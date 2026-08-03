@@ -1,0 +1,26 @@
+name: Mirror to Gitee
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Trust Gitee host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan gitee.com >> ~/.ssh/known_hosts
+
+      - name: Mirror to Gitee
+        uses: pixta-dev/repository-mirroring-action@v1
+        with:
+          target_repo_url: git@gitee.com:yinlichaoxi007/ai-env-clone.git
+          ssh_private_key: ${{ secrets.GITEE_SSH_KEY }}

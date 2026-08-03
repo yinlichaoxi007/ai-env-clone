@@ -1,0 +1,3 @@
+# Qoder 备份迁移工具 依赖
+# 仅 GUI 运行所需；打包成 exe 时由 PyInstaller 一并封入。
+PyInstaller>=6.0.0
