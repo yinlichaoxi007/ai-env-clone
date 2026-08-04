@@ -215,3 +215,9 @@ Issues and PRs are welcome — especially adapters for more **domestic AI tools*
 ## License
 
 [MIT](./LICENSE) — free to use, modify and distribute, including commercially.
+
+## About this project / 关于本项目
+
+This project was designed and directed by the author, with code and documentation assisted by an AI coding assistant (vibe coding). All design decisions, architecture trade-offs and the release process are controlled by the author. Issues and PRs are welcome on GitHub.
+
+本项目由作者主导设计，代码与文档借助 AI 编程助手（氛围编程 / vibe coding）辅助完成。所有设计决策、架构取舍与发布流程均由作者把控。欢迎在 GitHub 提 Issue / PR。
