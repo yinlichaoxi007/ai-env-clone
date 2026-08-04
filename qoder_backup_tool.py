@@ -4,7 +4,8 @@ Qoder 记忆与会话历史 备份 / 迁移工具（图形界面）
 运行：
     python qoder_backup_tool.py
 
-核心逻辑位于 ``qoder_backup_core.py``，本文件只负责界面与交互。
+通过 ``ai_env_clone`` 的适配器抽象层接入具体工具，核心逻辑位于
+``ai_env_clone.core``，适配器位于 ``ai_env_clone.adapters``。本文件只负责界面与交互。
 """
 
 from __future__ import annotations
@@ -16,16 +17,8 @@ import tkinter as tk
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
-from qoder_backup_core import (
-    BackupError,
-    ProgressInfo,
-    export_backup,
-    import_backup,
-    inspect_backup,
-    scan_items,
-)
-from qoder_backup_core import QoderPaths  # 目录布局对象
 from ai_env_clone.adapters import get_adapter
+from ai_env_clone.core import BackupError, ProgressInfo, scan_items
 
 APP_TITLE = "Qoder 备份迁移工具"
 
@@ -46,8 +39,8 @@ class QoderBackupApp:
         root.minsize(660, 600)
 
         self.adapter = get_adapter("qoder")
-        self.paths = self._make_paths()
-        self.items = self.adapter.build_items(self.paths.root)
+        self.root_dir = self._detect_root()
+        self.items = self.adapter.build_items(self.root_dir)
         self.vars: dict[str, tk.BooleanVar] = {}
         self.msg_queue: "queue.Queue[tuple]" = queue.Queue()
         self.busy = False
@@ -67,7 +60,7 @@ class QoderBackupApp:
         # 数据目录
         top = ttk.LabelFrame(self.root, text="Qoder 数据目录")
         top.pack(fill=tk.X, **pad)
-        self.root_var = tk.StringVar(value=self.paths.root)
+        self.root_var = tk.StringVar(value=self.root_dir)
         row = ttk.Frame(top)
         row.pack(fill=tk.X, padx=8, pady=8)
         ttk.Entry(row, textvariable=self.root_var).pack(
@@ -186,11 +179,11 @@ class QoderBackupApp:
                 row, text="%s %s" % (item.description, tag), foreground=color
             ).pack(side=tk.LEFT, padx=6)
 
-        ok = self.paths.exists
+        ok = os.path.isdir(self.root_dir)
         self.root_hint.config(
             text=(
                 "已识别：%s ｜ 共享目录：%s"
-                % (self.paths.root, os.path.basename(self.paths.shared))
+                % (self.root_dir, self._shared_name())
                 if ok
                 else "未找到 Qoder 数据目录，请手动指定"
             ),
@@ -217,21 +210,23 @@ class QoderBackupApp:
             self.root_var.set(d)
             self._redetect()
 
-    def _make_paths(self, explicit: str | None = None) -> QoderPaths:
-        root = explicit or self.adapter.detect_root() or self.adapter.build_default_root()
-        return QoderPaths(
-            root,
-            os.path.join(root, "shared_client")
-            if os.path.isdir(os.path.join(root, "shared_client"))
-            else os.path.join(root, "sharedclient"),
-        )
+    def _detect_root(self, explicit: str | None = None) -> str:
+        """经适配器探测数据根目录；显式指定或被探测到则用，否则回退默认建议路径。"""
+        return explicit or self.adapter.detect_root() or self.adapter.build_default_root()
 
     def _redetect(self) -> None:
-        self.paths = self._make_paths(self.root_var.get() or None)
-        self.root_var.set(self.paths.root)
-        self.items = self.adapter.build_items(self.paths.root)
+        self.root_dir = self._detect_root(self.root_var.get() or None)
+        self.root_var.set(self.root_dir)
+        self.items = self.adapter.build_items(self.root_dir)
         self._refresh_items()
         self._set_status("已重新检测数据目录")
+
+    def _shared_name(self) -> str:
+        """返回当前 root 下的共享子目录名（shared_client / sharedclient），未识别则空。"""
+        for name in ("shared_client", "sharedclient"):
+            if os.path.isdir(os.path.join(self.root_dir, name)):
+                return name
+        return ""
 
     def _max_mb(self):
         """读取「跳过超大文件」阈值（MB）。**只能在主线程调用**（访问 Tk 变量）。
@@ -348,7 +343,7 @@ class QoderBackupApp:
         self._set_status("正在估算…")
         # 在主线程取好 Tk 相关的值，后台线程只用普通 Python 对象
         max_mb = self._max_mb()
-        root_dir = self.paths.root
+        root_dir = self.root_dir
 
         def work():
             r = scan_items(items, root_dir, max_file_mb=max_mb)
@@ -385,15 +380,14 @@ class QoderBackupApp:
 
         # 主线程先取值，后台线程不碰 Tk
         max_mb = self._max_mb()
-        root_dir = self.paths.root
+        root_dir = self.root_dir
 
         def work():
-            mf = export_backup(
+            mf = self.adapter.export(
                 zip_path,
-                items,
                 root_dir,
-                max_file_mb=max_mb,
                 progress=self._progress_cb,
+                max_file_mb=max_mb,
             )
             self.msg_queue.put(
                 (
@@ -420,7 +414,7 @@ class QoderBackupApp:
         if not zip_path:
             return
         try:
-            info = inspect_backup(zip_path)
+            info = self.adapter.inspect(zip_path)
         except BackupError as exc:
             messagebox.showerror("无法读取", str(exc))
             return
@@ -447,7 +441,7 @@ class QoderBackupApp:
         if not zip_path:
             return
         try:
-            info = inspect_backup(zip_path)
+            info = self.adapter.inspect(zip_path)
         except BackupError as exc:
             messagebox.showerror("无法读取", str(exc))
             return
@@ -457,16 +451,16 @@ class QoderBackupApp:
             "即将把备份包还原（覆盖写入）到：\n%s\n\n"
             "将自动解压并写入 %d 个文件（%s），无需手动解压。\n\n"
             "请务必先完全退出 Qoder，否则可能导致数据损坏。\n是否继续？"
-            % (self.paths.root, info["file_count"], human_size(info["total_bytes"])),
+            % (self.root_dir, info["file_count"], human_size(info["total_bytes"])),
         ):
             return
 
         # 主线程先取值，后台线程不碰 Tk
-        root_dir = self.paths.root
+        root_dir = self.root_dir
         make_rollback = self.rollback_var.get()
 
         def work():
-            r = import_backup(
+            r = self.adapter.restore(
                 zip_path,
                 root_dir,
                 progress=self._progress_cb,

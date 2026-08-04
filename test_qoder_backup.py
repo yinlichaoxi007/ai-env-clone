@@ -644,13 +644,12 @@ class TestGuiThreadSafety(TempEnv):
         self.tk_root.withdraw()
         self.addCleanup(self._destroy)
 
-        from qoder_backup_core import QoderPaths
         import qoder_backup_tool as gui
 
         self.app = gui.QoderBackupApp(self.tk_root)
-        # 指向测试目录，避免动用真实 Qoder 数据
-        self.app.paths = QoderPaths(root=self.root, shared=self.shared)
-        self.app.items = build_items(self.app.paths)
+        # 指向测试目录，避免动用真实 Qoder 数据（统一走适配器接口）
+        self.app.root_dir = self.root
+        self.app.items = self.app.adapter.build_items(self.root)
         self.app._refresh_items()
         self.tk_root.update_idletasks()
 
