@@ -28,6 +28,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Iterable, Sequence
 
+#: manifest 中记录类型的字段值（也用于 ``export_backup`` 的 kind 默认值）
+KIND_BACKUP = "backup"
+KIND_ROLLBACK = "rollback"
+
 __all__ = [
     "BackupItem",
     "ScanResult",
@@ -45,6 +49,14 @@ __all__ = [
     "inspect_backup",
     "import_backup",
     "safe_target",
+    "list_backup_dir",
+    "classify_zip_name",
+    "BACKUP_PREFIX",
+    "ROLLBACK_PREFIX",
+    "BACKUP_MARK",
+    "ROLLBACK_MARK",
+    "KIND_BACKUP",
+    "KIND_ROLLBACK",
 ]
 
 MANIFEST_NAME = "ai_env_clone_manifest.json"
@@ -89,6 +101,7 @@ class BackupItem:
     path: str            # 绝对路径
     description: str
     recommended: bool = True
+    uid: str | None = None  # 记忆区按 UID 拆分时的用户标识，非记忆项为 None
 
     @property
     def exists(self) -> bool:
@@ -128,6 +141,9 @@ class ScanResult:
     skipped_count: int = 0
     skipped_bytes: int = 0
     missing_keys: list[str] = field(default_factory=list)
+    # 按扩展名（小写，含点，如 ".md"；无扩展名为 ""）分组的字节数，用于按文件类型
+    # 估算压缩后体积，比单一固定系数更贴近实际。新增字段，向后兼容。
+    bytes_by_ext: dict[str, int] = field(default_factory=dict)
 
     @property
     def file_count(self) -> int:
@@ -208,6 +224,8 @@ def scan_items(
             seen.add(key)
             result.files.append((full, rel))
             result.total_bytes += size
+            ext = os.path.splitext(full)[1].lower()
+            result.bytes_by_ext[ext] = result.bytes_by_ext.get(ext, 0) + size
 
     result.files.sort(key=lambda x: x[1])
     return result
@@ -279,12 +297,15 @@ def export_backup(
     compresslevel: int = 6,
     tool_name: str = "unknown",
     extra_meta: dict | None = None,
+    kind: str = KIND_BACKUP,
 ) -> dict:
     """
     导出备份到 zip。
 
     :param tool_name: 来源工具标识（写入 manifest，便于跨工具识别）。
     :param extra_meta: 适配器可附加的自定义元信息（如版本、子模块说明）。
+    :param kind: 包类型，写入 manifest 的 ``kind`` 字段，供还原时校验，
+        防止仅改文件名就被误还原。默认 ``"backup"``，回滚快照传 ``"rollback"``。
     :return: manifest 字典
     :raises BackupError: 无可备份内容或写入失败
     """
@@ -301,6 +322,7 @@ def export_backup(
 
     manifest = {
         "version": MANIFEST_VERSION,
+        "kind": kind,
         "tool": tool_name,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "source_root": root,
@@ -399,12 +421,31 @@ def safe_target(root_real: str, member_name: str) -> str | None:
     return target
 
 
-def inspect_backup(zip_path: str) -> dict:
+def inspect_backup(
+    zip_path: str,
+    verify: bool = False,
+    match_structure: "Callable[[Sequence[str]], tuple[bool, list[str]]] | None" = None,
+) -> dict:
     """
-    读取备份包信息并做完整性校验。
+    读取备份包信息（默认不做完整性校验，避免对大文件逐个解压算 CRC 导致卡顿）。
 
+    :param verify: 为 ``True`` 时额外调用 ``ZipFile.testzip()`` 校验完整性
+        （会对每个文件解压算 CRC，**大文件会很慢**，建议仅在用户主动点击
+        「校验完整性」时开启）。
+    :param match_structure: 可选的结构指纹回调函数，签名为
+        ``(names: Sequence[str]) -> (matched: bool, missing: list[str])``。
+        当包内缺失 manifest 或 manifest 无 ``kind`` 时，用它对 zip 内条目名
+        做结构指纹判定（识别数据类型 / 是否为该工具数据）。不传则跳过。
     :return: {'manifest': dict|None, 'file_count': int, 'total_bytes': int,
-              'unsafe': [str], 'has_manifest': bool}
+              'unsafe': [str], 'has_manifest': bool, 'bytes_by_ext': dict,
+              'corrupted': str|None, 'structure_match': bool|None,
+              'structure_missing': list[str], 'entries': list[str]}
+        - ``bytes_by_ext``：扩展名（小写含点）-> 源字节数，供 GUI 按类型归类展示。
+        - ``corrupted``：校验失败时返回首个损坏文件名，否则为 ``None``。
+        - ``structure_match``：结构指纹是否匹配（仅当传入 match_structure 且
+          manifest 缺 ``kind`` 时计算，否则为 ``None``）。
+        - ``structure_missing``：结构指纹缺失项说明。
+        - ``entries``：zip 内全部条目名（含目录），供上层做结构判定/展示。
     """
     if not os.path.exists(zip_path):
         raise BackupError("备份文件不存在：%s" % zip_path)
@@ -417,15 +458,23 @@ def inspect_backup(zip_path: str) -> dict:
         "total_bytes": 0,
         "unsafe": [],
         "has_manifest": False,
+        "bytes_by_ext": {},
+        "corrupted": None,
+        "structure_match": None,
+        "structure_missing": [],
+        "entries": [],
     }
     probe_root = os.path.realpath(tempfile.gettempdir())
 
     with zipfile.ZipFile(zip_path, "r") as zf:
-        bad = zf.testzip()
-        if bad is not None:
-            raise BackupError("备份包已损坏，首个损坏文件：%s" % bad)
+        if verify:
+            bad = zf.testzip()
+            if bad is not None:
+                info["corrupted"] = bad
 
+        names: list[str] = []
         for m in zf.infolist():
+            names.append(m.filename)
             if m.filename == MANIFEST_NAME:
                 info["has_manifest"] = True
                 try:
@@ -437,10 +486,95 @@ def inspect_backup(zip_path: str) -> dict:
                 continue
             info["file_count"] += 1
             info["total_bytes"] += m.file_size
+            ext = os.path.splitext(m.filename)[1].lower()
+            info["bytes_by_ext"][ext] = info["bytes_by_ext"].get(ext, 0) + m.file_size
             if safe_target(probe_root, m.filename) is None:
                 info["unsafe"].append(m.filename)
+        info["entries"] = names
+
+    # 解析类型：优先用 manifest 的 kind；有 manifest 但缺 kind（老版本包）时
+    # 退而用文件名约定推断，仍视为「有声明」，不触发结构指纹回退识别。
+    # 仅当完全无 manifest 时，才用结构指纹回退识别类型。
+    manifest = info.get("manifest") or {}
+    if manifest.get("kind") in (None, ""):
+        inferred = classify_zip_name(zip_path) if manifest else None
+        if inferred in ("backup", "rollback"):
+            manifest = dict(manifest)
+            manifest["kind"] = inferred
+            info["manifest"] = manifest
+            info["kind_inferred"] = True
+        elif not manifest:
+            # 完全无 manifest：结构指纹回退
+            if match_structure is not None:
+                matched, missing = match_structure(names)
+                info["structure_match"] = matched
+                info["structure_missing"] = missing
+    else:
+        info["kind_inferred"] = False
 
     return info
+
+
+#: 备份/快照文件名标记 -> 类型标识
+#: 现行约定为 ``<tool>_backup_`` / ``<tool>_rollback_``（含工具名，便于多工具混放时分辨）；
+#: 旧版曾用无工具名前缀（``backup_`` / ``aienv_rollback_``），此处依然兼容识别。
+BACKUP_PREFIX = "backup_"
+ROLLBACK_PREFIX = "aienv_rollback_"
+BACKUP_MARK = "_backup_"
+ROLLBACK_MARK = "_rollback_"
+
+
+def classify_zip_name(filename: str) -> str:
+    """
+    按文件名约定判定 zip 类型：``backup``（主动导出备份）/
+    ``rollback``（还原前自动生成的回滚快照）/ ``unknown``。
+
+    匹配优先级：含 ``_rollback_`` 标记或旧版 ``aienv_rollback_`` 前缀 → rollback；
+    含 ``_backup_`` 标记或旧版 ``backup_`` 前缀 → backup；其余 → unknown。
+
+    注意：分类仅依据文件名约定；真正的类型以包内 manifest 的 ``kind`` 字段为准
+    （还原时二次校验，防止仅改名就被误还原）。
+    """
+    base = os.path.basename(filename)
+    lowered = base.lower()
+    if ROLLBACK_MARK in lowered or base.startswith(ROLLBACK_PREFIX):
+        return KIND_ROLLBACK
+    if BACKUP_MARK in lowered or base.startswith(BACKUP_PREFIX):
+        return KIND_BACKUP
+    return "unknown"
+
+
+def list_backup_dir(dir_path: str) -> list:
+    """
+    列出目录下所有 ``*.zip`` 文件（**只读目录元数据，不打开/不解压 zip**，秒开），
+    供备份浏览器做虚拟加载。
+
+    :return: 按修改时间倒序的列表，每项
+        ``{'path', 'name', 'size', 'mtime', 'kind'}``
+        （kind 为 ``classify_zip_name`` 的结果）。
+    """
+    rows: list = []
+    if not os.path.isdir(dir_path):
+        return rows
+    for name in os.listdir(dir_path):
+        if not name.lower().endswith(".zip"):
+            continue
+        full = os.path.join(dir_path, name)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        rows.append(
+            {
+                "path": full,
+                "name": name,
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+                "kind": classify_zip_name(name),
+            }
+        )
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows
 
 
 def import_backup(
@@ -449,20 +583,83 @@ def import_backup(
     progress: ProgressCb = _noop,
     make_rollback: bool = True,
     overwrite: bool = True,
+    rollback_dir: str | None = None,
+    expected_kind: str | None = None,
+    strict: bool = False,
+    match_structure: "Callable[[Sequence[str]], tuple[bool, list[str]]] | None" = None,
 ) -> dict:
     """
     恢复备份到根目录。
 
+    回滚快照默认保存到 ``rollback_dir``（调用方按工具名分目录传入，例如
+    ``<工具运行目录>/backup/<工具名>/``，与备份文件同目录，方便按时间信息对比选择）；
+    若未传则退回到 ``root_real``。
+
     :param make_rollback: 覆盖前把同名旧文件打包成回滚快照
     :param overwrite: 为 ``False`` 时跳过已存在的文件
-    :return: {'restored': int, 'skipped': int, 'blocked': [str], 'rollback': str|None}
+    :param rollback_dir: 回滚快照存放目录（可按工具名分目录），不存在则创建
+    :param expected_kind: 期望的包类型（``"backup"`` / ``"rollback"``）。
+        若包内 manifest 的 ``kind`` 与此不符，抛出 ``BackupError`` 阻止还原，
+        防止仅改文件名就被误还原。传 ``None`` 则不做类型限制。
+    :param strict: 严格校验模式。为 ``True`` 时即使包内带 manifest，也强制
+        对 zip 内条目做结构指纹扫描（需配合 ``match_structure``），不一致则
+        抛出 ``BackupError``，用于防止伪造声明文件的恶意备份。
+    :param match_structure: 结构指纹回调函数（同 :func:`inspect_backup`）。
+        缺 manifest 或 ``strict`` 模式下用于判定数据类型与结构是否匹配。
+    :return: {'restored': int, 'skipped': int, 'blocked': [str], 'rollback': str|None,
+              'kind': str|None, 'tool': str|None, 'source_root': str|None,
+              'structure_match': bool|None, 'structure_missing': list[str]}
     """
-    info = inspect_backup(zip_path)
+    info = inspect_backup(zip_path, match_structure=match_structure)
     if info["unsafe"]:
         raise BackupError(
             "备份包中存在非法路径，已终止恢复：\n%s"
             % "\n".join(info["unsafe"][:5])
         )
+
+    manifest = info.get("manifest") or {}
+    kind = manifest.get("kind")
+    tool = manifest.get("tool")
+    source_root = manifest.get("source_root")
+
+    if expected_kind is not None and kind is not None and kind != expected_kind:
+        raise BackupError(
+            "类型不匹配，已阻止还原以防误覆盖数据。\n\n"
+            "压缩包文件名虽然像「%s」，但包内 manifest 记录的类型是「%s」。\n"
+            "本工具仅还原类型为「%s」的压缩包，请确认是否选错了文件。"
+            % (
+                {"backup": "备份", "rollback": "回滚快照"}.get(expected_kind, expected_kind),
+                {"backup": "备份", "rollback": "回滚快照"}.get(kind, kind),
+                {"backup": "备份", "rollback": "回滚快照"}.get(expected_kind, expected_kind),
+            )
+        )
+
+    # 结构指纹校验：缺 manifest / 无 kind 时回退判断；strict 模式强制校验
+    if match_structure is not None:
+        need_structure = (kind is None) or strict
+        if need_structure:
+            matched, missing = match_structure(info.get("entries") or [])
+            info["structure_match"] = matched
+            info["structure_missing"] = missing
+            if not matched:
+                if kind is None:
+                    reason = (
+                        "该压缩包缺少清单文件，且内部数据结构与 %s 不匹配，"
+                        "无法确认是可还原的备份。\n缺失项：%s"
+                        % (
+                            {"backup": "备份", "rollback": "回滚快照"}.get(
+                                expected_kind or "backup", expected_kind or "备份"
+                            ),
+                            "、".join(missing) or "（无）",
+                        )
+                    )
+                else:
+                    reason = (
+                        "严格校验模式下，压缩包内部结构指纹与 %s 不一致"
+                        "（疑似伪造声明文件），已阻止还原以防数据损坏。\n缺失项：%s"
+                        % (tool or "该工具", "、".join(missing) or "（无）")
+                    )
+                raise BackupError(reason)
 
     os.makedirs(root, exist_ok=True)
     root_real = os.path.realpath(root)
@@ -485,10 +682,22 @@ def import_backup(
                 if t and os.path.isfile(t):
                     victims.append((t, m.filename))
             if victims:
-                rollback_path = os.path.join(
-                    root_real,
-                    "aienv_rollback_%s.zip" % datetime.now().strftime("%Y%m%d_%H%M%S"),
-                )
+                rb_dir = os.path.realpath(rollback_dir) if rollback_dir else root_real
+                os.makedirs(rb_dir, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                tool_tag = (tool or "aienv").replace(" ", "")
+                rollback_path = os.path.join(rb_dir, "%s_rollback_%s.zip" % (tool_tag, ts))
+                # 回滚快照自身也写入 manifest，便于后续被识别/还原
+                rb_manifest = {
+                    "version": MANIFEST_VERSION,
+                    "kind": KIND_ROLLBACK,
+                    "tool": tool or "unknown",
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "source_root": root_real,
+                    "platform": os.name,
+                    "desc": "还原前自动生成的回滚快照",
+                    "from_backup": os.path.basename(zip_path),
+                }
                 try:
                     with zipfile.ZipFile(
                         rollback_path, "w", zipfile.ZIP_DEFLATED
@@ -498,6 +707,10 @@ def import_backup(
                                 ProgressInfo(idx, len(victims), "生成回滚快照 %s" % arc)
                             )
                             rb.write(t, arcname=arc)
+                        rb.writestr(
+                            MANIFEST_NAME,
+                            json.dumps(rb_manifest, ensure_ascii=False, indent=2),
+                        )
                 except OSError:
                     rollback_path = None
 
@@ -537,4 +750,9 @@ def import_backup(
         "skipped": skipped,
         "blocked": blocked,
         "rollback": rollback_path,
+        "kind": kind,
+        "tool": tool,
+        "source_root": source_root,
+        "structure_match": info.get("structure_match"),
+        "structure_missing": info.get("structure_missing"),
     }

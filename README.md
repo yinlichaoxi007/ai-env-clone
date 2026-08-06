@@ -18,13 +18,16 @@
 
 ## 支持的工具
 
-> 定位：**仅支持国内 AI 编程工具**。国外工具不在支持范围内（作者无法访问、无法测试）。
-> 反过来，国内工具国外用户同样可以使用，因此本工具对海外用户也有价值。
+> 定位：**支持「国内能正常使用的 AI 编程工具」**。不限定工具的国别或厂商——只要该工具在**国内网络环境下可访问、可测试**，无论其来自国内还是国外产品，都可纳入支持范围。反之，国内工具海外用户同样可用，本工具对海内外用户均有价值。
 
-| 工具 | 状态 |
-| --- | --- |
-| Qoder | ✅ 已支持 |
-| 其他国内工具（如 Trae、豆包、通义灵码、CodeBuddy 等） | 🚧 规划中，欢迎贡献适配器 |
+| 工具 | 形态 | 测试版本 | 状态 |
+| --- | --- | --- | --- |
+| Qoder CN（前 Lingma，JetBrains 插件） | 桌面 IDE 插件 | **3.3.3** | ✅ 已支持 |
+| Qoder CN IDE（独立桌面客户端） | 独立 IDE | **1.10.0** | ✅ 已支持 |
+| 其他国内可用工具（如 Trae、豆包、通义灵码、CodeBuddy 等） | — | — | 🚧 规划中，欢迎贡献适配器 |
+
+> ⚠️ **版本说明**：上表仅列出作者**实测通过**的版本。更高/更低版本（如 Qoder CN 插件 3.3.4）未经测试，数据结构可能变化，使用前请先在本机做一次「导出 → 校验」验证。
+> Qoder CN 系列产品（原 Lingma 插件、Qoder CN IDE 等）共用同一 `~/.qoder-cn` 根目录，本工具按该目录统一备份，无需用户区分具体产品。
 
 ## 安装
 
@@ -78,9 +81,10 @@ python qoder_backup_tool.py --restore --in ./my-backup.zip
 
 ### 备份包说明
 
-- 备份产物是一个标准 `.zip` 文件，内含 `qoder_backup_manifest.json` 清单（记录创建时间、来源目录、包含模块、文件数等）。
-- 可用「查看备份包」功能校验完整性，或直接解压查看内容。
-- 恢复时会**自动覆盖**同名文件，并在覆盖前生成 `qoder_rollback_*.zip` 回滚快照，可随时还原到恢复前状态。
+- 备份产物是一个标准 `.zip` 文件，文件名形如 `<工具名>_backup_<时间戳>.zip`（例如 `qoder_backup_20260805_095519.zip`）。包内含 `qoder_backup_manifest.json` 清单，记录 `kind`（类型）、`tool`（工具名）、`created_at`（创建时间）、`source_root`（来源目录）、`items`（包含模块）、文件数等。
+- 在「备份浏览器」（点「还原备份包」打开）中可查看明细、校验完整性、选择还原。校验结果会显示在列表「完整性」列，切换选择后仍可见。
+- 恢复时会**自动覆盖**同名文件，并在覆盖前在工具运行目录下的 `backup/<工具名>/`（例如 `QoderBackupTool.exe` 同级的 `backup/qoder/`，与备份文件同一目录）生成 `<工具名>_rollback_<时间戳>.zip` 回滚快照，可随时还原到恢复前状态，也方便按文件时间信息对比选择。备份默认同样导出到 `backup/<工具名>/`，随工具一起拷贝即可。
+- **防误还原**：还原时以包内 manifest 的 `kind` 为准，仅改文件名无法骗过校验；若包内记录的 `source_root` 与当前还原目标不一致，会弹窗二次确认，防止覆盖错误目录的数据。备份与回滚快照均可还原。
 
 ## 架构
 
@@ -96,6 +100,21 @@ build_exe.py           用 PyInstaller 打包成单文件 exe
 ```
 
 **多工具扩展**：已采用统一的适配器接口（`detect_root()` / `build_items()` / `export()` / `restore()`）。每种 AI 工具对应一个适配器模块，新增工具无需改动主流程，详见 `docs/CONTRIBUTING.md`。
+
+## 测试
+
+本仓库附带完整的单元测试，使用 Python 标准库 `unittest`，**无需安装任何第三方依赖**。
+
+- **一键运行（Windows）**：双击 `run_tests.bat`，全部测试结果会写入 `test_result.txt` 并在窗口中展示。
+- **手动运行**：
+  ```bash
+  # 运行全部测试（含无头 GUI 测试，不会弹出任何窗口）
+  python -m unittest discover -s . -p "test_*.py"
+
+  # 仅运行 GUI 无头测试类
+  python -m unittest test_qoder_backup.TestGuiThreadSafety -v
+  ```
+- **关于 GUI 测试**：GUI 测试基于 tkinter 的 `withdraw()` 实现**无头（headless）运行**，控件、变量与事件回调均可正常创建与触发，不会弹出真实窗口、也不会依赖显示器。消息框（`messagebox`）在测试中被 mock，避免人工点击。真实 GUI 中备份/恢复完成后的成功提示弹窗是正常产品行为，与自动化测试无关。
 
 ## 贡献
 
@@ -129,13 +148,16 @@ build_exe.py           用 PyInstaller 打包成单文件 exe
 
 ## Supported Tools
 
-> Scope: **domestic (China-based) AI coding tools only**. Foreign tools are out of scope (the author cannot access/test them).
-> Conversely, domestic tools are usable by overseas users too, so this tool is also valuable internationally.
+> Scope: **AI coding tools that work in China**. Not limited by the tool's country or vendor — any tool that is reachable and testable under China's network environment (whether domestic or foreign) is in scope. Conversely, domestic tools are usable by overseas users too, so this tool is also valuable internationally.
 
-| Tool | Status |
-| --- | --- |
-| Qoder | ✅ Supported |
-| Other domestic tools (Trae, Doubao, Tongyi Lingma, CodeBuddy, …) | 🚧 Planned — adapters welcome |
+| Tool | Form | Tested version | Status |
+| --- | --- | --- | --- |
+| Qoder CN (formerly Lingma, JetBrains plugin) | Desktop IDE plugin | **3.3.3** | ✅ Supported |
+| Qoder CN IDE (standalone desktop client) | Standalone IDE | **1.10.0** | ✅ Supported |
+| Other China-usable tools (Trae, Doubao, Tongyi Lingma, CodeBuddy, …) | — | — | 🚧 Planned — adapters welcome |
+
+> ⚠️ **Version note**: only author-tested versions are listed above. Untested higher/lower versions (e.g. Qoder CN plugin 3.3.4) may have changed data layouts — do an Export→Verify on your machine first.
+> All Qoder CN products (former Lingma plugin, Qoder CN IDE, etc.) share the same `~/.qoder-cn` root directory; the tool backs it up uniformly, so users need not distinguish which product they use.
 
 ## Install
 
@@ -186,9 +208,9 @@ python qoder_backup_tool.py --restore --in ./my-backup.zip
 
 ### About the backup archive
 
-- A standard `.zip` with a `qoder_backup_manifest.json` (creation time, source dir, modules, file count, …).
-- Inspectable via the "查看备份包" feature or by unzipping directly.
-- Restore **overwrites** existing files and auto-creates a `qoder_rollback_*.zip` snapshot beforehand, so you can revert anytime.
+- A standard `.zip` named `<tool>_backup_<timestamp>.zip`, with a `qoder_backup_manifest.json` (kind, tool, creation time, source dir, modules, file count, …).
+- Viewable via the "备份浏览器" (open from "还原备份包"): inspect details, verify integrity, and choose what to restore.
+- Restore **overwrites** existing files and auto-creates a `<tool>_rollback_<timestamp>.zip` snapshot beforehand, so you can revert anytime. Type is verified against the manifest to prevent accidental restore of a misnamed file.
 
 ## Architecture
 
@@ -204,6 +226,21 @@ build_exe.py           package into single-file exe via PyInstaller
 ```
 
 **Multi-tool**: a unified adapter interface (`detect_root()` / `build_items()` / `export()` / `restore()`). Each AI tool maps to one adapter module; adding a tool never touches the main flow. See `docs/CONTRIBUTING.md`.
+
+## Testing
+
+The repo ships full unit tests built on the Python stdlib `unittest`, **no third-party dependencies**.
+
+- **One-click (Windows)**: double-click `run_tests.bat`; results are written to `test_result.txt` and shown in the window.
+- **Manual**:
+  ```bash
+  # Run all tests (incl. headless GUI tests — no window pops up)
+  python -m unittest discover -s . -p "test_*.py"
+
+  # Run only the headless GUI test class
+  python -m unittest test_qoder_backup.TestGuiThreadSafety -v
+  ```
+- **About GUI tests**: GUI tests run **headless** via tkinter's `withdraw()` — widgets, variables and event callbacks are created and fired normally, with no real window and no display needed. `messagebox` is mocked during tests to avoid manual clicks. The success popup after a real backup/restore in the actual GUI is normal product behavior and unrelated to automated tests.
 
 ## Contributing
 
