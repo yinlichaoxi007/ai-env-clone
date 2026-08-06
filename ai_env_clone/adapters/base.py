@@ -24,6 +24,33 @@ class BaseAdapter(ABC):
     #: 人类可读名称，用于界面展示，如 "Qoder"
     display_name: str = ""
 
+    #: 该工具内置的压缩经验系数表（档位 -> 类别 -> 压缩后/源 占比）。
+    #: 各适配器应**按自身数据结构单独定义并维护**，不要共用一个全局表。
+    #: 这里给一份与通用兜底一致的默认表，未重写时也能跑（精度较差）。
+    COMPRESS_RATIO: dict[int, dict[str, float]] = {
+        1: {  # 快速
+            "text": 0.17,
+            "db": 0.61,
+            "struct": 0.48,
+            "binary": 0.99,
+            "other": 0.17,
+        },
+        6: {  # 正常（推荐）
+            "text": 0.15,
+            "db": 0.59,
+            "struct": 0.46,
+            "binary": 0.99,
+            "other": 0.13,
+        },
+    }
+
+    #: 是否支持"按真实备份反算的自动校准"。
+    #: - True （默认，如 Qoder）：备份成功后把实测压缩率写缓存，后续估算优先用实测率，
+    #:   没有校准记录时回退到 ``COMPRESS_RATIO`` 经验系数。
+    #: - False：该适配器不参与自动校准，估算**永远只用内置经验系数** ``COMPRESS_RATIO``，
+    #:   既不会读取也不会写入校准文件（便于尚无校准数据或不希望产生缓存的工具）。
+    supports_calibration: bool = True
+
     # ------------------------------------------------------------------ #
     @abstractmethod
     def detect_root(self) -> str | None:
@@ -61,11 +88,13 @@ class BaseAdapter(ABC):
         self,
         zip_path: str,
         root: str,
+        items: Sequence[BackupItem] | None = None,
         progress=None,
         max_file_mb: float | None = 200.0,
         compresslevel: int = 6,
     ) -> dict:
-        items = self.build_items(root)
+        if items is None:
+            items = self.build_items(root)
         return export_backup(
             zip_path,
             items,

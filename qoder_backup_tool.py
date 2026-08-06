@@ -11,6 +11,7 @@ Qoder 记忆与会话历史 备份 / 迁移工具（图形界面）
 from __future__ import annotations
 
 import os
+import json
 import queue
 import re
 import threading
@@ -25,7 +26,10 @@ from ai_env_clone.compress_estimate import (
     DEFAULT_COMPRESS_LEVEL,
     category_of,
     estimate_compressed_bytes,
+    load_calibration,
+    save_calibration,
 )
+
 from ai_env_clone.core import (
     BackupError,
     ProgressInfo,
@@ -177,6 +181,12 @@ class QoderBackupApp:
         # 选项
         opt = ttk.LabelFrame(self.root, text="选项")
         opt.pack(fill=tk.X, **pad)
+        # 恢复默认：把选项区域各参数复位到初始默认值，防用户改乱后无从恢复
+        btn_row = ttk.Frame(opt)
+        btn_row.pack(fill=tk.X, padx=8, pady=(8, 0))
+        ttk.Button(
+            btn_row, text="恢复默认", command=self._reset_options, width=10
+        ).pack(side=tk.LEFT)
         orow = ttk.Frame(opt)
         orow.pack(fill=tk.X, padx=8, pady=8)
         self.skip_big = tk.BooleanVar(value=True)
@@ -185,7 +195,7 @@ class QoderBackupApp:
         ).pack(side=tk.LEFT)
         self.max_mb_var = tk.StringVar(value="200")
         self.max_mb_entry = ttk.Spinbox(
-            orow, from_=0, to=100000, increment=50, width=7,
+            orow, from_=0, to=100000, increment=10, width=7,
             textvariable=self.max_mb_var, state="normal",
         )
         self.max_mb_entry.pack(side=tk.LEFT, padx=4)
@@ -237,6 +247,24 @@ class QoderBackupApp:
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
 
     # ------------------------------------------------------------- helpers --
+    def _reset_options(self) -> None:
+        """把选项区域各参数复位到初始默认值，防用户改乱后无从选择。
+
+        默认：跳过超大文件=开、阈值=200MB、生成回滚快照=开、严格校验=关、
+        压缩方式=正常档。
+        """
+        self.skip_big.set(True)
+        self.max_mb_var.set("200")
+        self.max_mb_entry.configure(
+            state="normal" if self.skip_big.get() else "disabled"
+        )
+        self.rollback_var.set(True)
+        self.strict_var.set(False)
+        self.compress_var.set(
+            next(k for k, v in self._compress_levels.items() if v == DEFAULT_COMPRESS_LEVEL)
+        )
+        self.status.configure(text="已恢复选项默认设置")
+
     @staticmethod
     def _agg_prefix(key: str) -> str:
         """聚合前缀：同一逻辑备份项（如 session_db 主库/-wal/-shm，或
@@ -245,13 +273,13 @@ class QoderBackupApp:
 
     @staticmethod
     def _toggle_var(var, cb) -> None:
-        """点击名称文本时切换勾选（ttk.Checkbutton 的 Label 名称部分可点击）。"""
+        """点击名称文本时切换勾选（ttk.Checkbutton 的 Label 名称部分可点击）。
+        直接 invoke 关联 checkbox：tk 会自行切换 variable 并执行 command（一次完成），
+        切忌先手动 var.set 再 invoke（有 command 的 checkbox 会被 toggle 两次导致净不变）。
+        """
         if str(cb.cget("state")) == "disabled":
             return
-        var.set(not var.get())
-        cmd = cb.cget("command")
-        if cmd:
-            cb.invoke()
+        cb.invoke()
 
     def _refresh_items(self) -> None:
         # 清空列表与底部"其他用户 UID"区块
@@ -306,7 +334,9 @@ class QoderBackupApp:
             if is_current:
                 cb.configure(command=self._on_current_toggled)
             # 点击名称文本同样能切换勾选
-            name_lbl.bind("<Button-1>", lambda e, v=var: self._toggle_var(v, cb))
+            # 注意：cb 与 v 都必须用默认参数即时捕获，否则闭包会共享循环末尾的变量
+            # （others 行复用同名 cb 变量，会导致所有项点击都误触 others 的勾选）。
+            name_lbl.bind("<Button-1>", lambda e, v=var, c=cb: self._toggle_var(v, c))
             if not any_exists:
                 missing += 1
                 cb.configure(state="disabled")
@@ -347,7 +377,7 @@ class QoderBackupApp:
         c0.grid(row=0, column=0, sticky="w")
         name_lbl.bind(
             "<Button-1>",
-            lambda e: self._toggle_var(self.others_master_var, cb),
+            lambda e, v=self.others_master_var, c=cb: self._toggle_var(v, c),
         )
         if not self.others_by_uid:
             cb.configure(state="disabled")
@@ -622,6 +652,33 @@ class QoderBackupApp:
         if not self._closing:
             self.msg_queue.put(("progress", info))
 
+    def _load_compress_calibration(self) -> dict | None:
+        """读本工具最近一次真实备份按扩展名反算的实测压缩率。
+
+        校准文件存于系统用户缓存目录（见 ``compress_estimate.cache_dir``），
+        按工具分文件，不进仓库、不落入 ``.codebuddy``。无记录或损坏则返回 None。
+        若适配器声明 ``supports_calibration=False``，则永远不读取校准，回退到内置经验系数。
+        """
+        if not self.adapter.supports_calibration:
+            return None
+        return load_calibration(self.adapter.name, self.adapter.COMPRESS_RATIO)
+
+    def _save_compress_calibration(
+        self, bytes_by_ext: dict, bytes_by_ext_compressed: dict
+    ) -> None:
+        """备份成功后，按扩展名反算实测压缩率并保存到本工具的校准文件。
+
+        比类别级更精细：同类别下不同扩展名（如 .json 不可压 vs .txt 高度可压）
+        才能各自贴合实测值。仅统计本次确实出现的扩展名；并按经验区间过滤
+        异常值，避免写入的校准文件本身有错（如历史 ``.db``=0.06 那样的污染数据）。
+        """
+        save_calibration(
+            self.adapter.name,
+            bytes_by_ext,
+            bytes_by_ext_compressed,
+            self.adapter.COMPRESS_RATIO,
+        )
+
     def _cancel_after(self) -> None:
         """取消尚未触发的 after 回调，避免窗口销毁后报错噪音。"""
         if self._after_id is not None:
@@ -653,22 +710,35 @@ class QoderBackupApp:
         root_dir = self.root_dir
         compresslevel = self._compress_levels.get(self.compress_var.get(), DEFAULT_COMPRESS_LEVEL)
         compress_name = self.compress_var.get()
+        # 读最近一次真实备份按类别反算的实测压缩率，用于按本次勾选组成校准
+        calibration = self._load_compress_calibration()
 
         def work():
             r = scan_items(items, root_dir, max_file_mb=max_mb)
-            # 按文件类型分组、用各类别经验压缩率加权估算，比单一固定系数更准
-            comp_bytes = estimate_compressed_bytes(r.bytes_by_ext, compresslevel)
+            # 按文件类型分组、用各类别经验压缩率加权，再用实测率整体校准
+            comp_bytes = estimate_compressed_bytes(
+                r.bytes_by_ext,
+                compresslevel,
+                per_extension=calibration,
+                base_ratios=self.adapter.COMPRESS_RATIO,
+            )
+            # 仅当确实因"超大文件过滤"跳过大文件时，才在源大小后紧接着提示跳过情况；
+            # 因排除规则（日志/临时/WAL 等）被忽略的文件属必要过滤，用户无感，不显示。
+            skip_part = (
+                "，已跳过 %d 个（%s）" % (r.oversize_count, human_size(r.oversize_bytes))
+                if r.oversize_count > 0
+                else ""
+            )
             self.msg_queue.put(
                 (
                     "status",
-                    "待备份 %d 个文件，源约 %s；按「%s」压缩后约 %s（估算）；已跳过 %d 个（%s）"
+                    "待备份 %d 个文件，源约 %s%s；按「%s」压缩后约 %s（估算）"
                     % (
                         r.file_count,
                         human_size(r.total_bytes),
+                        skip_part,
                         compress_name,
                         human_size(comp_bytes),
-                        r.skipped_count,
-                        human_size(r.skipped_bytes),
                     ),
                 )
             )
@@ -694,15 +764,17 @@ class QoderBackupApp:
         if not zip_path:
             return
 
-        # 主线程先取值，后台线程不碰 Tk
+        # 主线程先取值，后台线程不碰 Tk（_selected_items 读 Tk BooleanVar，必须在此算好）
         max_mb = self._max_mb()
         root_dir = self.root_dir
         compresslevel = self._compress_levels.get(self.compress_var.get(), DEFAULT_COMPRESS_LEVEL)
+        sel_items = self._selected_items()
 
         def work():
             mf = self.adapter.export(
                 zip_path,
                 root_dir,
+                items=sel_items,
                 progress=self._progress_cb,
                 max_file_mb=max_mb,
                 compresslevel=compresslevel,
@@ -722,6 +794,11 @@ class QoderBackupApp:
                     ),
                 )
             )
+            # 记录本次备份按类别反算的实测压缩率，供后续估算按勾选组成校准
+            if self.adapter.supports_calibration and mf.get("bytes_by_ext") and mf.get("bytes_by_ext_compressed"):
+                self._save_compress_calibration(
+                    mf["bytes_by_ext"], mf["bytes_by_ext_compressed"]
+                )
 
         self._run_bg(work)
 
@@ -998,6 +1075,11 @@ class BackupBrowser:
 
     # ----------------------------------------------------------- 列表加载 --
     def _load_list(self) -> None:
+        # 刷新前先快照各文件的完整性校验结果，重建后回填，避免已校验信息被清掉
+        prev_verify = {
+            item: self.tree.set(item, "verify")
+            for item in self.tree.get_children()
+        }
         self.tree.delete(*self.tree.get_children())
         rows = list_backup_dir(self.backup_dir)
         if not rows:
@@ -1019,7 +1101,7 @@ class BackupBrowser:
                     label,
                     human_size(r["size"]),
                     datetime.fromtimestamp(r["mtime"]).strftime("%Y-%m-%d %H:%M"),
-                    "",
+                    prev_verify.get(r["path"], ""),  # 已有结果回填，新文件留空待校验
                 ),
             )
         self._autosize_columns()
@@ -1335,10 +1417,19 @@ class BackupBrowser:
             self.top.deiconify()
 
     def _on_open_dir(self) -> None:
+        # 打开所选备份文件所在目录；未选择时退回备份根目录
+        target = self._selected_dir()
         try:
-            os.startfile(self.backup_dir)  # type: ignore[attr-defined]
+            os.startfile(target)  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001
-            messagebox.showinfo("打开目录", self.backup_dir)
+            messagebox.showinfo("打开目录", target)
+
+    def _selected_dir(self) -> str:
+        """返回应打开的目录：有选中文件则取该文件所在目录，否则用备份根目录。"""
+        path = self._pending_path
+        if path and os.path.isfile(path):
+            return os.path.dirname(path)
+        return self.backup_dir
 
     def _on_change_dir(self) -> None:
         """切换到其他存放备份/快照的目录（备份文件不一定在默认目录下）。"""
