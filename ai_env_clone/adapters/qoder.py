@@ -26,6 +26,38 @@ class QoderAdapter(BaseAdapter):
     name = "qoder"
     display_name = "Qoder"
 
+    #: Qoder 专属压缩经验系数（档位 -> 类别 -> 压缩后/源 占比），按本机真实备份
+    #: 反推并校准，单独维护、不与其他工具混用。
+    #:
+    #: 分类归属（与 ``compress_estimate`` 的扩展名集合对应）：
+    #:   - db     : ``.db`` / ``.sqlite`` / ``.sqlite3``（SQLite；含向量等已编码 blob，
+    #:              DEFLATE 仅再压掉约 40%，实测 ≈0.59）
+    #:   - struct : ``.zap`` / ``.bolt``（向量索引；非通用压缩格式，DEFLATE 仍可压约一半，
+    #:              实测 ≈0.46）
+    #:   - text   : ``.txt``/``.py``/``.jsonl``/``.log``/``.yaml`` 等高度可压源码文本
+    #:              （实测 .txt≈0.10、.jsonl≈0.21）
+    #:   - binary : 图片/音视频/压缩包/可执行等通用已压缩或二进制（≈0.99，几乎压不动）
+    #:   - other  : 未归类的其余（如 ``.json``/``.md`` 实为含 base64 的向量/附件快照，
+    #:              不可压，归此类；实测 .json≈0.83、.md≈0.67）
+    #: 注意：db 系数随 SQLite 内部存储内容浮动，仅代表当前 Qoder 数据；其他工具若存明文
+    #: 为主可压到剩 ~0.27，届时在此单独调整即可。
+    COMPRESS_RATIO: dict[int, dict[str, float]] = {
+        1: {  # 快速
+            "text": 0.17,
+            "db": 0.61,
+            "struct": 0.48,
+            "binary": 0.99,
+            "other": 0.17,
+        },
+        6: {  # 正常（推荐）
+            "text": 0.15,
+            "db": 0.59,
+            "struct": 0.46,
+            "binary": 0.99,
+            "other": 0.13,
+        },
+    }
+
     def detect_root(self) -> str | None:
         paths = detect_qoder_root()
         return paths.root if paths.exists else None

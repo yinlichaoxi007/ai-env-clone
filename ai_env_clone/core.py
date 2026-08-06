@@ -138,8 +138,14 @@ class ScanResult:
 
     files: list[tuple[str, str]] = field(default_factory=list)  # (绝对路径, 归档相对路径)
     total_bytes: int = 0
+    # 因排除规则（日志/临时/WAL 等）被忽略的文件——属备份项本身的必要过滤，用户无感，
+    # 不计入"跳过"提示。
     skipped_count: int = 0
     skipped_bytes: int = 0
+    # 因"超大文件过滤"被跳过的文件（仅当用户开启了跳过超大文件且确有非关键文件超阈值）。
+    # 这才是状态栏要提示的"已跳过"。
+    oversize_count: int = 0
+    oversize_bytes: int = 0
     missing_keys: list[str] = field(default_factory=list)
     # 按扩展名（小写，含点，如 ".md"；无扩展名为 ""）分组的字节数，用于按文件类型
     # 估算压缩后体积，比单一固定系数更贴近实际。新增字段，向后兼容。
@@ -214,9 +220,13 @@ def scan_items(
 
             critical = is_critical(rel)
             if not critical:
-                if is_excluded(rel, excludes) or (
-                    limit is not None and size > limit
-                ):
+                excluded = is_excluded(rel, excludes)
+                oversize = limit is not None and size > limit
+                if excluded or oversize:
+                    # 排除规则过滤属必要、用户无感；仅超大文件过滤计入"已跳过"提示
+                    if oversize:
+                        result.oversize_count += 1
+                        result.oversize_bytes += size
                     result.skipped_count += 1
                     result.skipped_bytes += size
                     continue
@@ -332,6 +342,9 @@ def export_backup(
         "total_bytes": scan.total_bytes,
         "skipped_count": scan.skipped_count,
         "skipped_bytes": scan.skipped_bytes,
+        # 按类型（扩展名）累计的源体积与压缩后体积，供「按当前勾选组成」校准压缩估算
+        "bytes_by_ext": {},
+        "bytes_by_ext_compressed": {},
     }
     if extra_meta:
         manifest["extra"] = extra_meta
@@ -358,6 +371,17 @@ def export_backup(
                 except (OSError, PermissionError) as exc:
                     manifest.setdefault("failed", []).append(
                         {"path": rel, "error": str(exc)}
+                    )
+                else:
+                    # 成功写入才统计；按归档内扩展名归类（SQLite 快照仍记为 .db）
+                    ext = os.path.splitext(rel)[1].lower()
+                    info = zf.getinfo(rel)
+                    manifest["bytes_by_ext"][ext] = (
+                        manifest["bytes_by_ext"].get(ext, 0) + info.file_size
+                    )
+                    manifest["bytes_by_ext_compressed"][ext] = (
+                        manifest["bytes_by_ext_compressed"].get(ext, 0)
+                        + info.compress_size
                     )
                 finally:
                     if snap and os.path.exists(snap):
