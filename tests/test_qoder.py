@@ -2,9 +2,9 @@
 Qoder 备份迁移工具 —— 全面测试用例
 
 运行：
-    python -m unittest test_qoder_backup -v
+    python -m unittest tests.test_qoder -v
 或：
-    python test_qoder_backup.py
+    python tests/test_qoder.py
 """
 
 from __future__ import annotations
@@ -17,12 +17,11 @@ import tempfile
 import unittest
 import zipfile
 
-from qoder_backup_core import (
+from ai_env_clone.core import (
     MANIFEST_NAME,
     BackupError,
     BackupItem,
-    build_items,
-    detect_qoder_root,
+    DEFAULT_EXCLUDES,
     export_backup,
     import_backup,
     inspect_backup,
@@ -30,7 +29,12 @@ from qoder_backup_core import (
     is_excluded,
     scan_items,
     snapshot_sqlite,
-    _safe_target,
+    safe_target,
+)
+from ai_env_clone.adapters.qoder import (
+    QoderPaths,
+    build_items,
+    detect_qoder_root,
 )
 
 
@@ -90,7 +94,7 @@ class TempEnv(unittest.TestCase):
         con.close()
 
     def items(self):
-        from qoder_backup_core import QoderPaths
+        from ai_env_clone.adapters.qoder import QoderPaths
 
         return build_items(QoderPaths(root=self.root, shared=self.shared))
 
@@ -142,7 +146,7 @@ class TestScan(TempEnv):
             "a/b.db-wal",
         ):
             self.assertTrue(is_excluded(bad, __import__(
-                "qoder_backup_core").DEFAULT_EXCLUDES), bad)
+                "ai_env_clone.core").DEFAULT_EXCLUDES), bad)
 
     def test_keeps_real_data(self):
         for good in (
@@ -152,7 +156,7 @@ class TestScan(TempEnv):
             "rules/test.md",
         ):
             self.assertFalse(is_excluded(good, __import__(
-                "qoder_backup_core").DEFAULT_EXCLUDES), good)
+                "ai_env_clone.core").DEFAULT_EXCLUDES), good)
 
     def test_scan_filters_and_counts(self):
         r = scan_items(self.existing_items(), self.root)
@@ -247,7 +251,7 @@ class TestScan(TempEnv):
         self._w("shared_client/index/repo1.zap", b"ZAP")
         self._w("shared_client/index/meta.json", b"{}")
         # 构造 build_items 含 code_index 条目
-        from qoder_backup_core import QoderPaths, build_items
+        from ai_env_clone.adapters.qoder import QoderPaths, build_items
         items = build_items(QoderPaths(root=self.root, shared=self.shared))
         keys = {i.key for i in items}
         self.assertIn("code_index", keys)
@@ -260,7 +264,7 @@ class TestScan(TempEnv):
     def test_index_copy_excluded(self):
         """index - 副本 不应被备份（冗余副本）。"""
         self._w("shared_client/index - 副本/repo.db", b"SQLite format 3\x00" + b"Y")
-        from qoder_backup_core import QoderPaths, build_items
+        from ai_env_clone.adapters.qoder import QoderPaths, build_items
         # 构造一个含 index 目录的条目（模拟 code_index 已存在）
         items = build_items(QoderPaths(root=self.root, shared=self.shared))
         items.append(
@@ -387,11 +391,11 @@ class TestSecurity(TempEnv):
             "/abs/evil.txt",
             "C:/Windows/evil.txt",
         ):
-            self.assertIsNone(_safe_target(base, evil), evil)
+            self.assertIsNone(safe_target(base, evil), evil)
 
     def test_safe_target_allows_normal(self):
         base = os.path.realpath(self.tmp)
-        t = _safe_target(base, "shared_client/memories/a.md")
+        t = safe_target(base, "shared_client/memories/a.md")
         self.assertIsNotNone(t)
         self.assertTrue(os.path.abspath(t).startswith(base))
 
@@ -399,7 +403,7 @@ class TestSecurity(TempEnv):
         """`/root_evil` 不应被误判为 `/root` 的子路径。"""
         base = os.path.realpath(os.path.join(self.tmp, "root"))
         os.makedirs(base, exist_ok=True)
-        self.assertIsNone(_safe_target(base, "../root_evil/x.txt"))
+        self.assertIsNone(safe_target(base, "../root_evil/x.txt"))
 
     def test_malicious_zip_rejected(self):
         z = os.path.join(self.tmp, "evil.zip")
@@ -665,7 +669,7 @@ class TestGuiThreadSafety(TempEnv):
         self.tk_root.withdraw()
         self.addCleanup(self._destroy)
 
-        import qoder_backup_tool as gui
+        from ai_env_clone import __main__ as gui
 
         self.app = gui.QoderBackupApp(self.tk_root)
         # 指向测试目录，避免动用真实 Qoder 数据（统一走适配器接口）
@@ -677,7 +681,7 @@ class TestGuiThreadSafety(TempEnv):
         self.tk_root.update_idletasks()
 
         # 全程 mock 弹窗与文件对话框，避免无头测试期间弹出真实窗口
-        import qoder_backup_tool as gui
+        from ai_env_clone import __main__ as gui
         self._orig_msg = dict(gui.messagebox.__dict__)
         self._orig_fd = dict(gui.filedialog.__dict__)
         for _n in ("showinfo", "showerror", "showwarning", "askyesno", "askquestion", "askokcancel"):
@@ -689,7 +693,7 @@ class TestGuiThreadSafety(TempEnv):
         gui.filedialog.askopenfilename = lambda **k: self._open_path
 
     def tearDown(self):
-        import qoder_backup_tool as gui
+        from ai_env_clone import __main__ as gui
         gui.messagebox.__dict__.update(self._orig_msg)
         gui.filedialog.__dict__.update(self._orig_fd)
         super().tearDown()

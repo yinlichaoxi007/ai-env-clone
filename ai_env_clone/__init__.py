@@ -1,7 +1,7 @@
 """ai-env-clone：跨电脑备份与迁移国内 AI 编程工具的环境数据。
 
-注意：为避免与 ``qoder_backup_core`` 形成循环导入，本包初始化时**不**自动导入
-``adapters`` 子包。需要适配器时请显式：``from ai_env_clone.adapters import get_adapter``。
+注意：为避免循环导入，本包初始化时**不**自动导入 ``adapters`` 子包。
+需要适配器时请显式：``from ai_env_clone.adapters import get_adapter``。
 """
 
 from .core import (
