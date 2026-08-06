@@ -55,15 +55,27 @@ class TempEnv(unittest.TestCase):
         return p
 
     def _make_tree(self) -> None:
+        self.uid = "13166325"  # 当前用户 UID
         self._w("settings.json", b'{"theme":"dark"}')
-        self._w("shared_client/memories/global/pref.md", b"# memory\n")
-        self._w("shared_client/memories/projects/p1/note.md", b"# note\n")
-        self._w("cache/projects/proj1/data.json", b"{}")
+        # 用户级规则（根目录 rules/）
+        self._w("rules/test.md", b"# test rule\n")
+        # 记忆区：shared_client/memories/<uid>/{global,projects}
+        self._w("shared_client/memories/%s/global/pref.md" % self.uid, b"# memory\n")
+        self._w("shared_client/memories/%s/projects/p1/note.md" % self.uid, b"# note\n")
+        # 记忆区：根 memories/<uid>/projects（IDE 活跃数据）
+        self._w("memories/%s/projects/p1/ide.md" % self.uid, b"# ide\n")
+        # 第二个用户（用于"其他用户记忆区"分支）
+        self.other_uid = "99887766"
+        self._w("shared_client/memories/%s/global/pref.md" % self.other_uid, b"# om\n")
+        self._w("memories/%s/projects/p2/ide.md" % self.other_uid, b"# oide\n")
+        # 项目级会话历史（IDE 写入）
+        self._w("cache/projects/proj1/conversation-history/c1.jsonl", b"hello\n")
         self._w("shared_client/repowiki/wiki.md", b"# wiki\n")
         # 噪音文件，应被默认规则排除
         self._w("shared_client/cache/db.7z", b"A" * 2048)
         self._w("shared_client/cache/diagnosis.bin", b"B" * 2048)
         self._w("shared_client/logs/run.log", b"log")
+        self._w("cache/projects/proj1/other.tmp", b"tmp")
         self._w("cache - 副本/old.json", b"{}")
         # 真实 SQLite 库
         self.db = os.path.join(self.shared, "cache", "db", "local.db")
@@ -134,9 +146,10 @@ class TestScan(TempEnv):
 
     def test_keeps_real_data(self):
         for good in (
-            "shared_client/memories/global/pref.md",
+            "shared_client/memories/%s/global/pref.md" % self.uid,
             "settings.json",
             "shared_client/cache/db/local.db",
+            "rules/test.md",
         ):
             self.assertFalse(is_excluded(good, __import__(
                 "qoder_backup_core").DEFAULT_EXCLUDES), good)
@@ -144,8 +157,9 @@ class TestScan(TempEnv):
     def test_scan_filters_and_counts(self):
         r = scan_items(self.existing_items(), self.root)
         rels = {rel for _, rel in r.files}
-        self.assertIn("shared_client/memories/global/pref.md", rels)
+        self.assertIn("shared_client/memories/%s/global/pref.md" % self.uid, rels)
         self.assertIn("settings.json", rels)
+        self.assertIn("rules/test.md", rels)
         self.assertNotIn("shared_client/cache/db.7z", rels)
         self.assertGreater(r.skipped_count, 0)
         self.assertGreater(r.total_bytes, 0)
@@ -158,7 +172,9 @@ class TestScan(TempEnv):
             self.assertNotIn("\\", rel)
             self.assertFalse(rel.startswith(".."))
         rels = {rel for _, rel in r.files}
-        self.assertIn("shared_client/memories/projects/p1/note.md", rels)
+        self.assertIn(
+            "shared_client/memories/%s/projects/p1/note.md" % self.uid, rels
+        )
 
     def test_no_duplicates_when_items_overlap(self):
         """cache/db 与 cache 目录重叠，不应重复打包。"""
@@ -167,14 +183,16 @@ class TestScan(TempEnv):
         self.assertEqual(len(rels), len(set(rels)))
 
     def test_max_file_size_limit(self):
-        self._w("shared_client/memories/big.md", b"Z" * 4096)
+        self._w("shared_client/memories/%s/big.md" % self.uid, b"Z" * 4096)
         small = scan_items(self.existing_items(), self.root, max_file_mb=0.001)
         big = scan_items(self.existing_items(), self.root, max_file_mb=None)
         self.assertLess(small.file_count, big.file_count)
 
     def test_missing_items_recorded(self):
+        """build_items 中路径实际不存在的条目应被记为缺失（如 code_index 未生成）。"""
         r = scan_items(self.items(), self.root)
-        self.assertIn("session_env", r.missing_keys)
+        # 测试脚手架未创建 shared_client/index，故 code_index 必缺失
+        self.assertIn("code_index", r.missing_keys)
 
     def test_large_session_db_always_included(self):
         """回归：会话库体积远超上限也必须备份，否则备份毫无意义。"""
@@ -201,10 +219,10 @@ class TestScan(TempEnv):
 
     def test_threshold_none_includes_everything(self):
         """阈值 None 表示不限制，超大普通文件也纳入备份。"""
-        self._w("shared_client/memories/huge.md", b"Z" * (50 * 1024 * 1024))
+        self._w("shared_client/memories/%s/huge.md" % self.uid, b"Z" * (50 * 1024 * 1024))
         r = scan_items(self.existing_items(), self.root, max_file_mb=None)
         rels = {rel for _, rel in r.files}
-        self.assertIn("shared_client/memories/huge.md", rels)
+        self.assertIn("shared_client/memories/%s/huge.md" % self.uid, rels)
 
     def test_sqlite_wal_shm_always_included(self):
         """SQLite 配套文件（.db-wal / .db-shm）属于关键文件，不被体积阈值跳过。"""
@@ -443,7 +461,9 @@ class TestImport(TempEnv):
         dst = os.path.join(self.tmp, "restored")
         import_backup(z, dst, make_rollback=False)
 
-        good = os.path.join(dst, "shared_client", "memories", "global", "pref.md")
+        good = os.path.join(
+            dst, "shared_client", "memories", self.uid, "global", "pref.md"
+        )
         wrong = os.path.join(dst, "memories", "global", "pref.md")
         self.assertTrue(os.path.exists(good), "记忆文件恢复位置错误")
         self.assertFalse(os.path.exists(wrong), "出现了旧版的错位路径")
@@ -456,9 +476,10 @@ class TestImport(TempEnv):
 
         for rel in (
             "settings.json",
-            "shared_client/memories/global/pref.md",
-            "shared_client/memories/projects/p1/note.md",
-            "cache/projects/proj1/data.json",
+            "shared_client/memories/%s/global/pref.md" % self.uid,
+            "shared_client/memories/%s/projects/p1/note.md" % self.uid,
+            "cache/projects/proj1/conversation-history/c1.jsonl",
+            "rules/test.md",
         ):
             a = os.path.join(self.root, rel.replace("/", os.sep))
             b = os.path.join(dst, rel.replace("/", os.sep))
@@ -509,16 +530,16 @@ class TestImport(TempEnv):
         self.assertIsNone(r["rollback"])  # 无同名文件可回滚
         self.assertTrue(
             os.path.exists(os.path.join(fresh, "shared_client", "memories",
-                                        "global", "pref.md"))
+                                        self.uid, "global", "pref.md"))
         )
 
     def test_unicode_paths(self):
-        self._w("shared_client/memories/global/中文 记忆.md", "内容".encode("utf-8"))
+        self._w("shared_client/memories/%s/中文 记忆.md" % self.uid, "内容".encode("utf-8"))
         z = os.path.join(self.tmp, "u.zip")
         export_backup(z, self.existing_items(), self.root)
         dst = os.path.join(self.tmp, "u_restored")
         import_backup(z, dst, make_rollback=False)
-        p = os.path.join(dst, "shared_client", "memories", "global", "中文 记忆.md")
+        p = os.path.join(dst, "shared_client", "memories", self.uid, "中文 记忆.md")
         self.assertTrue(os.path.exists(p))
         with open(p, "rb") as f:
             self.assertEqual(f.read().decode("utf-8"), "内容")
@@ -555,7 +576,7 @@ class TestImport(TempEnv):
         self.assertGreater(r["restored"], 0)
 
         # zip 不再需要保留即可验证目标已完整还原
-        out = os.path.join(dst, "shared_client", "memories", "global", "pref.md")
+        out = os.path.join(dst, "shared_client", "memories", self.uid, "global", "pref.md")
         self.assertTrue(os.path.exists(out))
         with open(out, "rb") as f:
             self.assertEqual(f.read(), b"# memory\n")
@@ -606,7 +627,7 @@ class TestMigrationScenario(TempEnv):
         self.assertFalse(result["blocked"])
 
         # 记忆可读
-        mem = os.path.join(pc_b, "shared_client", "memories", "global", "pref.md")
+        mem = os.path.join(pc_b, "shared_client", "memories", self.uid, "global", "pref.md")
         with open(mem, "rb") as f:
             self.assertEqual(f.read(), b"# memory\n")
 
@@ -649,9 +670,29 @@ class TestGuiThreadSafety(TempEnv):
         self.app = gui.QoderBackupApp(self.tk_root)
         # 指向测试目录，避免动用真实 Qoder 数据（统一走适配器接口）
         self.app.root_dir = self.root
-        self.app.items = self.app.adapter.build_items(self.root)
+        # 显式指定当前用户，保证 memories_current 项存在且可测
+        self.app.items = self.app.adapter.build_items(self.root, current_uid=self.uid)
         self.app._refresh_items()
+        self.app._refresh_uid_combo()
         self.tk_root.update_idletasks()
+
+        # 全程 mock 弹窗与文件对话框，避免无头测试期间弹出真实窗口
+        import qoder_backup_tool as gui
+        self._orig_msg = dict(gui.messagebox.__dict__)
+        self._orig_fd = dict(gui.filedialog.__dict__)
+        for _n in ("showinfo", "showerror", "showwarning", "askyesno", "askquestion", "askokcancel"):
+            setattr(gui.messagebox, _n, lambda *a, **k: None)
+        # 文件对话框返回路径可由单个测试改写，避免局部 mock 还原竞态
+        self._save_path = os.path.join(self.tmp, "gui_export.zip")
+        self._open_path = os.path.join(self.tmp, "gui_import.zip")
+        gui.filedialog.asksaveasfilename = lambda **k: self._save_path
+        gui.filedialog.askopenfilename = lambda **k: self._open_path
+
+    def tearDown(self):
+        import qoder_backup_tool as gui
+        gui.messagebox.__dict__.update(self._orig_msg)
+        gui.filedialog.__dict__.update(self._orig_fd)
+        super().tearDown()
 
     def _destroy(self):
         try:
@@ -709,17 +750,10 @@ class TestGuiThreadSafety(TempEnv):
     def test_export_never_touches_tk_from_thread(self):
         offenders = self._watch_tk_vars()
         z = os.path.join(self.tmp, "gui.zip")
+        self._save_path = z  # 文件对话框返回此路径（全局 mock，无需局部还原）
 
-        # 绕过文件对话框，直接驱动 on_export 的后台部分
-        import qoder_backup_tool as gui
-
-        orig = gui.filedialog.asksaveasfilename
-        gui.filedialog.asksaveasfilename = lambda **kw: z
-        try:
-            self.app.on_export()
-            self.assertTrue(self._run_until_idle(), "导出任务超时")
-        finally:
-            gui.filedialog.asksaveasfilename = orig
+        self.app.on_export()
+        self.assertTrue(self._run_until_idle(), "导出任务超时")
 
         self.assertEqual(offenders, [], "后台线程访问了 Tk 变量：%s" % offenders)
         self.assertTrue(os.path.exists(z))
@@ -727,23 +761,12 @@ class TestGuiThreadSafety(TempEnv):
     def test_import_never_touches_tk_from_thread(self):
         z = os.path.join(self.tmp, "gui2.zip")
         export_backup(z, self.existing_items(), self.root)
+        self._open_path = z  # 文件对话框返回此路径（全局 mock，无需局部还原）
 
         offenders = self._watch_tk_vars()
-        import qoder_backup_tool as gui
 
-        o1 = gui.filedialog.askopenfilename
-        o2 = gui.messagebox.askyesno
-        o3 = gui.messagebox.showinfo
-        gui.filedialog.askopenfilename = lambda **kw: z
-        gui.messagebox.askyesno = lambda *a, **k: True
-        gui.messagebox.showinfo = lambda *a, **k: None
-        try:
-            self.app.on_import()
-            self.assertTrue(self._run_until_idle(), "恢复任务超时")
-        finally:
-            gui.filedialog.askopenfilename = o1
-            gui.messagebox.askyesno = o2
-            gui.messagebox.showinfo = o3
+        self.app.on_import()
+        self.assertTrue(self._run_until_idle(), "恢复任务超时")
 
         self.assertEqual(offenders, [], "后台线程访问了 Tk 变量：%s" % offenders)
 
@@ -795,6 +818,82 @@ class TestGuiThreadSafety(TempEnv):
         # 0 视为不限制
         self.app.max_mb_var.set("0")
         self.assertIsNone(self.app._max_mb())
+
+    # ----------------------------------------------------------------------- #
+    # 无头交互：记忆区双分组 + 其他用户 UID 多选（不依赖真实显示）
+    # ----------------------------------------------------------------------- #
+    def test_backup_list_frame_lays_out_with_width(self):
+        """布局断言：用 root.update() 驱动一次完整布局后，
+        备份内容区（canvas 内嵌 list_frame）必须真正铺开宽度，
+        否则双列会被压成一条竖线（肉眼看即'什么都没有'）。"""
+        # withdraw 下 Tcl 不布局，此处临时 deiconify 驱动一次真实几何计算
+        self.tk_root.deiconify()
+        self.tk_root.geometry("720x640")
+        self.tk_root.update()  # 强制 Tcl 完成布局计算
+        self.tk_root.after_idle(self.app._sync_canvas_width)
+        self.tk_root.update_idletasks()
+        width = self.app.list_frame.winfo_width()
+        self.assertGreater(width, 200, "备份内容区宽度塌缩，双列不可见（实测 %dpx）" % width)
+        # 每行由 [勾选+标题, 说明] 两个 grid 控件组成；验证首行左右均铺开且对齐
+        rows = [w for w in self.app.list_frame.winfo_children()
+                if w.winfo_class() == "TFrame" and w.winfo_children()]
+        self.assertTrue(rows, "未生成任何备份项行")
+        first = rows[0]
+        cb, lbl = first.winfo_children()[:2]
+        self.assertGreater(cb.winfo_width(), 20, "标题/勾选列未铺开")
+        self.assertGreater(lbl.winfo_width(), 50, "说明列未铺开")
+
+    def test_uid_combo_defaults_to_current_user(self):
+        vals = list(self.app.uid_combo["values"])
+        self.assertIn(self.uid, vals)
+        self.assertIn(self.other_uid, vals)
+        # 默认选中自动检测到的当前用户
+        self.assertEqual(self.app.uid_var.get(), self.uid)
+
+    def test_selected_items_only_current_user_by_default(self):
+        sel = self.app._selected_items()
+        keys = {i.key for i in sel}
+        # 默认只含"当前用户记忆区"（聚合前缀），不含任何"其他用户记忆区"项
+        self.assertTrue(
+            any(k.startswith("memories_current") for k in keys),
+            "默认应含当前用户记忆区",
+        )
+        self.assertFalse(
+            any(k.startswith("memories_others") for k in keys),
+            "默认不应包含其他用户记忆区",
+        )
+
+    def test_others_block_hidden_until_checked(self):
+        # 未勾选主项时，底部 UID 区块不应渲染出子项
+        self.assertFalse(self.app.others_master_var.get())
+        self.assertEqual(len(getattr(self.app, "other_vars", {})), 0)
+
+        # 勾选主项后，应展开其余 UID 且默认全选
+        self.app.others_master_var.set(True)
+        self.app._on_others_toggled()
+        self.assertIn(self.other_uid, self.app.other_vars)
+        self.assertTrue(self.app.other_vars[self.other_uid].get())
+
+    def test_others_uid_filter_applied_on_export(self):
+        # 勾选其他用户主项，但只选 other_uid
+        self.app.others_master_var.set(True)
+        self.app._on_others_toggled()
+        # 取消当前用户记忆区，仅保留其他用户
+        self.app.current_var.set(False)
+        sel = self.app._selected_items()
+        others = [i for i in sel if i.key.startswith("memories_others")]
+        self.assertTrue(others)
+        self.assertTrue(all(i.uid == self.other_uid for i in others))
+        self.assertFalse(any(i.key.startswith("memories_current") for i in sel))
+
+    def test_uid_switch_rebuilds_memory_items(self):
+        # 切换当前用户下拉为 other_uid，记忆区应重建
+        self.app.uid_var.set(self.other_uid)
+        self.app._on_uid_selected()
+        sel = self.app._selected_items()
+        cur = [i for i in sel if i.key.startswith("memories_current")]
+        self.assertTrue(cur)
+        self.assertEqual(cur[0].uid, self.other_uid)
 
 
 if __name__ == "__main__":

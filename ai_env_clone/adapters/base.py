@@ -38,10 +38,32 @@ class BaseAdapter(ABC):
         """未探测到时的默认（建议）数据目录。"""
 
     # ------------------------------------------------------------------ #
+    # 结构指纹（回退校验用，可重写）
+    # ------------------------------------------------------------------ #
+    def match_structure(self, names: Sequence[str]) -> tuple[bool, list[str]]:
+        """
+        判断 zip 内条目名列表是否匹配本工具的数据结构（用于**缺 manifest 时**
+        回退识别类型 / 严格模式下二次校验）。
+
+        :param names: 压缩包内所有条目名（含目录项，正斜杠分隔）。
+        :return: ``(是否匹配, 缺失项说明列表)``。
+
+        默认实现返回 ``(False, ["未实现结构指纹"])`` —— 即适配器未重写时，
+        任何需要回退的包都被判为「不匹配」，等价于「只严格匹配 manifest，
+        不允许无清单回退」。各适配器应按自身数据结构重写。
+        """
+        return False, ["未实现结构指纹"]
+
+    # ------------------------------------------------------------------ #
     # 通用实现（多数适配器无需重写）
     # ------------------------------------------------------------------ #
     def export(
-        self, zip_path: str, root: str, progress=None, max_file_mb: float | None = 200.0
+        self,
+        zip_path: str,
+        root: str,
+        progress=None,
+        max_file_mb: float | None = 200.0,
+        compresslevel: int = 6,
     ) -> dict:
         items = self.build_items(root)
         return export_backup(
@@ -51,6 +73,7 @@ class BaseAdapter(ABC):
             tool_name=self.name,
             progress=progress,
             max_file_mb=max_file_mb,
+            compresslevel=compresslevel,
         )
 
     def inspect(self, zip_path: str) -> dict:
