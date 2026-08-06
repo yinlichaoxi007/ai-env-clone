@@ -11,7 +11,7 @@
 `ai-env-clone` 帮助你把本地 AI 编程工具（如 Qoder）积累的**记忆（memory）**、**会话历史（chat history）**、**代码索引**、**配置**等数据，打包成一个离线备份文件，方便在新电脑上完整恢复，避免重新训练和丢失上下文。
 
 - 🖥️ **双形态**：同一套核心逻辑，既提供命令行（CLI）也提供图形界面（GUI，基于 Python 自带的 tkinter，无需额外安装）。
-- 📦 **零第三方依赖**：运行时不依赖任何第三方库，仅用 Python 标准库。发布版的**单文件 exe 双击即用、无需安装 Python**；从源码运行（`python qoder_backup_tool.py` 或 `run.bat`）则需本机已装 Python 3.10+。
+- 📦 **零第三方依赖**：运行时不依赖任何第三方库，仅用 Python 标准库。发布版的**单文件 exe 双击即用、无需安装 Python**；从源码运行（`python -m ai_env_clone` 或 `run.bat`）则需本机已装 Python 3.10+。
 - 🌐 **跨平台**：Windows / macOS / Linux 均可运行（GUI 在三大平台均可用）。
 - 🔌 **可扩展**：以"适配器（adapter）"模式设计，新增一种 AI 工具只需添加一个适配器模块。
 - 🛡️ **安全可靠**：恢复前自动生成回滚快照；SQLite 数据库使用在线备份 API 一致性快照；内置 Zip Slip 路径穿越防护。
@@ -35,7 +35,7 @@
 
 到 [Releases](https://github.com/yinlichaoxi007/ai-env-clone/releases) 下载对应平台的单文件程序：
 
-- Windows：`QoderBackupTool.exe`（或未来的 `ai-env-clone.exe`），双击运行。
+- Windows：`AiEnvClone.exe`（单文件），双击运行。
 - macOS / Linux：下载可执行包，赋予执行权限后运行。
 
 ### 方式二：从源码运行（需 Python 3.10+）
@@ -43,7 +43,7 @@
 ```bash
 git clone https://github.com/yinlichaoxi007/ai-env-clone.git
 cd ai-env-clone
-python qoder_backup_tool.py        # 启动 GUI
+python -m ai_env_clone                    # 启动 GUI
 ```
 
 ### 方式三：自行打包单文件 exe（Windows）
@@ -58,7 +58,7 @@ python build_exe.py                # 产物在 dist/ 目录下
 ### GUI（图形界面）
 
 ```bash
-python qoder_backup_tool.py
+python -m ai_env_clone
 ```
 
 启动后：自动检测数据目录 → 勾选要备份的内容 → 点击「导出备份」生成 zip，或「还原备份包」恢复。
@@ -67,14 +67,14 @@ python qoder_backup_tool.py
 
 ### CLI（命令行）
 
-> 当前 CLI 入口正在完善中，核心逻辑层 `qoder_backup_core.py` 已完全解耦，可独立调用 `export_backup` / `import_backup` / `inspect_backup`。
+> 当前 CLI 入口正在完善中，核心逻辑层 `ai_env_clone.core` 已完全解耦，可独立调用 `export_backup` / `import_backup` / `inspect_backup`。
 
 ```bash
 # 备份
-python qoder_backup_tool.py --backup --out ./my-backup.zip
+python -m ai_env_clone --backup --out ./my-backup.zip
 
 # 恢复
-python qoder_backup_tool.py --restore --in ./my-backup.zip
+python -m ai_env_clone --restore --in ./my-backup.zip
 ```
 
 （具体 CLI 参数以发布版本为准，请关注 Release Notes。）
@@ -89,14 +89,17 @@ python qoder_backup_tool.py --restore --in ./my-backup.zip
 ## 架构
 
 ```
-ai_env_clone/
+ai_env_clone/                包（import 名 ai_env_clone，产品名 AiEnvClone）
+├── __init__.py        包初始化与 __version__
+├── __main__.py        图形界面层（tkinter），统一入口，负责交互与进度展示
 ├── core.py            通用核心层（扫描/打包/校验/恢复/SQLite快照/ZipSlip防护），与具体工具解耦
-└── adapters/
-    ├── base.py        BaseAdapter 抽象接口 + 适配器注册表
-    └── qoder.py       Qoder 适配器（参考实现）
-qoder_backup_core.py   Qoder 兼容层（保留历史 API，委托 ai_env_clone 实现）
-qoder_backup_tool.py   图形界面层（tkinter），负责交互与进度展示
-build_exe.py           用 PyInstaller 打包成单文件 exe
+├── compress_estimate.py  压缩体积预估（经验系数 + 可校准缓存）
+├── adapters/
+│   ├── base.py        BaseAdapter 抽象接口 + 适配器注册表
+│   └── qoder.py       Qoder 适配器（参考实现，自包含）
+└── backup/            备份/恢复执行与回滚快照
+build_exe.py           用 PyInstaller 打包成单文件 exe（产物 AiEnvClone.exe）
+.github/workflows/     build-release.yml（打 tag 自动构建 exe 发 Release）+ mirror-to-gitee.yml（镜像到 Gitee）
 ```
 
 **多工具扩展**：已采用统一的适配器接口（`detect_root()` / `build_items()` / `export()` / `restore()`）。每种 AI 工具对应一个适配器模块，新增工具无需改动主流程，详见 `docs/CONTRIBUTING.md`。
@@ -109,10 +112,10 @@ build_exe.py           用 PyInstaller 打包成单文件 exe
 - **手动运行**：
   ```bash
   # 运行全部测试（含无头 GUI 测试，不会弹出任何窗口）
-  python -m unittest discover -s . -p "test_*.py"
+  python -m unittest discover -s tests -p "test_*.py"
 
   # 仅运行 GUI 无头测试类
-  python -m unittest test_qoder_backup.TestGuiThreadSafety -v
+  python -m unittest tests.test_qoder.TestGuiThreadSafety -v
   ```
 - **关于 GUI 测试**：GUI 测试基于 tkinter 的 `withdraw()` 实现**无头（headless）运行**，控件、变量与事件回调均可正常创建与触发，不会弹出真实窗口、也不会依赖显示器。消息框（`messagebox`）在测试中被 mock，避免人工点击。真实 GUI 中备份/恢复完成后的成功提示弹窗是正常产品行为，与自动化测试无关。
 
@@ -165,7 +168,7 @@ build_exe.py           用 PyInstaller 打包成单文件 exe
 
 Get the single-file build from [Releases](https://github.com/yinlichaoxi007/ai-env-clone/releases):
 
-- Windows: `QoderBackupTool.exe` (or future `ai-env-clone.exe`), double-click to run.
+- Windows: `AiEnvClone.exe` (single-file), double-click to run.
 - macOS / Linux: download the executable, `chmod +x` then run.
 
 ### Option B: Run from source (Python 3.10+ required)
@@ -173,7 +176,7 @@ Get the single-file build from [Releases](https://github.com/yinlichaoxi007/ai-e
 ```bash
 git clone https://github.com/yinlichaoxi007/ai-env-clone.git
 cd ai-env-clone
-python qoder_backup_tool.py        # launch GUI
+python -m ai_env_clone                    # launch GUI
 ```
 
 ### Option C: Build single-file exe yourself (Windows)
@@ -188,7 +191,7 @@ python build_exe.py                # output in dist/
 ### GUI
 
 ```bash
-python qoder_backup_tool.py
+python -m ai_env_clone
 ```
 
 Auto-detect data dir → check items → "导出备份" (export) to make a zip, or "还原备份包" (restore) to recover.
@@ -197,11 +200,11 @@ On Windows you can also double-click `run.bat` (requires Python 3.10+ installed 
 
 ### CLI
 
-> The CLI entry is being finalized. The core layer `qoder_backup_core.py` is fully decoupled and callable via `export_backup` / `import_backup` / `inspect_backup`.
+> The CLI entry is being finalized. The core layer `ai_env_clone.core` is fully decoupled and callable via `export_backup` / `import_backup` / `inspect_backup`.
 
 ```bash
-python qoder_backup_tool.py --backup --out ./my-backup.zip
-python qoder_backup_tool.py --restore --in ./my-backup.zip
+python -m ai_env_clone --backup --out ./my-backup.zip
+python -m ai_env_clone --restore --in ./my-backup.zip
 ```
 
 (Exact CLI flags follow the released version; see Release Notes.)
@@ -215,14 +218,17 @@ python qoder_backup_tool.py --restore --in ./my-backup.zip
 ## Architecture
 
 ```
-ai_env_clone/
+ai_env_clone/                package (import name ai_env_clone, product name AiEnvClone)
+├── __init__.py        package init & __version__
+├── __main__.py        GUI layer (tkinter), unified entry point, interaction & progress
 ├── core.py            generic core (scan / pack / verify / restore / SQLite snapshot / Zip Slip guard), tool-agnostic
-└── adapters/
-    ├── base.py        BaseAdapter interface + adapter registry
-    └── qoder.py       Qoder adapter (reference implementation)
-qoder_backup_core.py   Qoder compat layer (keeps legacy API, delegates to ai_env_clone)
-qoder_backup_tool.py   GUI layer (tkinter), interaction & progress
-build_exe.py           package into single-file exe via PyInstaller
+├── compress_estimate.py  compressed-size estimation (empirical ratios + calibratable cache)
+├── adapters/
+│   ├── base.py        BaseAdapter interface + adapter registry
+│   └── qoder.py       Qoder adapter (reference implementation, self-contained)
+└── backup/            backup/restore execution & rollback snapshots
+build_exe.py           package into single-file exe via PyInstaller (output AiEnvClone.exe)
+.github/workflows/     build-release.yml (tag → auto-build exe & publish Release) + mirror-to-gitee.yml (mirror to Gitee)
 ```
 
 **Multi-tool**: a unified adapter interface (`detect_root()` / `build_items()` / `export()` / `restore()`). Each AI tool maps to one adapter module; adding a tool never touches the main flow. See `docs/CONTRIBUTING.md`.
@@ -235,10 +241,10 @@ The repo ships full unit tests built on the Python stdlib `unittest`, **no third
 - **Manual**:
   ```bash
   # Run all tests (incl. headless GUI tests — no window pops up)
-  python -m unittest discover -s . -p "test_*.py"
+  python -m unittest discover -s tests -p "test_*.py"
 
   # Run only the headless GUI test class
-  python -m unittest test_qoder_backup.TestGuiThreadSafety -v
+  python -m unittest tests.test_qoder.TestGuiThreadSafety -v
   ```
 - **About GUI tests**: GUI tests run **headless** via tkinter's `withdraw()` — widgets, variables and event callbacks are created and fired normally, with no real window and no display needed. `messagebox` is mocked during tests to avoid manual clicks. The success popup after a real backup/restore in the actual GUI is normal product behavior and unrelated to automated tests.
 

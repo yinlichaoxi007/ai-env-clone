@@ -15,11 +15,11 @@ echo 正在运行测试，请稍候...
 set RESULT_FILE=test_result.txt
 if exist "%RESULT_FILE%" del /f /q "%RESULT_FILE%" 2>nul
 if not exist "%RESULT_FILE%" (
-    python -m unittest discover -s . -p "test_*.py" > "%RESULT_FILE%" 2>&1
+    python -m unittest discover -s tests -p "test_*.py" > "%RESULT_FILE%" 2>&1
 ) else (
     REM 旧结果文件被占用时，改用带时间戳的文件，避免冲突
     set RESULT_FILE=test_result_%date:~0,4%%date:~5,2%%date:~8,2%_%time:~0,2%%time:~3,2%%time:~6,2%.txt
-    python -m unittest discover -s . -p "test_*.py" > "%RESULT_FILE%" 2>&1
+    python -m unittest discover -s tests -p "test_*.py" > "%RESULT_FILE%" 2>&1
 )
 set RC=%errorlevel%
 

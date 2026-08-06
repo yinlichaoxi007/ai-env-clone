@@ -1,11 +1,13 @@
 """
-Qoder 记忆与会话历史 备份 / 迁移工具（图形界面）
+AI 工具记忆与会话历史 备份 / 迁移工具（图形界面，统一入口）
 
 运行：
-    python qoder_backup_tool.py
+    python -m ai_env_clone        # 源码/开发方式（仓库根目录执行）
+    ai_env_clone                  # pip 安装后直接用命令启动（由 pyproject.toml 的 entry_points 生成）
 
-通过 ``ai_env_clone`` 的适配器抽象层接入具体工具，核心逻辑位于
-``ai_env_clone.core``，适配器位于 ``ai_env_clone.adapters``。本文件只负责界面与交互。
+通过 ``ai_env_clone`` 的适配器抽象层接入具体工具（下拉切换），核心逻辑位于
+``ai_env_clone.core``，各工具适配器位于 ``ai_env_clone/adapters/``。本文件是
+``python -m ai_env_clone`` 与 pip 命令 ``ai_env_clone`` 的唯一起始点，只负责界面与交互。
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ import tkinter.font as tkfont
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
-from ai_env_clone.adapters import get_adapter
+from ai_env_clone.adapters import get_adapter, list_adapters
 from ai_env_clone.compress_estimate import (
     COMPRESS_LEVELS,
     DEFAULT_COMPRESS_LEVEL,
@@ -40,7 +42,8 @@ from ai_env_clone.core import (
     scan_items,
 )
 
-APP_TITLE = "Qoder 备份迁移工具"
+APP_TITLE_TPL = "%s 备份迁移工具"  # % (tool_display_name,)
+BROWSER_TITLE_TPL = "还原备份/快照"
 
 
 def human_size(n: float) -> str:
@@ -54,11 +57,14 @@ def human_size(n: float) -> str:
 class QoderBackupApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title(APP_TITLE)
         root.geometry("738x640")
         root.minsize(700, 600)
 
-        self.adapter = get_adapter("qoder")
+        # 默认使用第一个已注册适配器（维护者新增适配器后自动出现在切换下拉中）
+        self._tool_names = list_adapters()
+        self.adapter = get_adapter(self._tool_names[0])
+        self.root.title(APP_TITLE_TPL % self.adapter.display_name)
+
         self.root_dir = self._detect_root()
         self.items = self.adapter.build_items(self.root_dir)
         self.vars: dict[str, tk.BooleanVar] = {}
@@ -75,14 +81,58 @@ class QoderBackupApp:
         self._after_id = self.root.after(80, self._drain_queue)
 
     # ------------------------------------------------------------------ UI --
+    def _on_switch_tool(self, event=None) -> None:
+        """切换当前 AI 工具：重设适配器、自动探测新工具数据目录、重建备份内容、同步标题。"""
+        disp = self.tool_var.get()
+        name = self._tool_display.get(disp)
+        if not name or name == self.adapter.name:
+            return  # 未变化或映射缺失，忽略
+        self.adapter = get_adapter(name)
+
+        # 自动探测新工具的数据目录（B 项确认：覆盖而非保留旧路径）
+        self.root_dir = self._detect_root()
+        self.root_var.set(self.root_dir)
+        # 重建备份内容（不同工具的项结构不同，必须重建）
+        self.items = self.adapter.build_items(self.root_dir)
+        self.vars.clear()
+        self.others_by_uid.clear()
+        self.others_master_var.set(False)
+        self.other_vars.clear()
+
+        # 同步所有涉及工具名的标题
+        self.root.title(APP_TITLE_TPL % self.adapter.display_name)
+        self.dir_frame.config(text="%s 数据目录" % self.adapter.display_name)
+
+        self._refresh_items()
+        self._refresh_uid_combo()
+        self.status.configure(text="已切换到 %s" % self.adapter.display_name)
+
     def _build_ui(self) -> None:
         pad = {"padx": 12, "pady": 6}
 
+        # 工具切换：维护者实现新适配器后，下拉即可切换当前 AI 工具
+        tool_row = ttk.Frame(self.root)
+        tool_row.pack(fill=tk.X, padx=12, pady=(6, 0))
+        ttk.Label(tool_row, text="AI 工具：").pack(side=tk.LEFT)
+        self.tool_var = tk.StringVar(value=self.adapter.display_name)
+        self.tool_combo = ttk.Combobox(
+            tool_row, textvariable=self.tool_var, width=18, state="readonly"
+        )
+        # 下拉显示各工具可读名，内部用 name 映射
+        self._tool_display = {
+            get_adapter(n).display_name: n for n in self._tool_names
+        }
+        self.tool_combo["values"] = list(self._tool_display.keys())
+        self.tool_combo.bind("<<ComboboxSelected>>", self._on_switch_tool)
+        self.tool_combo.pack(side=tk.LEFT, padx=(4, 0))
+
         # 数据目录
-        top = ttk.LabelFrame(self.root, text="Qoder 数据目录")
-        top.pack(fill=tk.X, **pad)
+        self.dir_frame = ttk.LabelFrame(
+            self.root, text="%s 数据目录" % self.adapter.display_name
+        )
+        self.dir_frame.pack(fill=tk.X, **pad)
         self.root_var = tk.StringVar(value=self.root_dir)
-        row = ttk.Frame(top)
+        row = ttk.Frame(self.dir_frame)
         row.pack(fill=tk.X, padx=8, pady=8)
         ttk.Entry(row, textvariable=self.root_var).pack(
             side=tk.LEFT, fill=tk.X, expand=True
@@ -93,11 +143,11 @@ class QoderBackupApp:
         ttk.Button(row, text="重新检测", command=self._redetect, width=10).pack(
             side=tk.LEFT, padx=(6, 0)
         )
-        self.root_hint = ttk.Label(top, text="", foreground="#666")
+        self.root_hint = ttk.Label(self.dir_frame, text="", foreground="#666")
         self.root_hint.pack(anchor="w", padx=10, pady=(0, 8))
 
         # 当前登录用户 UID（记忆区默认备份对象，下拉切换）
-        uid_row = ttk.Frame(top)
+        uid_row = ttk.Frame(self.dir_frame)
         uid_row.pack(fill=tk.X, padx=10, pady=(0, 8))
         ttk.Label(uid_row, text="当前用户：").pack(side=tk.LEFT)
         self.uid_var = tk.StringVar()
@@ -405,7 +455,7 @@ class QoderBackupApp:
                 "已识别：%s ｜ 共享目录：%s"
                 % (self.root_dir, self._shared_name())
                 if ok
-                else "未找到 Qoder 数据目录，请手动指定"
+                else "未找到 %s 数据目录，请手动指定" % self.adapter.display_name
             ),
             foreground="#0a6" if ok else "#c00",
         )
@@ -500,7 +550,7 @@ class QoderBackupApp:
             self._rebuild_others_block()
 
     def _choose_root(self) -> None:
-        d = filedialog.askdirectory(title="选择 Qoder 数据目录")
+        d = filedialog.askdirectory(title="选择 %s 数据目录" % self.adapter.display_name)
         if d:
             self.root_var.set(d)
             self._redetect()
@@ -968,7 +1018,7 @@ class BackupBrowser:
         self._result: dict | None = None
 
         top = tk.Toplevel(app.root)
-        top.title("备份浏览器 — %s" % os.path.basename(backup_dir))
+        top.title(BROWSER_TITLE_TPL)
         # 窗口宽度收敛：左侧列表按内容自适应(约503px)，右侧详情框请求宽约344px，
         # 二者加边距/sash 约 880；920 使右侧自然贴合内容、不空。
         top.geometry("920x640")
@@ -1439,7 +1489,7 @@ class BackupBrowser:
         if not new_dir:
             return
         self.backup_dir = new_dir
-        self.top.title("备份浏览器 — %s" % os.path.basename(new_dir))
+        self.top.title(BROWSER_TITLE_TPL)
         self.dir_lbl.config(text=new_dir)
         self._set_detail("已切换到目录：\n%s\n\n正在加载该目录下的备份文件…" % new_dir)
         self._load_list()
