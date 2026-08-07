@@ -160,7 +160,7 @@ def build_items(paths: "QoderPaths", current_uid: str | None = None) -> list[Bac
         items.append(
             BackupItem(
                 key=key,
-                label="历史会话数据库（SQLite）",
+                label="历史会话数据库",
                 path=db_file,
                 description="全局会话/历史主库及其 -wal/-shm 配套文件，核心数据。建议必选。",
                 recommended=True,
@@ -195,19 +195,28 @@ def build_items(paths: "QoderPaths", current_uid: str | None = None) -> list[Bac
     #    两处路径（~/.qoder-cn/memories/<uid> 与 ~/.qoder-cn/shared_client/memories/<uid>）
     #    各生成唯一 key（聚合前缀 "memories_current" + :root/:shared 后缀），
     #    GUI 按前缀聚合成一个勾选项；任一存在即视为"找到"。
-    if current_uid:
+    #    注意：无论是否探测到当前用户，都必须生成"当前用户记忆区"这一标准选项，
+    #    否则数据目录识别失败（current_uid 为空）时该行会从清单消失，导致备份内容区
+    #    选项与勾选状态随路径识别结果忽有忽无。探测失败时以占位 uid 生成，路径无效、
+    #    exists 自动为 False，GUI 仅显示"（未找到）"且不勾选，选项结构保持稳定。
+    cur_uids = [current_uid] if current_uid else [None]
+    for uid in cur_uids:
         cur_paths = [
-            (os.path.join(root, "memories", current_uid), "root"),
-            (os.path.join(shared, "memories", current_uid), "shared"),
+            (os.path.join(root, "memories", uid) if uid else os.path.join(root, "memories"), "root"),
+            (os.path.join(shared, "memories", uid) if uid else os.path.join(shared, "memories"), "shared"),
         ]
         for mp, tag in cur_paths:
+            if uid:
+                desc = "当前登录用户（%s）的记忆（%s 位置）。默认勾选。" % (uid, tag)
+            else:
+                desc = "当前登录用户的记忆（%s 位置）。未检测到当前用户，请确认数据目录正确。默认勾选。" % tag
             items.append(
                 BackupItem(
                     key="memories_current:" + tag,
                     label="当前用户记忆区",
                     path=mp,
-                    uid=current_uid,
-                    description="当前登录用户（%s）的记忆（%s 位置）。默认勾选。" % (current_uid, tag),
+                    uid=uid,
+                    description=desc,
                     recommended=True,
                 )
             )

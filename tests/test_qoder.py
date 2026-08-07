@@ -671,6 +671,10 @@ class TestGuiThreadSafety(TempEnv):
 
         from ai_env_clone import __main__ as gui
 
+        # 无头模式：隐藏导入流程中弹出的备份浏览器子窗口，避免测试闪窗。
+        gui.HEADLESS = True
+        self.addCleanup(lambda: setattr(gui, "HEADLESS", False))
+
         self.app = gui.QoderBackupApp(self.tk_root)
         # 指向测试目录，避免动用真实 Qoder 数据（统一走适配器接口）
         self.app.root_dir = self.root
@@ -830,10 +834,10 @@ class TestGuiThreadSafety(TempEnv):
         """布局断言：用 root.update() 驱动一次完整布局后，
         备份内容区（canvas 内嵌 list_frame）必须真正铺开宽度，
         否则双列会被压成一条竖线（肉眼看即'什么都没有'）。"""
-        # withdraw 下 Tcl 不布局，此处临时 deiconify 驱动一次真实几何计算
-        self.tk_root.deiconify()
+        # 保持窗口 withdrawn，仅用 update_idletasks() 驱动几何计算（无需 deiconify，
+        # 避免双屏下窗口落入第二屏可见区而闪窗）。
         self.tk_root.geometry("720x640")
-        self.tk_root.update()  # 强制 Tcl 完成布局计算
+        self.tk_root.update_idletasks()
         self.tk_root.after_idle(self.app._sync_canvas_width)
         self.tk_root.update_idletasks()
         width = self.app.list_frame.winfo_width()
@@ -853,6 +857,23 @@ class TestGuiThreadSafety(TempEnv):
         self.assertIn(self.other_uid, vals)
         # 默认选中自动检测到的当前用户
         self.assertEqual(self.app.uid_var.get(), self.uid)
+
+    def test_uid_combo_force_clear_when_dir_unrecognized(self):
+        # 回归：目录未识别（冻结）时，即使 self.items 仍残留上一次有效的 UID，
+        # 当前用户下拉也必须清空并禁用，不能残留旧用户名。
+        self.assertIn(self.uid, self.app.uid_combo["values"])  # 前置：有效时本有值
+        self.app._refresh_uid_combo(force_clear=True)
+        self.assertEqual(self.app.uid_var.get(), "")
+        self.assertEqual(str(self.app.uid_combo.cget("state")), "disabled")
+
+    def test_redetect_invalid_path_clears_uid_combo(self):
+        # 回归：目录未识别（冻结）时当前用户下拉必须清空禁用，
+        # 即便 self.items 仍残留上一次有效的 UID（冻结分支不重建清单）。
+        self.assertIn(self.uid, self.app.uid_combo["values"])
+        self.app.root_var.set("C:/__no_such_qoder_dir__")
+        self.app._redetect()
+        self.assertEqual(self.app.uid_var.get(), "")
+        self.assertEqual(str(self.app.uid_combo.cget("state")), "disabled")
 
     def test_selected_items_only_current_user_by_default(self):
         sel = self.app._selected_items()
