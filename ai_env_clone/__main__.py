@@ -13,6 +13,7 @@ AI 工具记忆与会话历史 备份 / 迁移工具（图形界面，统一入�
 from __future__ import annotations
 
 import os
+import sys
 import json
 import queue
 import re
@@ -45,6 +46,9 @@ from ai_env_clone.core import (
 APP_TITLE_TPL = "%s 备份迁移工具"  # % (tool_display_name,)
 BROWSER_TITLE_TPL = "还原备份/快照"
 
+# 无头开关：单元测试置 True 时隐藏备份浏览器子窗口，避免测试闪窗（仅影响测试）。
+HEADLESS = False
+
 
 def human_size(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -57,8 +61,10 @@ def human_size(n: float) -> str:
 class QoderBackupApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.geometry("738x640")
-        root.minsize(700, 600)
+        # 宽度固定、高度动态：初始仅给个合理高度，构建完成后由 _fit_layout()
+        # 按实际内容自适应（保证状态栏等完整区域始终可见，不写死过大/过小）。
+        root.geometry("738x560")
+        root.minsize(700, 460)
 
         # 默认使用第一个已注册适配器（维护者新增适配器后自动出现在切换下拉中）
         self._tool_names = list_adapters()
@@ -97,6 +103,9 @@ class QoderBackupApp:
         self.vars.clear()
         self.others_by_uid.clear()
         self.others_master_var.set(False)
+        # other_vars 仅在展开“其他用户”区块时创建，切换前可能不存在
+        if getattr(self, "other_vars", None) is None:
+            self.other_vars = {}
         self.other_vars.clear()
 
         # 同步所有涉及工具名的标题
@@ -143,10 +152,8 @@ class QoderBackupApp:
         ttk.Button(row, text="重新检测", command=self._redetect, width=10).pack(
             side=tk.LEFT, padx=(6, 0)
         )
-        self.root_hint = ttk.Label(self.dir_frame, text="", foreground="#666")
-        self.root_hint.pack(anchor="w", padx=10, pady=(0, 8))
-
         # 当前登录用户 UID（记忆区默认备份对象，下拉切换）
+        # 与数据目录识别状态同放一行：左=当前用户，右=识别状态
         uid_row = ttk.Frame(self.dir_frame)
         uid_row.pack(fill=tk.X, padx=10, pady=(0, 8))
         ttk.Label(uid_row, text="当前用户：").pack(side=tk.LEFT)
@@ -161,6 +168,9 @@ class QoderBackupApp:
             text="（自动检测最近活动用户，可下拉切换）",
             foreground="#666",
         ).pack(side=tk.LEFT, padx=(6, 0))
+        # 右侧识别状态：仅说明是否已识别，不再重复显示路径（路径见上方输入框）
+        self.root_hint = ttk.Label(uid_row, text="", foreground="#666")
+        self.root_hint.pack(side=tk.RIGHT)
 
         # 备份内容
         mid = ttk.LabelFrame(self.root, text="备份内容（勾选即生效）")
@@ -194,7 +204,8 @@ class QoderBackupApp:
             side=tk.RIGHT, padx=8
         )
 
-        canvas = tk.Canvas(mid, highlightthickness=0, height=240)
+        canvas = tk.Canvas(mid, highlightthickness=0)
+        # 高度动态：内容少时收缩、内容多时给足并启用滚动条（见 _fit_layout）。
         sb = ttk.Scrollbar(mid, orient="vertical", command=canvas.yview)
         # 备份项列表：每行一个 Frame，内部左=勾选+标题(权重3) / 右=说明(权重7)，
         # 同行 grid 保证标题与说明行严格对齐（双独立列堆叠会导致累计错位）。
@@ -296,7 +307,54 @@ class QoderBackupApp:
         )
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
 
+        # 构建完成后按实际内容自适应窗口高度（保证状态栏等完整区域默认可见）
+        self._fit_layout()
+
     # ------------------------------------------------------------- helpers --
+    def _fit_layout(self) -> None:
+        """按实际内容自适应窗口高度与备份列表区高度，保证状态栏等完整区域可见。
+
+        - 备份列表区（canvas）：内容少则收缩、内容多则给足并启用滚动条，
+          不写死固定高度（避免内容少时大片空白、内容多时被裁剪）。
+        - 主窗口：构建完成后按各区块请求高度设定窗口高度（宽度不变），
+          不超出屏幕可用高度，确保默认即可看到窗口内全部区域。
+        HEADLESS 测试下同样安全（只计算几何、不弹出可见窗口）。
+        """
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            return
+        # 列表内容实际高度（含 others 区块展开后的全部行）
+        try:
+            content_h = self.list_frame.winfo_reqheight()
+        except Exception:
+            content_h = 0
+        # canvas 高度：内容少则贴合内容、内容多则封顶并滚动（下限避免过扁）
+        LIST_MIN, LIST_MAX = 120, 380
+        canvas_h = max(LIST_MIN, min(content_h, LIST_MAX))
+        try:
+            self._canvas.configure(height=canvas_h)
+        except Exception:
+            pass
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        # 主窗口高度：取内容请求高，封顶到屏幕可用高度的 90%，并满足 minsize
+        try:
+            want = self.root.winfo_reqheight()
+        except Exception:
+            want = 560
+        try:
+            screen = self.root.winfo_screenheight()
+        except Exception:
+            screen = 900
+        win_max = max(520, int(screen * 0.9))
+        cur_w = self.root.winfo_width() or 738
+        want = max(want, 460)
+        want = min(want, win_max)
+        self.root.geometry("%dx%d" % (cur_w, want))
+
     def _reset_options(self) -> None:
         """把选项区域各参数复位到初始默认值，防用户改乱后无从选择。
 
@@ -332,6 +390,12 @@ class QoderBackupApp:
         cb.invoke()
 
     def _refresh_items(self) -> None:
+        # 保留上一轮勾选状态（按聚合前缀），重建后恢复：路径识别错误只应让相关项
+        # 显示"（未找到）"，不应让备份内容区的选项与用户勾选随识别结果忽有忽无。
+        prev_sel = {p: v.get() for p, v in self.vars.items()}
+        prev_others = getattr(self, "others_master_var", None)
+        prev_others = prev_others.get() if prev_others is not None else None
+
         # 清空列表与底部"其他用户 UID"区块
         for w in self.list_frame.winfo_children():
             w.destroy()
@@ -354,10 +418,15 @@ class QoderBackupApp:
                         self.others_by_uid.setdefault(it.uid, []).append(it)
                 continue
 
-            # 聚合项：任一子项存在即视为"找到"；勾选态取首个推荐项
+            # 聚合项：任一子项存在即视为"找到"；勾选态优先沿用上一轮用户选择，
+            # 仅当该项本次未找到（any_exists=False）时强制不勾选（避免勾选无效项）。
             any_exists = any(it.exists for it in grp)
             first = grp[0]
-            var = tk.BooleanVar(value=first.recommended and any_exists)
+            if prefix in prev_sel and any_exists:
+                default = prev_sel[prefix]
+            else:
+                default = first.recommended and any_exists
+            var = tk.BooleanVar(value=default)
             self.vars[prefix] = var
             is_current = prefix == "memories_current"
             if is_current:
@@ -410,7 +479,9 @@ class QoderBackupApp:
             self._wrap_labels.append(lbl)
 
         # 其他用户记忆区（合并行，默认不勾；勾选后展开 UID 多选）
-        self.others_master_var = tk.BooleanVar(value=False)
+        # 沿用上一轮勾选（仅当本次确实探测到其他用户时）
+        others_default = bool(prev_others) if (prev_others is not None and self.others_by_uid) else False
+        self.others_master_var = tk.BooleanVar(value=others_default)
         row = ttk.Frame(self.list_frame)
         row.pack(fill=tk.X, pady=1)
         row.columnconfigure(0, minsize=170, weight=0)
@@ -448,25 +519,27 @@ class QoderBackupApp:
         # 兜底：重建后强制同步一次内嵌窗口宽度（不依赖 <Configure> 事件是否触发）
         if getattr(self, "_sync_canvas_width", None):
             self.root.after_idle(self._sync_canvas_width)
+        # 列表内容变化后重新自适应高度（others 区块展开/收起会改变总高）
+        self.root.after_idle(self._fit_layout)
 
         ok = os.path.isdir(self.root_dir)
         self.root_hint.config(
-            text=(
-                "已识别：%s ｜ 共享目录：%s"
-                % (self.root_dir, self._shared_name())
-                if ok
-                else "未找到 %s 数据目录，请手动指定" % self.adapter.display_name
-            ),
+            text="数据目录已识别" if ok else "未找到数据目录，请手动指定",
             foreground="#0a6" if ok else "#c00",
         )
         if missing:
             self.summary.config(text="%d 项未找到" % missing, foreground="#c60")
+        else:
+            # 全部找到（含重新检测成功后）：清空上一次可能残留的"未找到"提示
+            self.summary.config(text="", foreground="#0a6")
 
         self._rebuild_others_block()
 
         # 兜底：重建后强制同步一次内嵌窗口宽度（不依赖 <Configure> 事件是否触发）
         if getattr(self, "_sync_canvas_width", None):
             self.root.after_idle(self._sync_canvas_width)
+        # 列表内容变化后重新自适应高度（others 区块展开/收起会改变总高）
+        self.root.after_idle(self._fit_layout)
 
     def _rebuild_others_block(self) -> None:
         """在底部区块按当前勾选状态渲染"其他用户"UID 多选（仅勾选主项时显示）。"""
@@ -559,12 +632,25 @@ class QoderBackupApp:
         """经适配器探测数据根目录；显式指定或被探测到则用，否则回退默认建议路径。"""
         return explicit or self.adapter.detect_root() or self.adapter.build_default_root()
 
-    def _refresh_uid_combo(self) -> None:
-        """刷新当前用户下拉：列出全部 UID，默认选自动检测到的当前用户。"""
-        uids = sorted(
-            {it.uid for it in self.items if it.uid}
-            | set(self.others_by_uid.keys())
+    def _refresh_uid_combo(self, force_clear: bool = False) -> None:
+        """刷新当前用户下拉：列出全部 UID，默认选自动检测到的当前用户。
+
+        force_clear=True 用于数据目录未识别（冻结）时：无论 self.items 是否还残留
+        上一次有效目录的 UID，都强制清空下拉并禁用，避免目录已无效却仍显示旧用户名。
+        """
+        uids = (
+            []
+            if force_clear
+            else sorted(
+                {it.uid for it in self.items if it.uid}
+                | set(self.others_by_uid.keys())
+            )
         )
+        if force_clear or not uids:
+            # 数据目录未识别（或其中无用户）：清空下拉与当前选择，避免残留旧用户名
+            self.uid_var.set("")
+            self.uid_combo.configure(state="disabled")
+            return
         if getattr(self, "current_var", None) and self.current_var.get():
             cur = next(
                 (it.uid for it in self.items if self._agg_prefix(it.key) == "memories_current" and it.uid),
@@ -574,16 +660,36 @@ class QoderBackupApp:
             cur = None
         self.uid_combo["values"] = uids
         detected = getattr(self.adapter, "last_detected_uid", None)
+        if not uids:
+            # 数据目录未识别（或其中无用户）：清空下拉与当前选择，避免残留旧用户名
+            self.uid_var.set("")
+            self.uid_combo.configure(state="disabled")
+            return
+        self.uid_combo.configure(state="readonly")
         if cur:
             self.uid_var.set(cur)
         elif detected:
             self.uid_var.set(detected)
-        elif uids:
+        else:
             self.uid_var.set(uids[0])
 
     def _redetect(self) -> None:
         self.root_dir = self._detect_root(self.root_var.get() or None)
         self.root_var.set(self.root_dir)
+        if not os.path.isdir(self.root_dir):
+            # 数据目录未识别：冻结备份内容区，保持已有选项与用户勾选不变，
+            # 仅提示用户指定正确目录。避免识别错误时清单残缺（行忽有忽无）、
+            # 勾选被重置、以及批量"xx项未找到"提示反复出现。
+            if self.items:
+                self._refresh_uid_combo(force_clear=True)  # 当前用户下拉强制清空
+                self.root_hint.config(
+                    text="未找到数据目录，请手动指定", foreground="#c00"
+                )
+                # 整体目录未识别，清空上一次可能残留的"xx项未找到"（不再显示局部未找到）
+                self.summary.config(text="", foreground="#0a6")
+                self._set_status("未找到数据目录，请手动指定")
+                return
+            # 从未成功识别过：仍重建一次，生成稳定的占位清单（各项未找到）
         self.items = self.adapter.build_items(self.root_dir)
         self._refresh_items()
         self._refresh_uid_combo()
@@ -604,16 +710,20 @@ class QoderBackupApp:
         self._set_status("已切换当前用户：%s" % (chosen or "自动检测"))
 
     def _tool_dir(self, sub: str) -> str:
-        """返回按工具名分目录的存放路径：<工具运行目录>/<sub>/<tool_name>/。"""
-        base = os.path.dirname(os.path.abspath(__file__))
-        return os.path.join(base, sub, self.adapter.name)
+        """返回备份/快照存放目录：<备份工具启动目录>/<sub>/<工具名>/。
 
-    def _shared_name(self) -> str:
-        """返回当前 root 下的共享子目录名（shared_client / sharedclient），未识别则空。"""
-        for name in ("shared_client", "sharedclient"):
-            if os.path.isdir(os.path.join(self.root_dir, name)):
-                return name
-        return ""
+        即与 run.bat（源码模式）或打包后的 exe 同一级目录下的 backup/<工具名>/，
+        按工具名分目录，便于区分不同工具的备份数据。不放在被备份工具
+        （如 Qoder）的数据根目录，也不在 ai_env_clone 包内部。
+        源码模式下 __main__.py 位于 <仓库根>/ai_env_clone/，故取上级（仓库根）；
+        单文件 exe 模式下取 exe 自身所在目录。
+        """
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            # __main__.py 在 <仓库根>/ai_env_clone/，仓库根在其上级
+            base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(base, sub, self.adapter.name)
 
     def _max_mb(self):
         """读取「跳过超大文件」阈值（MB）。**只能在主线程调用**（访问 Tk 变量）。
@@ -946,7 +1056,7 @@ class QoderBackupApp:
 
         root_dir = self.root_dir
         make_rollback = self.rollback_var.get()
-        # 回滚快照与备份文件同目录（backup/<工具名>/），方便按时间信息对比选择
+        # 回滚快照与备份文件同目录（<备份工具目录>/backup/<工具名>/），方便按时间信息对比选择
         rollback_dir = self._tool_dir("backup")
         os.makedirs(rollback_dir, exist_ok=True)
 
@@ -1018,6 +1128,8 @@ class BackupBrowser:
         self._result: dict | None = None
 
         top = tk.Toplevel(app.root)
+        # 创建即隐藏：Toplevel 默认可见，双屏/慢渲染下首帧会闪；正常模式末尾再 deiconify。
+        top.withdraw()
         top.title(BROWSER_TITLE_TPL)
         # 窗口宽度收敛：左侧列表按内容自适应(约503px)，右侧详情框请求宽约344px，
         # 二者加边距/sash 约 880；920 使右侧自然贴合内容、不空。
@@ -1115,6 +1227,12 @@ class BackupBrowser:
         self._load_list()
         if initial and os.path.isfile(initial):
             self.select(initial)
+
+        # 按模式决定可见性：无头测试保持隐藏，正常模式显示窗口。
+        if HEADLESS:
+            self.top.withdraw()
+        else:
+            self.top.deiconify()
 
     def select(self, path: str) -> None:
         """选中并展示指定备份文件（供主窗口跳转打开指定文件）。"""

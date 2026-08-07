@@ -35,8 +35,16 @@
 
 到 [Releases](https://github.com/yinlichaoxi007/ai-env-clone/releases) 下载对应平台的单文件程序：
 
-- Windows：`AiEnvClone.exe`（单文件），双击运行。
-- macOS / Linux：下载可执行包，赋予执行权限后运行。
+- **Windows (x64)**：`AiEnvClone-windows.exe`，双击运行。
+- **macOS（Apple Silicon / Intel 通用）**：`AiEnvClone-macos-*.app.zip`，解压后将 `AiEnvClone.app` 拖入「应用程序」或右键打开。
+  - 首次打开若提示「无法验证开发者」，右键 `AiEnvClone.app` →「打开」即可（本程序未购买 Apple 开发者签名证书，属正常提示）。
+- **Linux (x64)**：`AiEnvClone-linux`，终端赋予执行权限后运行：
+  ```bash
+  chmod +x AiEnvClone-linux
+  ./AiEnvClone-linux
+  ```
+
+> 各平台分发与运行方式均经打包流程验证可产出；**实际运行仅在 Windows x64 上实测过**，macOS / Linux 因暂无对应设备未做端到端实测，但代码路径与打包流程跨平台通用。
 
 ### 方式二：从源码运行（需 Python 3.10+）
 
@@ -46,12 +54,14 @@ cd ai-env-clone
 python -m ai_env_clone                    # 启动 GUI
 ```
 
-### 方式三：自行打包单文件 exe（Windows）
+### 方式三：自行打包各平台可执行程序
 
 ```bash
 pip install -r requirements.txt
-python build_exe.py                # 产物在 dist/ 目录下
+python build_exe.py --name AiEnvClone            # 在当前平台产出对应格式的可执行程序，位于 dist/
 ```
+
+> 在 Windows 上产出 `AiEnvClone.exe`，macOS 上产出 `AiEnvClone.app`，Linux 上产出 `AiEnvClone`（无后缀）。CI 中的 `build-release.yml` 即在三平台（Windows / macOS / Linux）分别调用此脚本并汇总发布（macOS 按 arm64 与 x86_64 各产一份）。
 
 ## 使用
 
@@ -98,11 +108,23 @@ ai_env_clone/                包（import 名 ai_env_clone，产品名 AiEnvClon
 │   ├── base.py        BaseAdapter 抽象接口 + 适配器注册表
 │   └── qoder.py       Qoder 适配器（参考实现，自包含）
 └── backup/            备份/恢复执行与回滚快照
-build_exe.py           用 PyInstaller 打包成单文件 exe（产物 AiEnvClone.exe）
-.github/workflows/     build-release.yml（打 tag 自动构建 exe 发 Release）+ mirror-to-gitee.yml（镜像到 Gitee）
+build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 / macOS x86_64 / Linux 可执行程序）
+.github/workflows/     build-release.yml（打 tag 自动构建多平台可执行程序并发布 Release）+ mirror-to-gitee.yml（镜像到 Gitee）
 ```
 
 **多工具扩展**：已采用统一的适配器接口（`detect_root()` / `build_items()` / `export()` / `restore()`）。每种 AI 工具对应一个适配器模块，新增工具无需改动主流程，详见 `docs/CONTRIBUTING.md`。
+
+## 支持的平台与架构
+
+| 平台 | 架构 | 分发格式 | 编译/打包 | 运行实测 |
+| --- | --- | --- | --- | --- |
+| Windows | x64 | `AiEnvClone-windows.exe`（单文件） | ✅ CI 自动构建 | ✅ 已实测 |
+| macOS | Apple Silicon / Intel（arm64 + x86_64） | `AiEnvClone-macos-*.app.zip` | ✅ CI 自动构建 | ⚠️ 暂无设备，未实测 |
+| Linux | x64 | `AiEnvClone-linux`（单文件） | ✅ CI 自动构建 | ⚠️ 暂无设备，未实测 |
+
+- **编译与打包**：三个平台的产物均由 GitHub Actions 在对应系统（Windows / macOS / Ubuntu）上由 PyInstaller 跨平台打包产出，流程已验证可正常产出。
+- **运行实测**：目前仅在 **Windows x64** 上做过完整端到端运行验证；macOS 与 Linux 因暂无对应设备，未做真机实测。代码路径（路径解析、缓存目录、适配器检测均使用 `os.path.expanduser("~")` 等跨平台写法）与打包流程本身跨平台通用，但首次在这些平台上运行如遇问题，欢迎反馈 Issue。
+- **适配器（被备份的工具）的平台支持**：取决于各工具自身提供的平台。例如 CatPaw 目前仅提供 Windows / macOS，无 Linux 版，因此在 Linux 上该适配器会检测不到数据目录而跳过；这不影响本工具在 Linux 上备份其它已支持的工具。
 
 ## 测试
 
@@ -162,14 +184,33 @@ build_exe.py           用 PyInstaller 打包成单文件 exe（产物 AiEnvClon
 > ⚠️ **Version note**: only author-tested versions are listed above. Untested higher/lower versions (e.g. Qoder CN plugin 3.3.4) may have changed data layouts — do an Export→Verify on your machine first.
 > All Qoder CN products (former Lingma plugin, Qoder CN IDE, etc.) share the same `~/.qoder-cn` root directory; the tool backs it up uniformly, so users need not distinguish which product they use.
 
+## Supported Platforms & Architectures
+
+| Platform | Arch | Distribution | Built by CI | Runtime tested |
+| --- | --- | --- | --- | --- |
+| Windows | x64 | `AiEnvClone-windows.exe` (single-file) | ✅ automated | ✅ verified |
+| macOS | Apple Silicon / Intel (arm64 + x86_64) | `AiEnvClone-macos-*.app.zip` | ✅ automated | ⚠️ no device, untested |
+| Linux | x64 | `AiEnvClone-linux` (single-file) | ✅ automated | ⚠️ no device, untested |
+
+- **Build & packaging**: all three platform artifacts are produced by GitHub Actions on their native OS (Windows / macOS / Ubuntu) via cross-platform PyInstaller; the flow is verified to produce valid outputs.
+- **Runtime tested**: full end-to-end runtime is verified only on **Windows x64** so far. macOS and Linux are not yet exercised on real hardware (none available). The code paths (path resolution, cache dir, adapter detection all use cross-platform `os.path.expanduser("~")`) and the packaging flow are cross-platform by design, but if you hit issues on those platforms, please file an Issue.
+- **Platform support of backed-up tools**: depends on each tool's own offerings. For example CatPaw currently ships Windows / macOS only (no Linux build), so on Linux its adapter will simply detect no data dir and skip — this does not affect backing up other supported tools on Linux.
+
 ## Install
 
 ### Option A: Download release (recommended, no Python needed)
 
 Get the single-file build from [Releases](https://github.com/yinlichaoxi007/ai-env-clone/releases):
 
-- Windows: `AiEnvClone.exe` (single-file), double-click to run.
-- macOS / Linux: download the executable, `chmod +x` then run.
+- **Windows (x64)**: `AiEnvClone-windows.exe`, double-click to run.
+- **macOS (Apple Silicon / Intel)**: `AiEnvClone-macos-*.app.zip` — unzip, then drag `AiEnvClone.app` to Applications or right-click → Open. On first launch macOS may say "cannot verify developer" (this app is not Apple-signed); right-click the app → Open to bypass.
+- **Linux (x64)**: `AiEnvClone-linux` — make it executable and run:
+  ```bash
+  chmod +x AiEnvClone-linux
+  ./AiEnvClone-linux
+  ```
+
+> Distribution and launch steps for every platform are validated by the packaging flow. **End-to-end runtime is verified only on Windows x64**; macOS / Linux are not yet tested on real devices (no hardware available), but the code paths and packaging are cross-platform by design.
 
 ### Option B: Run from source (Python 3.10+ required)
 
@@ -179,12 +220,14 @@ cd ai-env-clone
 python -m ai_env_clone                    # launch GUI
 ```
 
-### Option C: Build single-file exe yourself (Windows)
+### Option C: Build per-platform executables yourself
 
 ```bash
 pip install -r requirements.txt
-python build_exe.py                # output in dist/
+python build_exe.py --name AiEnvClone            # produces the platform-native executable in dist/
 ```
+
+> On Windows it produces `AiEnvClone.exe`, on macOS `AiEnvClone.app`, on Linux `AiEnvClone` (no suffix). The CI `build-release.yml` invokes this script on three platforms (Windows / macOS / Linux) and publishes the results (macOS yields both arm64 and x86_64 builds).
 
 ## Usage
 
@@ -227,8 +270,8 @@ ai_env_clone/                package (import name ai_env_clone, product name AiE
 │   ├── base.py        BaseAdapter interface + adapter registry
 │   └── qoder.py       Qoder adapter (reference implementation, self-contained)
 └── backup/            backup/restore execution & rollback snapshots
-build_exe.py           package into single-file exe via PyInstaller (output AiEnvClone.exe)
-.github/workflows/     build-release.yml (tag → auto-build exe & publish Release) + mirror-to-gitee.yml (mirror to Gitee)
+build_exe.py           package into cross-platform executables via PyInstaller (Windows / macOS arm64 / macOS x86_64 / Linux)
+.github/workflows/     build-release.yml (tag → auto-build multi-platform binaries & publish Release) + mirror-to-gitee.yml (mirror to Gitee)
 ```
 
 **Multi-tool**: a unified adapter interface (`detect_root()` / `build_items()` / `export()` / `restore()`). Each AI tool maps to one adapter module; adding a tool never touches the main flow. See `docs/CONTRIBUTING.md`.
@@ -246,7 +289,7 @@ The repo ships full unit tests built on the Python stdlib `unittest`, **no third
   # Run only the headless GUI test class
   python -m unittest tests.test_qoder.TestGuiThreadSafety -v
   ```
-- **About GUI tests**: GUI tests run **headless** via tkinter's `withdraw()` — widgets, variables and event callbacks are created and fired normally, with no real window and no display needed. `messagebox` is mocked during tests to avoid manual clicks. The success popup after a real backup/restore in the actual GUI is normal product behavior and unrelated to automated tests.
+- **About GUI tests**: GUI tests run **truly headless** — the root window is `withdraw()`-ed, and the backup-browser Toplevel opened by the import flow is also hidden in headless mode, so **no window ever pops up during a test run**. Layout measurement temporarily moves the (invisible) window off-screen (`+4000+4000`) and drives a real geometry pass without showing anything. Widgets, variables and event callbacks are created and fired normally; `messagebox` is mocked to avoid manual clicks. The success popup after a real backup/restore in the actual GUI is normal product behavior and unrelated to automated tests.
 
 ## Contributing
 

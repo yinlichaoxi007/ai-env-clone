@@ -18,8 +18,36 @@ permissions:
 
 jobs:
   build:
-    name: Build Windows exe
-    runs-on: windows-latest
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: AiEnvClone-windows
+            base_name: AiEnvClone-windows
+            upload_path: dist/AiEnvClone-windows.exe
+            zip_app: false
+            use_system_python: false
+          - os: macos-latest        # Apple Silicon (arm64)
+            artifact: AiEnvClone-macos-arm64
+            base_name: AiEnvClone-macos-arm64
+            upload_path: AiEnvClone-macos-arm64.app
+            zip_app: true
+            use_system_python: false
+          - os: macos-13            # Intel (x86_64)
+            artifact: AiEnvClone-macos-x86_64
+            base_name: AiEnvClone-macos-x86_64
+            upload_path: AiEnvClone-macos-x86_64.app
+            zip_app: true
+            use_system_python: false
+          - os: ubuntu-latest
+            artifact: AiEnvClone-linux
+            base_name: AiEnvClone-linux
+            upload_path: dist/AiEnvClone-linux
+            zip_app: false
+            use_system_python: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,32 +56,62 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Set up Python
+        if: ${{ !matrix.use_system_python }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
+      # Linux 使用 runner 自带 python3（已带 tkinter），避免 setup-python 的 CPython 缺 Tk。
+      - name: Ensure tkinter (Linux)
+        if: ${{ matrix.use_system_python }}
+        run: python3 -c "import tkinter; print('tkinter ok')"
+
       - name: Install build deps
+        if: ${{ !matrix.use_system_python }}
         run: pip install -r requirements.txt
 
-      - name: Build exe
-        run: python build_exe.py
+      - name: Install build deps (Linux system python)
+        if: ${{ matrix.use_system_python }}
+        run: python3 -m pip install -r requirements.txt
 
-      - name: Upload artifact
+      - name: Build executable
+        if: ${{ !matrix.use_system_python }}
+        run: python build_exe.py --name ${{ matrix.base_name }}
+
+      - name: Build executable (Linux system python)
+        if: ${{ matrix.use_system_python }}
+        run: python3 build_exe.py --name ${{ matrix.base_name }}
+
+      # macOS 产出的是 .app 目录，压缩后上传更便于分发。
+      - name: Zip macOS app
+        if: ${{ matrix.zip_app }}
+        shell: bash
+        run: zip -r "${{ matrix.artifact }}.zip" "${{ matrix.upload_path }}"
+
+      - name: Upload artifact (zip)
+        if: ${{ matrix.zip_app }}
         uses: actions/upload-artifact@v4
         with:
-          name: AiEnvClone-exe
-          path: dist/AiEnvClone.exe
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+
+      - name: Upload artifact (binary)
+        if: ${{ !matrix.zip_app }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.upload_path }}
 
   release:
     name: Publish Release
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Download exe
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: AiEnvClone-exe
-          path: ./
+          path: assets
+          merge-multiple: true
 
       - name: Decide prerelease
         id: meta
@@ -66,10 +124,13 @@ jobs:
             *)  echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
           esac
 
+      - name: List assets
+        run: ls -la assets
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
-          files: AiEnvClone.exe
+          files: assets/*
           prerelease: ${{ steps.meta.outputs.prerelease }}
           generate_release_notes: true
