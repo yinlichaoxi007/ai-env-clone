@@ -66,9 +66,11 @@ class QoderBackupApp:
         root.geometry("738x560")
         root.minsize(700, 460)
 
-        # 默认使用第一个已注册适配器（维护者新增适配器后自动出现在切换下拉中）
+        # 工具切换下拉列出所有已注册适配器（新增适配器后自动出现）。
+        # 默认工具固定为 qoder（已实测主力工具）；下拉仍列出全部，用户可手动切换。
         self._tool_names = list_adapters()
-        self.adapter = get_adapter(self._tool_names[0])
+        default_tool = "qoder" if "qoder" in self._tool_names else (self._tool_names[0] if self._tool_names else "")
+        self.adapter = get_adapter(default_tool)
         self.root.title(APP_TITLE_TPL % self.adapter.display_name)
 
         self.root_dir = self._detect_root()
@@ -411,8 +413,8 @@ class QoderBackupApp:
 
         missing = 0
         for prefix, grp in groups.items():
-            if prefix == "memories_others":
-                # 记忆区-其他用户：按 UID 聚合，稍后合并成一行
+            if prefix in ("memories_others", "user_sessions_others"):
+                # 其他用户聚合项（记忆区或集中会话）：按 UID 聚合，稍后合并成一行
                 for it in grp:
                     if it.uid:
                         self.others_by_uid.setdefault(it.uid, []).append(it)
@@ -491,7 +493,7 @@ class QoderBackupApp:
             c0, variable=self.others_master_var, command=self._on_others_toggled
         )
         name_lbl = ttk.Label(
-            c0, text="其他用户记忆区", wraplength=140, justify="left", anchor="w"
+            c0, text="其他用户数据", wraplength=140, justify="left", anchor="w"
         )
         cb.pack(side=tk.LEFT, padx=(0, 4))
         name_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -549,17 +551,18 @@ class QoderBackupApp:
             return
         self.other_vars: dict[str, tk.BooleanVar] = {}
         inner = ttk.LabelFrame(
-            self.others_block, text="其他用户记忆区 · 选择要备份的 UID"
+            self.others_block, text="其他用户 · 选择要备份的 UID"
         )
         inner.pack(fill=tk.X, padx=8, pady=2)
+        from ai_env_clone.adapters.codebuddy import short_uid
         for uid in sorted(self.others_by_uid):
             v = tk.BooleanVar(value=True)  # 默认全选其余 UID
             self.other_vars[uid] = v
             row = ttk.Frame(inner)
             row.pack(fill=tk.X, padx=6, pady=1)
-            ttk.Checkbutton(row, text=uid, variable=v, width=26).pack(side=tk.LEFT)
+            ttk.Checkbutton(row, text=short_uid(uid), variable=v, width=12).pack(side=tk.LEFT)
             ttk.Label(
-                row, text="该用户的记忆（长期/项目记忆）", foreground="#666"
+                row, text="该用户的数据（记忆/会话/规则等）", foreground="#666"
             ).pack(side=tk.LEFT, padx=6)
 
     def _on_current_toggled(self) -> None:
@@ -658,7 +661,17 @@ class QoderBackupApp:
             )
         else:
             cur = None
-        self.uid_combo["values"] = uids
+        # UUID 较长时显示截短串（前若干位 + 省略号），同时维护 短串->真实uid 映射，
+        # 供 _on_uid_selected 还原。短串理论上可能碰撞，但 8 位前缀碰撞概率极低，
+        # 还原时优先精确匹配、其次前缀匹配、最后回退原串。
+        from ai_env_clone.adapters.codebuddy import short_uid  # 延迟导入，避免循环依赖
+        self._uid_short_map = {}
+        short_values = []
+        for u in uids:
+            s = short_uid(u)
+            self._uid_short_map[s] = u
+            short_values.append(s)
+        self.uid_combo["values"] = short_values
         detected = getattr(self.adapter, "last_detected_uid", None)
         if not uids:
             # 数据目录未识别（或其中无用户）：清空下拉与当前选择，避免残留旧用户名
@@ -667,11 +680,11 @@ class QoderBackupApp:
             return
         self.uid_combo.configure(state="readonly")
         if cur:
-            self.uid_var.set(cur)
+            self.uid_var.set(short_uid(cur))
         elif detected:
-            self.uid_var.set(detected)
+            self.uid_var.set(short_uid(detected))
         else:
-            self.uid_var.set(uids[0])
+            self.uid_var.set(short_values[0])
 
     def _redetect(self) -> None:
         self.root_dir = self._detect_root(self.root_var.get() or None)
@@ -698,15 +711,20 @@ class QoderBackupApp:
     def _on_uid_selected(self) -> None:
         """下拉切换当前用户 UID 后，重建记忆区条目（保留其他用户的勾选状态）。"""
         chosen = self.uid_var.get().strip() or None
+        # 下拉显示的是截短串，需还原成真实 UUID 再传给适配器
+        if chosen and getattr(self, "_uid_short_map", None):
+            chosen = self._uid_short_map.get(chosen, chosen)
         self.items = self.adapter.build_items(self.root_dir, current_uid=chosen)
         self._refresh_items()
         # 重建后把下拉同步到新检测到的当前用户（build_items 可能改回自动检测）
+        detected = getattr(self.adapter, "last_detected_uid", None)
         new_cur = next(
             (it.uid for it in self.items if it.key == "memories_current" and it.uid),
-            None,
+            detected,
         )
         if new_cur and new_cur != chosen:
-            self.uid_var.set(new_cur)
+            from ai_env_clone.adapters.codebuddy import short_uid
+            self.uid_var.set(short_uid(new_cur))
         self._set_status("已切换当前用户：%s" % (chosen or "自动检测"))
 
     def _tool_dir(self, sub: str) -> str:
@@ -911,7 +929,7 @@ class QoderBackupApp:
             messagebox.showwarning("提示", "请至少勾选一项要备份的内容。")
             return
 
-        default = "qoder_backup_%s.zip" % datetime.now().strftime("%Y%m%d_%H%M%S")
+        default = "%s_backup_%s.zip" % (self.adapter.name, datetime.now().strftime("%Y%m%d_%H%M%S"))
         initial_dir = self._tool_dir("backup")
         os.makedirs(initial_dir, exist_ok=True)
         zip_path = filedialog.asksaveasfilename(
@@ -997,12 +1015,13 @@ class QoderBackupApp:
             "确认还原备份包",
             "即将把%s还原（覆盖写入）到：\n%s\n\n"
             "将自动解压并写入 %d 个文件（%s），无需手动解压。\n\n"
-            "请务必先完全退出 Qoder，否则可能导致数据损坏。\n是否继续？"
+            "请务必先完全退出 %s，否则可能导致数据损坏。\n是否继续？"
             % (
                 "回滚快照" if expected_kind == "rollback" else "备份包",
                 self.root_dir,
                 info["file_count"],
                 human_size(info["total_bytes"]),
+                self.adapter.display_name,
             ),
         ):
             return
@@ -1079,8 +1098,8 @@ class QoderBackupApp:
                     "done",
                     (
                         "还原成功",
-                        "已还原 %d 个文件（备份包已自动解压覆盖）。%s\n\n请重启 Qoder 验证记忆与会话。"
-                        % (r["restored"], extra),
+                        "已还原 %d 个文件（备份包已自动解压覆盖）。%s\n\n请重启 %s 验证记忆与会话。"
+                        % (r["restored"], extra, self.adapter.display_name),
                     ),
                 )
             )
@@ -1256,7 +1275,8 @@ class BackupBrowser:
             )
             self._set_detail("该目录下还没有任何备份文件。\n\n"
                              "请在主窗口点「导出备份」生成备份，或把已有的备份包 "
-                             "（qoder_backup_*.zip）放到：\n%s" % self.backup_dir)
+                             "（%s_backup_*.zip）放到：\n%s"
+                             % (self.app.adapter.name, self.backup_dir))
             return
         for r in rows:
             label, _ = self.KIND_LABEL.get(r["kind"], self.KIND_LABEL["unknown"])
