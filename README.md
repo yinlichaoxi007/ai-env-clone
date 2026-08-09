@@ -24,10 +24,11 @@
 | --- | --- | --- | --- |
 | Qoder CN（前 Lingma，JetBrains 插件） | 桌面 IDE 插件 | **3.3.3** | ✅ 已支持 |
 | Qoder CN IDE（独立桌面客户端） | 独立 IDE | **1.10.0** | ✅ 已支持 |
-| 其他国内可用工具（如 Trae、豆包、通义灵码、CodeBuddy 等） | — | — | 🚧 规划中，欢迎贡献适配器 |
+| CodeBuddy | 桌面 IDE | — | ✅ 已支持（用户级/全局数据，公共根为用户主目录；适配器逻辑已实现，实际形态以 IDE 为主） |
+| 其他国内可用工具 | — | — | 🚧 规划中，欢迎贡献适配器 |
 
-> ⚠️ **版本说明**：上表仅列出作者**实测通过**的版本。更高/更低版本（如 Qoder CN 插件 3.3.4）未经测试，数据结构可能变化，使用前请先在本机做一次「导出 → 校验」验证。
-> Qoder CN 系列产品（原 Lingma 插件、Qoder CN IDE 等）共用同一 `~/.qoder-cn` 根目录，本工具按该目录统一备份，无需用户区分具体产品。
+> ⚠️ **版本说明**：上表仅列出作者**实测通过**的版本。其他更高/更低版本未经测试，数据结构可能变化，使用前请先在本机做一次「导出 → 校验」验证。
+> 部分工具的不同形态（如桌面 IDE 与对应插件）可能共用同一套数据目录，本工具按各适配器探测到的数据根统一备份，无需用户区分具体产品形态。
 
 ## 安装
 
@@ -73,6 +74,13 @@ python -m ai_env_clone
 
 启动后：自动检测数据目录 → 勾选要备份的内容 → 点击「导出备份」生成 zip，或「还原备份包」恢复。
 
+GUI 界面要点：
+
+- **数据根识别状态区**：位于「数据目录」与「当前用户」之间，自动列出该工具在用户主目录下识别到的各个数据根目录（含完整相对路径），未找到的根以灰显 `✗` 标注；若完全未识别到数据目录会提示需手动指定。
+- **备份内容路径可见**：每个备份项的说明文字后附带其相对于数据目录的具体路径，方便确认备份范围。
+- **未找到项标红**：当数据目录未正确识别时，备份内容中找不到的每一项会标红并注明「（未找到）」，备份内容区右上角同时显示「N 项未找到」；已勾选项保持不变，仅作提示，不会自动取消勾选。
+- **估算大小**：点击「估算大小」按钮可预估所选备份项打包后的体积。
+
 也可双击仓库内的 `run.bat`（Windows，需本机已装 Python 3.10+）一键启动。
 
 ### CLI（命令行）
@@ -106,13 +114,14 @@ ai_env_clone/                包（import 名 ai_env_clone，产品名 AiEnvClon
 ├── compress_estimate.py  压缩体积预估（经验系数 + 可校准缓存）
 ├── adapters/
 │   ├── base.py        BaseAdapter 抽象接口 + 适配器注册表
-│   └── qoder.py       Qoder 适配器（参考实现，自包含）
+│   ├── qoder.py       Qoder 适配器（参考实现，自包含）
+│   └── codebuddy.py   CodeBuddy 适配器（用户级/全局数据，公共根为用户主目录）
 └── backup/            备份/恢复执行与回滚快照
 build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 / macOS x86_64 / Linux 可执行程序）
 .github/workflows/     build-release.yml（打 tag 自动构建多平台可执行程序并发布 Release）+ mirror-to-gitee.yml（镜像到 Gitee）
 ```
 
-**多工具扩展**：已采用统一的适配器接口（`detect_root()` / `build_items()` / `export()` / `restore()`）。每种 AI 工具对应一个适配器模块，新增工具无需改动主流程，详见 `docs/CONTRIBUTING.md`。
+**多工具扩展**：已采用统一的适配器接口（`detect_root()` / `detect_data_roots()` / `build_items()` / `export()` / `restore()`）。每种 AI 工具对应一个适配器模块，新增工具无需改动主流程，详见 `docs/CONTRIBUTING.md`。
 
 ## 支持的平台与架构
 
@@ -179,10 +188,11 @@ build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 /
 | --- | --- | --- | --- |
 | Qoder CN (formerly Lingma, JetBrains plugin) | Desktop IDE plugin | **3.3.3** | ✅ Supported |
 | Qoder CN IDE (standalone desktop client) | Standalone IDE | **1.10.0** | ✅ Supported |
-| Other China-usable tools (Trae, Doubao, Tongyi Lingma, CodeBuddy, …) | — | — | 🚧 Planned — adapters welcome |
+| CodeBuddy | Desktop IDE | — | ✅ Supported (user-level & global data, common root = user home; adapter logic implemented, primarily IDE in practice) |
+| Other China-usable tools | — | — | 🚧 Planned — adapters welcome |
 
-> ⚠️ **Version note**: only author-tested versions are listed above. Untested higher/lower versions (e.g. Qoder CN plugin 3.3.4) may have changed data layouts — do an Export→Verify on your machine first.
-> All Qoder CN products (former Lingma plugin, Qoder CN IDE, etc.) share the same `~/.qoder-cn` root directory; the tool backs it up uniformly, so users need not distinguish which product they use.
+> ⚠️ **Version note**: only author-tested versions are listed above. Untested higher/lower versions may have changed data layouts — do an Export→Verify on your machine first.
+> Some tools may ship multiple forms (e.g. a desktop IDE and its plugin) that share one data directory; each adapter backs up whatever data roots it detects, so users need not distinguish product forms.
 
 ## Supported Platforms & Architectures
 
@@ -239,6 +249,13 @@ python -m ai_env_clone
 
 Auto-detect data dir → check items → "导出备份" (export) to make a zip, or "还原备份包" (restore) to recover.
 
+GUI highlights:
+
+- **Data-root detection status**: shown between the data-directory field and the current-user selector; lists each detected data root under the user home (with its relative path). Missing roots are marked with a greyed `✗`; if nothing is detected, the tool prompts you to specify the directory manually.
+- **Backup-item paths visible**: each backup item shows its concrete relative path after its description, so you can confirm the backup scope.
+- **Missing items highlighted**: when the data directory is not correctly detected, every item that cannot be found is shown in red and labelled "(未找到 / not found)"; the top-right of the backup list also shows "N 项未找到" (N items not found). Already-checked items keep their state — only a hint, no auto-uncheck.
+- **Estimate size**: click "估算大小" (estimate size) to preview the packed size of selected items.
+
 On Windows you can also double-click `run.bat` (requires Python 3.10+ installed locally).
 
 ### CLI
@@ -268,13 +285,14 @@ ai_env_clone/                package (import name ai_env_clone, product name AiE
 ├── compress_estimate.py  compressed-size estimation (empirical ratios + calibratable cache)
 ├── adapters/
 │   ├── base.py        BaseAdapter interface + adapter registry
-│   └── qoder.py       Qoder adapter (reference implementation, self-contained)
+│   ├── qoder.py       Qoder adapter (reference implementation, self-contained)
+│   └── codebuddy.py   CodeBuddy adapter (user-level & global data, common root = user home)
 └── backup/            backup/restore execution & rollback snapshots
 build_exe.py           package into cross-platform executables via PyInstaller (Windows / macOS arm64 / macOS x86_64 / Linux)
 .github/workflows/     build-release.yml (tag → auto-build multi-platform binaries & publish Release) + mirror-to-gitee.yml (mirror to Gitee)
 ```
 
-**Multi-tool**: a unified adapter interface (`detect_root()` / `build_items()` / `export()` / `restore()`). Each AI tool maps to one adapter module; adding a tool never touches the main flow. See `docs/CONTRIBUTING.md`.
+**Multi-tool**: a unified adapter interface (`detect_root()` / `detect_data_roots()` / `build_items()` / `export()` / `restore()`). Each AI tool maps to one adapter module; adding a tool never touches the main flow. See `docs/CONTRIBUTING.md`.
 
 ## Testing
 
