@@ -459,6 +459,34 @@ class CodeBuddyAdapter(BaseAdapter):
         """未探测到时的默认（建议）数据目录：用户主目录 ``~``。"""
         return _home()
 
+    def detect_data_roots(self, root: str | None = None) -> list[dict]:
+        """返回 CodeBuddy 在 ``root``（用户主目录）下的各数据根目录信息，供识别状态区展示。
+
+        每个根目录显示相对 ``root`` 的完整路径（含每层），含 UUID 用户目录的根备注用户数。
+        不改变单路径数据目录模型，仅做展示增强。
+        """
+        home = root or _home()
+        uids = detect_user_uids()
+        uid_note = "（含 %d 个用户会话）" % len(uids) if uids else ""
+
+        # 各根目录：相对 home 的完整路径 + 实际绝对路径 + 备注
+        ext_rel = os.path.relpath(_codebuddy_extension_root(), home)
+        candidates = [
+            (".codebuddy", os.path.join(home, ".codebuddy"), ""),
+            (".codebuddycn", os.path.join(home, ".codebuddycn"), ""),
+            (ext_rel, _codebuddy_extension_root(), uid_note),
+        ]
+        roots = []
+        for rel, abs_path, note in candidates:
+            roots.append(
+                {
+                    "rel": rel,
+                    "exists": os.path.isdir(abs_path),
+                    "note": note,
+                }
+            )
+        return roots
+
     def build_items(self, root_dir: str | None = None, current_uid: str | None = None) -> list[BackupItem]:
         """构造 CodeBuddy 备份条目（root_dir 为公共根 ``~``，可传 None 自动取）。
 

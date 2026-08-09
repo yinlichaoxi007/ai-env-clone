@@ -154,8 +154,14 @@ class QoderBackupApp:
         ttk.Button(row, text="重新检测", command=self._redetect, width=10).pack(
             side=tk.LEFT, padx=(6, 0)
         )
+        # 识别状态区：在数据目录输入框与当前用户行之间，列出探测到的各数据根目录
+        self.detect_frame = ttk.Frame(self.dir_frame)
+        self.detect_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
+        self.detect_summary = ttk.Label(self.detect_frame, text="", foreground="#0a6")
+        self.detect_summary.pack(fill=tk.X, anchor="w")
+        self.detect_rows_frame = ttk.Frame(self.detect_frame)
+        self.detect_rows_frame.pack(fill=tk.X, anchor="w", padx=(0, 0))
         # 当前登录用户 UID（记忆区默认备份对象，下拉切换）
-        # 与数据目录识别状态同放一行：左=当前用户，右=识别状态
         uid_row = ttk.Frame(self.dir_frame)
         uid_row.pack(fill=tk.X, padx=10, pady=(0, 8))
         ttk.Label(uid_row, text="当前用户：").pack(side=tk.LEFT)
@@ -170,9 +176,6 @@ class QoderBackupApp:
             text="（自动检测最近活动用户，可下拉切换）",
             foreground="#666",
         ).pack(side=tk.LEFT, padx=(6, 0))
-        # 右侧识别状态：仅说明是否已识别，不再重复显示路径（路径见上方输入框）
-        self.root_hint = ttk.Label(uid_row, text="", foreground="#666")
-        self.root_hint.pack(side=tk.RIGHT)
 
         # 备份内容
         mid = ttk.LabelFrame(self.root, text="备份内容（勾选即生效）")
@@ -200,10 +203,12 @@ class QoderBackupApp:
             value=next(k for k, v in self._compress_levels.items() if v == DEFAULT_COMPRESS_LEVEL)
         )
 
-        self.summary = ttk.Label(bar, text="", foreground="#0a6")
-        self.summary.pack(side=tk.RIGHT)
-        ttk.Button(bar, text="估算大小", command=self._estimate, width=10).pack(
-            side=tk.RIGHT, padx=8
+        right_bar = ttk.Frame(bar)
+        right_bar.pack(side=tk.RIGHT)
+        self.summary = ttk.Label(right_bar, text="", foreground="#0a6")
+        self.summary.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(right_bar, text="估算大小", command=self._estimate, width=10).pack(
+            side=tk.LEFT, padx=8
         )
 
         canvas = tk.Canvas(mid, highlightthickness=0)
@@ -420,11 +425,11 @@ class QoderBackupApp:
                         self.others_by_uid.setdefault(it.uid, []).append(it)
                 continue
 
-            # 聚合项：任一子项存在即视为"找到"；勾选态优先沿用上一轮用户选择，
-            # 仅当该项本次未找到（any_exists=False）时强制不勾选（避免勾选无效项）。
+            # 聚合项：任一子项存在即视为"找到"；勾选态优先沿用上一轮用户选择。
+            # 未找到项也保留用户原有勾选状态（仅标红提示，不改动勾选）。
             any_exists = any(it.exists for it in grp)
             first = grp[0]
-            if prefix in prev_sel and any_exists:
+            if prefix in prev_sel:
                 default = prev_sel[prefix]
             else:
                 default = first.recommended and any_exists
@@ -461,7 +466,7 @@ class QoderBackupApp:
             if not any_exists:
                 missing += 1
                 cb.configure(state="disabled")
-                var.set(False)
+                # 仅标红提示未找到，保留用户原有勾选状态（不在识别错误时改动勾选）
                 tag, color = "（未找到）", "#c00"
             else:
                 tag, color = "", "#666"
@@ -471,6 +476,12 @@ class QoderBackupApp:
             detail = re.sub(r"\s*（[^）]*位置）", "", first.description)
             if len(grp) > 1:
                 detail = "%s（涵盖 %d 处路径）" % (detail.rstrip("。"), len(grp))
+            # 追加该项的具体相对路径，方便用户了解备份位置（相对数据目录）
+            try:
+                rel_path = os.path.relpath(first.path, self.root_dir)
+            except ValueError:
+                rel_path = first.path
+            detail = "%s\n路径: %s" % (detail, rel_path)
             lbl = ttk.Label(
                 row, text="%s %s" % (detail, tag),
                 foreground=color, anchor="w", justify="left",
@@ -525,10 +536,7 @@ class QoderBackupApp:
         self.root.after_idle(self._fit_layout)
 
         ok = os.path.isdir(self.root_dir)
-        self.root_hint.config(
-            text="数据目录已识别" if ok else "未找到数据目录，请手动指定",
-            foreground="#0a6" if ok else "#c00",
-        )
+        self._refresh_detect_status(ok)
         if missing:
             self.summary.config(text="%d 项未找到" % missing, foreground="#c60")
         else:
@@ -686,24 +694,67 @@ class QoderBackupApp:
         else:
             self.uid_var.set(short_values[0])
 
+    def _refresh_detect_status(self, ok: bool) -> None:
+        """刷新「识别状态」区：列出数据目录下探测到的各数据根目录及状态。
+
+        位于数据目录输入框与当前用户行之间，仅做展示增强，不改变单路径数据目录模型。
+        严格成对处理：``ok`` 为 False 时清空逐行并提示未找到；恢复 True 时重新填充，
+        绝不残留旧文案。
+        """
+        # 清空上一次逐行内容（成对处理：先清后填，避免旧行残留）
+        for w in self.detect_rows_frame.winfo_children():
+            w.destroy()
+        if not ok:
+            self.detect_summary.config(
+                text="未找到数据目录，请手动指定", foreground="#c00"
+            )
+            return
+        roots = self.adapter.detect_data_roots(self.root_dir)
+        found = sum(1 for r in roots if r.get("exists"))
+        if not roots:
+            self.detect_summary.config(
+                text="已识别数据目录（未细分具体根）", foreground="#0a6"
+            )
+            return
+        self.detect_summary.config(
+            text="已识别 %d 个数据根目录：" % found, foreground="#0a6"
+        )
+        for r in roots:
+            rel = r.get("rel", "")
+            exists = r.get("exists", False)
+            note = r.get("note", "")
+            status = "✓ 已识别" if exists else "✗ 未找到"
+            color = "#0a6" if exists else "#c00"
+            line = "• %s   %s%s" % (rel, status, ("  " + note) if note else "")
+            ttk.Label(
+                self.detect_rows_frame, text=line, foreground=color, anchor="w"
+            ).pack(fill=tk.X, anchor="w", pady=(1, 0))
+
     def _redetect(self) -> None:
         self.root_dir = self._detect_root(self.root_var.get() or None)
         self.root_var.set(self.root_dir)
         if not os.path.isdir(self.root_dir):
-            # 数据目录未识别：冻结备份内容区，保持已有选项与用户勾选不变，
-            # 仅提示用户指定正确目录。避免识别错误时清单残缺（行忽有忽无）、
-            # 勾选被重置、以及批量"xx项未找到"提示反复出现。
-            if self.items:
+            # 数据目录未识别：把现有清单各项的 path 重映射到「当前（失效的）root_dir」
+            # 下对应相对位置，使其 exists 自然为 False，从而触发「未找到」标红与右上角
+            # 计数（成对处理，恢复有效后 build_items 会重建、自然复位）。用户明确要求：
+            # 目录失效时备份内容各项也要标红提示未找到，且勾选状态保持不变。
+            if self.items and getattr(self, "_last_good_root", None):
+                old_root = self._last_good_root
+                for it in self.items:
+                    try:
+                        rel = os.path.relpath(it.path, old_root)
+                    except ValueError:
+                        rel = os.path.basename(it.path)
+                    it.path = os.path.join(self.root_dir, rel)
                 self._refresh_uid_combo(force_clear=True)  # 当前用户下拉强制清空
-                self.root_hint.config(
-                    text="未找到数据目录，请手动指定", foreground="#c00"
-                )
-                # 整体目录未识别，清空上一次可能残留的"xx项未找到"（不再显示局部未找到）
-                self.summary.config(text="", foreground="#0a6")
+                self._refresh_detect_status(False)
+                # 保留勾选（_refresh_items 内 prev_sel 沿用当前勾选），仅标红未找到项
+                self._refresh_items()
                 self._set_status("未找到数据目录，请手动指定")
                 return
             # 从未成功识别过：仍重建一次，生成稳定的占位清单（各项未找到）
         self.items = self.adapter.build_items(self.root_dir)
+        self._last_good_root = self.root_dir  # 记录最后有效数据根，供失效时重映射
         self._refresh_items()
         self._refresh_uid_combo()
         self._set_status("已重新检测数据目录")
