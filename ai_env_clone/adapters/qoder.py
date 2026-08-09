@@ -307,17 +307,35 @@ class QoderAdapter(BaseAdapter):
     }
 
     def detect_root(self) -> str | None:
-        """探测 Qoder 数据根目录；未找到返回 None（GUI 提示手动指定）。"""
-        p = detect_qoder_root()
-        return p.root if p.exists else None
+        """探测 Qoder 数据根的公共根（用户主目录 ``~``）。与 CodeBuddy 统一：数据目录取 ``~``，``.qoder-cn`` 是其下的一个根。"""
+        return os.path.expanduser("~")
 
     def build_default_root(self) -> str:
-        """未探测到时的默认（建议）数据目录：``~/.qoder-cn``。"""
-        return os.path.join(os.path.expanduser("~"), ".qoder-cn")
+        """未探测到时的默认（建议）数据目录：用户主目录 ``~``。"""
+        return os.path.expanduser("~")
 
-    def build_items(self, root_dir: str, current_uid: str | None = None) -> list[BackupItem]:
-        """构造 Qoder 备份条目（root_dir 为已探测的根目录）。"""
-        shared = os.path.join(root_dir, "shared_client")
-        if not os.path.isdir(shared):
-            shared = os.path.join(root_dir, "sharedclient")
-        return build_items(QoderPaths(root=root_dir, shared=shared), current_uid)
+    def detect_data_roots(self, root: str | None = None) -> list[dict]:
+        """返回 Qoder 在 ``root`` 下的数据根目录信息。Qoder 仅 ``.qoder-cn`` 一处。
+
+        供 GUI 识别状态区展示，不改变单路径数据目录模型。
+        """
+        base = root or os.path.expanduser("~")
+        qoder_root = os.path.join(base, ".qoder-cn")
+        return [
+            {
+                "rel": ".qoder-cn",
+                "exists": os.path.isdir(qoder_root),
+                "note": "",
+            }
+        ]
+
+    def build_items(self, root_dir: str | None = None, current_uid: str | None = None) -> list[BackupItem]:
+        """构造 Qoder 备份条目。
+
+        ``root_dir`` 为公共根（用户主目录 ``~``，与 CodeBuddy 统一）；Qoder 实际数据在
+        ``<root_dir>/.qoder-cn`` 下，由 ``detect_qoder_root`` 以其（explicit）形式探测真实位置，
+        路径信息不失真。
+        """
+        base = root_dir or os.path.expanduser("~")
+        paths = detect_qoder_root(os.path.join(base, ".qoder-cn"))
+        return build_items(paths, current_uid)

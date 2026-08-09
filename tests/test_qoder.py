@@ -676,10 +676,10 @@ class TestGuiThreadSafety(TempEnv):
         self.addCleanup(lambda: setattr(gui, "HEADLESS", False))
 
         self.app = gui.QoderBackupApp(self.tk_root)
-        # 指向测试目录，避免动用真实 Qoder 数据（统一走适配器接口）
-        self.app.root_dir = self.root
+        # 指向测试目录（主目录语义：.qoder-cn 在其下），避免动用真实 Qoder 数据
+        self.app.root_dir = self.tmp
         # 显式指定当前用户，保证 memories_current 项存在且可测
-        self.app.items = self.app.adapter.build_items(self.root, current_uid=self.uid)
+        self.app.items = self.app.adapter.build_items(self.tmp, current_uid=self.uid)
         self.app._refresh_items()
         self.app._refresh_uid_combo()
         self.tk_root.update_idletasks()
