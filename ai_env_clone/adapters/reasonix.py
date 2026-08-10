@@ -18,11 +18,17 @@ Reasonix 适配器（自包含，不依赖任何遗留兼容层）。
     - ``projects/<name>/memory/``   各项目记忆（``<name>`` 形如 ``d--project-tbmhmi_alpha``，
                                     是项目路径的编码，名称层级即项目名）
     - ``projects/<name>/sessions/`` 各项目会话（实测会话即存于此，非顶层 ``sessions/``）
-    - ``config.toml``               全局配置
+    - ``config.toml``               全局配置（同时含 MCP 服务器 ``[[plugins]]`` 段与
+                                    ``disabled_skills`` 等用户级设置，属「设置」类）
     - ``plugins/``                  已安装扩展
+    - ``skills/``                   自定义技能与子智能体（实测：如 ``skills/test-sub-agent/SKILL.md``；
+                                    内置 explore 等技能的停用标记在 config.toml，不在此目录）
+    - ``settings.json``             全局 Hook 配置（用户级 hook 存放处；项目级 hook 在项目文件夹内，
+                                    不列入）。本机未配置 hook 时该文件可能不存在，届时标「（未找到）」
     - ``state/`` ``stats/`` ``archive/`` ``crash-fatal/`` ``repair/`` ``global-workspace/``
-      ``desktop-*.json`` ``install-id`` ``metrics-pending.json`` 等：运行态/崩溃日志/锁文件，
-      易变、迁移价值低，**不列入备份项**（避免打包崩溃日志与锁）。
+      ``sessions/``（仅 ``.legacy-imported`` 等迁移标记，非真实会话） ``desktop-*.json``
+      ``install-id`` ``metrics-pending.json`` 等：运行态/崩溃日志/锁文件，易变、迁移价值低，
+      **不列入备份项**（避免打包崩溃日志与锁）。
 - 本地缓存（Local 级）：
     Windows : ``%LOCALAPPDATA%\\reasonix\\``           (= ``~/AppData/Local/reasonix``)
     macOS   : ``~/Library/Caches/reasonix``
@@ -36,9 +42,9 @@ path 均在 ``~`` 之下（含 ``AppData/Roaming`` 与 ``AppData/Local``），�
 落回原位，恢复干净。这与 CodeBuddy 适配器「公共根=用户主目录」策略一致。
 
 备份哲学（统一标准）：默认勾选无法从零重复创建的——会话、记忆；默认不勾可从零重复
-创建的——扩展（plugins/）、设置（config.toml）；程序自身的本地缓存、运行态、日志
-不列入备份选项。新增其它工具时，仿照本文件新建 ``ai_env_clone/adapters/<tool>.py``，
-用 ``@register`` 装饰类，无需改动任何入口代码。
+创建的——扩展（plugins/）、自定义技能/子智能体（skills/）、设置（config.toml、settings.json）；
+程序自身的本地缓存、运行态、日志不列入备份选项。新增其它工具时，仿照本文件新建
+``ai_env_clone/adapters/<tool>.py``，用 ``@register`` 装饰类，无需改动任何入口代码。
 """
 
 from __future__ import annotations
@@ -147,6 +153,37 @@ def build_items(
             path=os.path.join(roam, "plugins"),
             uid=None,
             description="Reasonix 已安装扩展目录（plugins/）。重装可恢复，默认不勾。",
+            recommended=False,
+        )
+    )
+
+    # 5) 自定义技能与子智能体（skills/）。实测：用户添加的自定义技能/子智能体
+    #    （如 test-sub-agent）以 skill 形式存放在 Roaming/reasonix/skills/<name>/SKILL.md。
+    #    内置 explore 等技能停用状态记录在 config.toml（见 global_config 项），不在本目录。
+    #    技能属「可重建」内容，默认不勾。
+    items.append(
+        BackupItem(
+            key="skills",
+            label="自定义技能与子智能体（skills/）",
+            path=os.path.join(roam, "skills"),
+            uid=None,
+            description="Reasonix 自定义技能/子智能体目录（skills/，如 test-sub-agent）。"
+                        "可重建，默认不勾。",
+            recommended=False,
+        )
+    )
+
+    # 6) 全局 Hook 配置（settings.json）。用户明确：全局 hook 配置存放于
+    #    Roaming/reasonix/settings.json，列入备份、默认不勾；项目级 hook 在项目文件夹内，不列入。
+    #    注：本机实测该文件可能尚未落盘（未配置 hook 时不存在），届时该项标「（未找到）」，
+    #    待用户实际配置 hook 后生成即生效。
+    items.append(
+        BackupItem(
+            key="global_settings",
+            label="全局 Hook 配置（settings.json）",
+            path=os.path.join(roam, "settings.json"),
+            uid=None,
+            description="Reasonix 全局 Hook 配置（settings.json）。默认不勾。",
             recommended=False,
         )
     )
