@@ -79,8 +79,15 @@ class TestBuildItems(unittest.TestCase):
         os.makedirs(os.path.join(self.roam, "projects", "d--proj", "memory"), exist_ok=True)
         os.makedirs(os.path.join(self.roam, "projects", "d--proj", "sessions"), exist_ok=True)
         os.makedirs(os.path.join(self.roam, "plugins"), exist_ok=True)
+        # 自定义技能/子智能体（如 test-sub-agent）与全局 hook 配置（settings.json）
+        os.makedirs(os.path.join(self.roam, "skills", "test-sub-agent"), exist_ok=True)
+        with open(os.path.join(self.roam, "skills", "test-sub-agent", "SKILL.md"),
+                  "w", encoding="utf-8") as f:
+            f.write("")
         with open(os.path.join(self.roam, "config.toml"), "w", encoding="utf-8") as f:
             f.write("")
+        with open(os.path.join(self.roam, "settings.json"), "w", encoding="utf-8") as f:
+            f.write("{}")
         os.makedirs(os.path.join(self.local, "updates"), exist_ok=True)
 
     def _items(self):
@@ -97,7 +104,7 @@ class TestBuildItems(unittest.TestCase):
         keys = {it.key for it in self._items()}
         self.assertEqual(
             keys,
-            {"global_memory", "projects", "global_config", "plugins"},
+            {"global_memory", "projects", "global_config", "plugins", "skills", "global_settings"},
         )
 
     def test_recommended_defaults(self) -> None:
@@ -106,16 +113,18 @@ class TestBuildItems(unittest.TestCase):
         self.assertTrue(items["projects"].recommended)
         self.assertFalse(items["global_config"].recommended)
         self.assertFalse(items["plugins"].recommended)
+        self.assertFalse(items["skills"].recommended)
+        self.assertFalse(items["global_settings"].recommended)
 
     def test_exists_when_present(self) -> None:
         for it in self._items():
             self.assertTrue(it.exists, "条目 %s 应存在: %s" % (it.key, it.path))
 
     def test_missing_root_still_lists_all(self) -> None:
-        # 即使 root 下没有任何 reasonix 目录，也应列出全部 4 项（供 GUI 显示未找到）。
+        # 即使 root 下没有任何 reasonix 目录，也应列出全部 6 项（供 GUI 显示未找到）。
         items = rx_mod.build_items(self.tmp, os.path.join(self.tmp, "nope_r"),
                                    os.path.join(self.tmp, "nope_l"))
-        self.assertEqual(len(items), 4)
+        self.assertEqual(len(items), 6)
         self.assertTrue(all(not it.exists for it in items))
 
 
