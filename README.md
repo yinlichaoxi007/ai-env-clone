@@ -25,6 +25,7 @@
 | Qoder CN（前 Lingma，JetBrains 插件） | 桌面 IDE 插件 | **3.3.3** | ✅ 已支持 |
 | Qoder CN IDE（独立桌面客户端） | 独立 IDE | **1.10.0** | ✅ 已支持 |
 | CodeBuddy | 桌面 IDE | — | ✅ 已支持（用户级/全局数据，公共根为用户主目录；适配器逻辑已实现，实际形态以 IDE 为主） |
+| Reasonix | 桌面 IDE | — | ✅ 已支持（配置/数据在 `AppData/Roaming/reasonix`，缓存在 `AppData/Local/reasonix`；本机 Windows 实测） |
 | 其他国内可用工具 | — | — | 🚧 规划中，欢迎贡献适配器 |
 
 > ⚠️ **版本说明**：上表仅列出作者**实测通过**的版本。其他更高/更低版本未经测试，数据结构可能变化，使用前请先在本机做一次「导出 → 校验」验证。
@@ -116,6 +117,7 @@ ai_env_clone/                包（import 名 ai_env_clone，产品名 AiEnvClon
 │   ├── base.py        BaseAdapter 抽象接口 + 适配器注册表
 │   ├── qoder.py       Qoder 适配器（参考实现，自包含）
 │   └── codebuddy.py   CodeBuddy 适配器（用户级/全局数据，公共根为用户主目录）
+│   └── reasonix.py    Reasonix 适配器（配置/数据在 AppData/Roaming/reasonix，缓存在 AppData/Local/reasonix）
 └── backup/            备份/恢复执行与回滚快照
 build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 / macOS x86_64 / Linux 可执行程序）
 .github/workflows/     build-release.yml（打 tag 自动构建多平台可执行程序并发布 Release）+ mirror-to-gitee.yml（镜像到 Gitee）
@@ -189,6 +191,7 @@ build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 /
 | Qoder CN (formerly Lingma, JetBrains plugin) | Desktop IDE plugin | **3.3.3** | ✅ Supported |
 | Qoder CN IDE (standalone desktop client) | Standalone IDE | **1.10.0** | ✅ Supported |
 | CodeBuddy | Desktop IDE | — | ✅ Supported (user-level & global data, common root = user home; adapter logic implemented, primarily IDE in practice) |
+| Reasonix | Desktop IDE | — | ✅ Supported (config/data under `AppData/Roaming/reasonix`, cache under `AppData/Local/reasonix`; verified on Windows) |
 | Other China-usable tools | — | — | 🚧 Planned — adapters welcome |
 
 > ⚠️ **Version note**: only author-tested versions are listed above. Untested higher/lower versions may have changed data layouts — do an Export→Verify on your machine first.
@@ -287,6 +290,7 @@ ai_env_clone/                package (import name ai_env_clone, product name AiE
 │   ├── base.py        BaseAdapter interface + adapter registry
 │   ├── qoder.py       Qoder adapter (reference implementation, self-contained)
 │   └── codebuddy.py   CodeBuddy adapter (user-level & global data, common root = user home)
+│   └── reasonix.py    Reasonix adapter (config/data under AppData/Roaming/reasonix, cache under AppData/Local/reasonix)
 └── backup/            backup/restore execution & rollback snapshots
 build_exe.py           package into cross-platform executables via PyInstaller (Windows / macOS arm64 / macOS x86_64 / Linux)
 .github/workflows/     build-release.yml (tag → auto-build multi-platform binaries & publish Release) + mirror-to-gitee.yml (mirror to Gitee)
