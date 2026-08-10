@@ -8,7 +8,7 @@
 
 ## 简介
 
-`ai-env-clone` 帮助你把本地 AI 编程工具（如 Qoder）积累的**记忆（memory）**、**会话历史（chat history）**、**代码索引**、**配置**等数据，打包成一个离线备份文件，方便在新电脑上完整恢复，避免重新训练和丢失上下文。
+`ai-env-clone` 帮助你把本地 AI 编程工具（如 Qoder）积累的**记忆（memory）**、**会话历史（chat history）**、**规则（rules）** 等用户核心数据，打包成一个离线备份文件，方便在新电脑上完整恢复，避免重新训练和丢失上下文。
 
 - 🖥️ **双形态**：同一套核心逻辑，既提供命令行（CLI）也提供图形界面（GUI，基于 Python 自带的 tkinter，无需额外安装）。
 - 📦 **零第三方依赖**：运行时不依赖任何第三方库，仅用 Python 标准库。发布版的**单文件 exe 双击即用、无需安装 Python**；从源码运行（`python -m ai_env_clone` 或 `run.bat`）则需本机已装 Python 3.10+。
@@ -30,6 +30,16 @@
 
 > ⚠️ **版本说明**：上表仅列出作者**实测通过**的版本。其他更高/更低版本未经测试，数据结构可能变化，使用前请先在本机做一次「导出 → 校验」验证。
 > 部分工具的不同形态（如桌面 IDE 与对应插件）可能共用同一套数据目录，本工具按各适配器探测到的数据根统一备份，无需用户区分具体产品形态。
+
+## 备份范围与默认勾选策略
+
+本工具统一按以下原则划分「备份内容」的默认勾选状态（各适配器一致，适用于所有已支持的工具）：
+
+- ✅ **默认勾选（推荐项）**：**会话历史、记忆、规则** —— 这些是无法从零重复创建的用户核心数据，丢失即不可逆，故默认勾选，建议连同一起备份。
+- ⬜ **默认不勾选（可选）**：**插件、扩展、MCP、skill、灵感、索引、设置** —— 这些属于程序配置或可由工具自身从零重建的内容，默认不勾，按需自行勾选。
+- 🚫 **不列入备份选项**：**本地缓存、运行态记录、日志** —— 这些纯属程序自身的临时/运行数据，与用户数据无关，不生成备份条目，无论是否勾选都不会备份。
+
+> 注：不同工具内部目录命名不同（如「设置」可能是 `argv.json`/`config.toml`/项目级 `settings.json`），但均按上述类别归入对应勾选状态。
 
 ## 安装
 
@@ -174,7 +184,7 @@ build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 /
 
 ## Introduction
 
-`ai-env-clone` helps you package the **memory**, **chat history**, **code index** and **settings** accumulated by your local AI coding tools (e.g. Qoder) into an offline backup archive, so you can fully restore them on a new machine without retraining or losing context.
+`ai-env-clone` helps you package the **memory**, **chat history** and **rules** accumulated by your local AI coding tools (e.g. Qoder) — the user's core, irreproducible data — into an offline backup archive, so you can fully restore them on a new machine without retraining or losing context.
 
 - 🖥️ **Dual mode**: one core, both CLI and GUI (GUI via Python's built-in tkinter, no extra install).
 - 📦 **Zero runtime dependencies**: standard library only at runtime; the packaged single-file exe runs by double-click.
@@ -196,6 +206,16 @@ build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 /
 
 > ⚠️ **Version note**: only author-tested versions are listed above. Untested higher/lower versions may have changed data layouts — do an Export→Verify on your machine first.
 > Some tools may ship multiple forms (e.g. a desktop IDE and its plugin) that share one data directory; each adapter backs up whatever data roots it detects, so users need not distinguish product forms.
+
+## Backup Scope & Default Selection Policy
+
+All adapters follow the same policy for which backup items are checked by default:
+
+- ✅ **Checked by default (recommended)**: **chat history, memory, rules** — user core data that cannot be recreated from scratch; losing it is irreversible, so these are checked and recommended for backup.
+- ⬜ **Unchecked by default (optional)**: **plugins, extensions, MCP, skills, inspiration, index, settings** — program configuration or content that the tool can rebuild from scratch; unchecked by default, tick as needed.
+- 🚫 **Not listed as a backup item**: **local cache, runtime/state records, logs** — purely the program's own temporary/runtime data, unrelated to user data; no item is generated and it is never backed up regardless of selection.
+
+> Note: different tools name their directories differently (e.g. "settings" may be `argv.json` / `config.toml` / project-level `settings.json`), but each is mapped to the appropriate selection state by category above.
 
 ## Supported Platforms & Architectures
 

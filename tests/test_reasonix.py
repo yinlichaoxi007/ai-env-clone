@@ -97,26 +97,25 @@ class TestBuildItems(unittest.TestCase):
         keys = {it.key for it in self._items()}
         self.assertEqual(
             keys,
-            {"global_memory", "projects", "global_config", "plugins", "local_cache"},
+            {"global_memory", "projects", "global_config", "plugins"},
         )
 
     def test_recommended_defaults(self) -> None:
         items = {it.key: it for it in self._items()}
         self.assertTrue(items["global_memory"].recommended)
         self.assertTrue(items["projects"].recommended)
-        self.assertTrue(items["global_config"].recommended)
-        self.assertTrue(items["plugins"].recommended)
-        self.assertFalse(items["local_cache"].recommended)
+        self.assertFalse(items["global_config"].recommended)
+        self.assertFalse(items["plugins"].recommended)
 
     def test_exists_when_present(self) -> None:
         for it in self._items():
             self.assertTrue(it.exists, "条目 %s 应存在: %s" % (it.key, it.path))
 
     def test_missing_root_still_lists_all(self) -> None:
-        # 即使 root 下没有任何 reasonix 目录，也应列出全部 5 项（供 GUI 显示未找到）。
+        # 即使 root 下没有任何 reasonix 目录，也应列出全部 4 项（供 GUI 显示未找到）。
         items = rx_mod.build_items(self.tmp, os.path.join(self.tmp, "nope_r"),
                                    os.path.join(self.tmp, "nope_l"))
-        self.assertEqual(len(items), 5)
+        self.assertEqual(len(items), 4)
         self.assertTrue(all(not it.exists for it in items))
 
 
