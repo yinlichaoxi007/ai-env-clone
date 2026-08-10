@@ -9,7 +9,8 @@ CodeBuddy 适配器测试用例。
 备份范围铁律（用户 2026-08-07 明确）：**只备份不在项目文件夹下的用户级/全局数据**。
 所有条目 path 均在公共根 ``~`` 之下。本项目级 ``.codebuddy`` **绝不**出现在清单中。
 用户级规则 ``test.mdc`` 整体备份（不排除任何特定文件）。
-集中会话/检查点（``Data/<uuid>/CodeBuddyIDE/<uuid>/``）需备份，除工程索引 ``file-tree/`` 外默认勾选。
+集中会话/检查点（``Data/<uuid>/CodeBuddyIDE/<uuid>/``）需备份，``history/`` ``check-point/``
+``plan-task/`` 默认勾选；工程索引缓存 ``file-tree/`` 不列入备份选项。
 """
 
 from __future__ import annotations
@@ -88,7 +89,6 @@ class TempEnv(unittest.TestCase):
         self._w(self.session_root, "history/messages/1.json", "{}")
         self._w(self.session_root, "check-point/1.json", "{}")
         self._w(self.session_root, "plan-task/1.json", "{}")
-        self._w(self.session_root, "file-tree/index.json", "{}")  # 默认不勾的索引缓存
 
         # 让适配器内部探测函数指向临时目录（真实环境里 LOCALAPPDATA 也在 ~ 下，
         # 这里用 monkeypatch 保证所有条目 path 都在 self.tmp 之下，便于断言）。
@@ -178,17 +178,16 @@ class TestBuildItems(TempEnv):
         self.assertEqual(self.prefixes, expected)
 
     def test_recommended_defaults(self) -> None:
-        # 默认勾选：用户记忆 / 用户规则 / 全局 argv / 集中会话（除 file-tree）
+        # 默认勾选：用户记忆 / 用户规则 / 集中会话（history/check-point/plan-task）
         self.assertTrue(self.by_key["user_memories"].recommended)
-        self.assertTrue(self.by_key["global_argv"].recommended)
         # 规则项（单一 key user_rules）默认勾选
         self.assertTrue(self.by_key["user_rules"].recommended)
-        # 集中会话：history/check-point/plan-task 默认勾选；file-tree 默认不勾
+        # 集中会话：history/check-point/plan-task 默认勾选
         self.assertTrue(self.by_key["user_sessions:history"].recommended)
         self.assertTrue(self.by_key["user_sessions:checkpoint"].recommended)
         self.assertTrue(self.by_key["user_sessions:plan_task"].recommended)
-        self.assertFalse(self.by_key["user_sessions:file_tree"].recommended)
-        # 默认不勾：skill 设置/本体、mcp、扩展、灵感、专家历史、插件
+        # 默认不勾：设置类（argv）、skill 设置/本体、mcp、扩展、灵感、专家历史、插件
+        self.assertFalse(self.by_key["global_argv"].recommended)
         self.assertFalse(self.by_key["user_skill:settings"].recommended)
         self.assertFalse(self.by_key["user_skill:skills"].recommended)
         self.assertFalse(self.by_key["user_mcp"].recommended)
@@ -241,8 +240,6 @@ class TestBuildItems(TempEnv):
         # 集中会话各项指向 session_root 下的子目录
         self.assertEqual(self.by_key["user_sessions:history"].path,
                          os.path.join(self.session_root, "history"))
-        self.assertEqual(self.by_key["user_sessions:file_tree"].path,
-                         os.path.join(self.session_root, "file-tree"))
 
 
 class TestMultiUser(unittest.TestCase):

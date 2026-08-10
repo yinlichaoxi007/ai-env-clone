@@ -19,15 +19,17 @@ CodeBuddy 的数据分两处，本适配器**只处理后者**：
   3. 用户级设置 + skill 本体：``~/.codebuddy/settings.json``（用户级 skill 开关）
      + ``~/.codebuddy/skills-marketplace/``（已下载 skill 本体）。合并为一项，默认不勾。
   4. 用户级 MCP：``~/.codebuddy/mcp.json``（默认不勾）。
-  5. 全局 IDE 配置：``~/.codebuddycn/``（``argv.json`` / ``extensions/``）。
+  5. 全局 IDE 配置：``~/.codebuddycn/``（``argv.json`` / ``extensions/``）。属「设置」类，
+     可从零重复创建，默认不勾。
   6. 灵感（``~/.codebuddy/inspiration/``，按登录用户 UUID 隔离，非项目）与
      专家历史（``~/.codebuddy/expert-history.json``）——均为用户级，默认不勾。
   7. **集中会话/检查点数据**（``%LOCALAPPDATA%/CodeBuddyExtension/Data/<uuid>/CodeBuddyIDE/<uuid>/``）：
      这是 CodeBuddy **跨工程集中存储的会话历史与 AI 回答检查点**（``history/`` 真实对话消息、
      ``check-point/`` 检查点快照、``plan-task/`` 计划任务等），**不是** ``<project>/.codebuddy``
      那种「项目级」数据（后者打包工程自然带着、不进选项）。该目录外层 ``<uuid>`` = 登录用户标识，
-     是「用户级」集中存储，**必须备份**。其中仅「工程文件索引缓存」 ``file-tree/`` 无迁移价值、默认不勾，
-     其余默认勾选。
+     是「用户级」集中存储，**必须备份**。其中 ``history/`` ``check-point/`` ``plan-task/`` 默认勾选；
+     工程文件索引缓存 ``file-tree/`` 属程序自身运行态、重新打开工程即重建，与用户数据无关，
+     **不列入备份选项**。
 
 所有用户级/全局数据的**公共根是用户主目录 ``~``**，故 ``detect_root`` / ``build_default_root``
 均返回 ``~``，各条目 path 均在 ``~`` 之下，归档按相对路径落回原位，恢复干净。
@@ -37,8 +39,9 @@ CodeBuddy 的数据分两处，本适配器**只处理后者**：
 - 「集中会话」= ``CodeBuddyExtension/Data/<uuid>/CodeBuddyIDE/<uuid>/``（跨工程集中存储于
   用户 AppData，需显式备份）→ **进备份选项**，默认勾选（除工程索引 ``file-tree/``）。
 
-备份哲学（用户 2026-08-08）：主要备份会话、记忆、规则和无法方便导出的设置参数；
-插件、skill、mcp、扩展等默认不勾选。
+备份哲学（统一标准）：默认勾选无法从零重复创建的——会话、记忆、规则；默认不勾可从零重复
+创建的——插件、skill、mcp、扩展、灵感、索引、设置（含全局 argv.json）；程序自身的本地缓存、
+运行态记录、日志与用户数据无关，不列入备份选项。
 
 与 Qoder 不同，CodeBuddy 记忆是**单用户扁平结构**，无 UID 拆分（``inspiration/`` 下的
 UUID 是登录用户标识，不是项目；``CodeBuddyIDE`` 外层 UUID 同理）。
@@ -285,15 +288,15 @@ def build_items(
         )
     )
 
-    # 5) 全局 IDE 配置（~/.codebuddycn/argv.json）。默认勾选（无法方便导出的设置参数）。
+    # 5) 全局 IDE 配置（~/.codebuddycn/argv.json）。属「设置」类，可从零重复创建，默认不勾。
     items.append(
         BackupItem(
             key="global_argv",
             label="全局 IDE 配置（argv.json）",
             path=os.path.join(global_root, "argv.json"),
             uid=None,
-            description="CodeBuddy 全局 IDE 配置（%s/argv.json）。建议必选。" % global_root,
-            recommended=True,
+            description="CodeBuddy 全局 IDE 配置（%s/argv.json）。可从零重新创建，默认不勾。" % global_root,
+            recommended=False,
         )
     )
 
@@ -334,16 +337,8 @@ def build_items(
             recommended=True,
         )
     )
-    items.append(
-        BackupItem(
-            key="user_sessions:file_tree",
-            label="集中会话/检查点（CodeBuddyIDE）",
-            path=os.path.join(session_root, "file-tree"),
-            uid=current_uid,
-            description="工程文件索引缓存（file-tree/），重新打开工程即重建，迁移价值低。默认不勾。",
-            recommended=False,
-        )
-    )
+    # 注意：工程文件索引缓存（file-tree/）属程序自身的运行态/索引，重新打开工程即重建，
+    # 与用户数据无关，按统一策略**不列入备份选项**（不生成条目），故此处不再添加。
 
     # 7) 全局扩展目录（~/.codebuddycn/extensions/）。默认不勾（体积大、重装可恢复）。
     items.append(

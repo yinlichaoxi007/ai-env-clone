@@ -27,16 +27,18 @@ Reasonix 适配器（自包含，不依赖任何遗留兼容层）。
     Windows : ``%LOCALAPPDATA%\\reasonix\\``           (= ``~/AppData/Local/reasonix``)
     macOS   : ``~/Library/Caches/reasonix``
     Linux   : ``~/.cache/reasonix``
-  其下 ``environment/`` ``repair-mutation-locks/`` ``updates/``：缓存/更新，可重建，**默认不勾**。
+  其下 ``environment/`` ``repair-mutation-locks/`` ``updates/``：缓存/更新，程序自身，
+  **与用户数据无关，不列入备份选项**（不生成备份条目）。
 
 说明：Reasonix 同时有 Roaming（配置/数据）与 Local（缓存）两处，二者公共根是
 用户主目录 ``~``，故 ``detect_root`` / ``build_default_root`` 均返回 ``~``，各条目
 path 均在 ``~`` 之下（含 ``AppData/Roaming`` 与 ``AppData/Local``），归档按相对路径
 落回原位，恢复干净。这与 CodeBuddy 适配器「公共根=用户主目录」策略一致。
 
-备份哲学（对齐其它适配器）：主要备份会话、记忆、全局配置、扩展；本地缓存默认不勾。
-新增其它工具时，仿照本文件新建 ``ai_env_clone/adapters/<tool>.py``，用 ``@register``
-装饰类，无需改动任何入口代码。
+备份哲学（统一标准）：默认勾选无法从零重复创建的——会话、记忆；默认不勾可从零重复
+创建的——扩展（plugins/）、设置（config.toml）；程序自身的本地缓存、运行态、日志
+不列入备份选项。新增其它工具时，仿照本文件新建 ``ai_env_clone/adapters/<tool>.py``，
+用 ``@register`` 装饰类，无需改动任何入口代码。
 """
 
 from __future__ import annotations
@@ -125,41 +127,32 @@ def build_items(
         )
     )
 
-    # 3) 全局配置（config.toml）。默认勾选（无法方便导出的设置参数）。
+    # 3) 全局配置（config.toml）。属「设置」类，可从零重复创建，默认不勾。
     items.append(
         BackupItem(
             key="global_config",
             label="全局配置（config.toml）",
             path=os.path.join(roam, "config.toml"),
             uid=None,
-            description="Reasonix 全局配置（config.toml）。建议必选。",
-            recommended=True,
+            description="Reasonix 全局配置（config.toml）。可从零重新创建，默认不勾。",
+            recommended=False,
         )
     )
 
-    # 4) 扩展（plugins/）。用户明确列出，默认勾选。
+    # 4) 扩展（plugins/）。属「扩展」类，重装可恢复，默认不勾。
     items.append(
         BackupItem(
             key="plugins",
             label="扩展（plugins/）",
             path=os.path.join(roam, "plugins"),
             uid=None,
-            description="Reasonix 已安装扩展目录（plugins/）。默认勾选。",
-            recommended=True,
-        )
-    )
-
-    # 5) 本地缓存（Local/reasonix）。缓存/更新，可重建，默认不勾。
-    items.append(
-        BackupItem(
-            key="local_cache",
-            label="本地缓存（Local/reasonix）",
-            path=local,
-            uid=None,
-            description="Reasonix 本地缓存（environment/、updates/ 等），可重建。默认不勾。",
+            description="Reasonix 已安装扩展目录（plugins/）。重装可恢复，默认不勾。",
             recommended=False,
         )
     )
+
+    # 注意：本地缓存（Local/reasonix 下的 environment/、updates/ 等）属程序自身缓存，
+    # 与用户数据无关，按统一策略**不列入备份选项**（不生成条目），此处不再添加。
 
     return items
 
@@ -213,7 +206,7 @@ class ReasonixAdapter(BaseAdapter):
         local = _local_root()
         candidates = [
             (os.path.relpath(roam, home), roam, ""),
-            (os.path.relpath(local, home), local, "（缓存，默认不勾）"),
+            (os.path.relpath(local, home), local, "（缓存，不列入备份）"),
         ]
         roots = []
         for rel, abs_path, note in candidates:
