@@ -1,0 +1,17 @@
+{
+  "messages": [
+    {"id": "aaaa0001-bbbb-cccc-dddd-eeeeeeee0001", "type": "message", "role": "user", "isComplete": true},
+    {"id": "aaaa0002-bbbb-cccc-dddd-eeeeeeee0002", "type": "message", "role": "assistant", "isComplete": true}
+  ],
+  "requests": [
+    {
+      "id": "aaaa0003-bbbb-cccc-dddd-eeeeeeee0003",
+      "type": "request",
+      "messages": ["aaaa0001-bbbb-cccc-dddd-eeeeeeee0001", "aaaa0002-bbbb-cccc-dddd-eeeeeeee0002"],
+      "state": "completed",
+      "startedAt": "2026-08-10T09:30:00.000Z",
+      "usage": []
+    }
+  ],
+  "title": "解释闭包"
+}
