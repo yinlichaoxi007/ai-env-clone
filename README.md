@@ -24,8 +24,8 @@
 | --- | --- | --- | --- |
 | Qoder CN（前 Lingma，JetBrains 插件） | 桌面 IDE 插件 | **3.3.3** | ✅ 已支持 |
 | Qoder CN IDE（独立桌面客户端） | 独立 IDE | **1.10.0** | ✅ 已支持 |
-| CodeBuddy | 桌面 IDE | **4.11.0** | ✅ 已支持（用户级/全局数据，公共根为用户主目录；适配器逻辑已实现，实际形态以 IDE 为主） |
-| Reasonix | 桌面 IDE | **1.21.5** | ✅ 已支持（配置/数据在 `AppData/Roaming/reasonix`，缓存在 `AppData/Local/reasonix`；本机 Windows 实测） |
+| CodeBuddy | 桌面 IDE | **4.11.0** | ✅ 已支持 |
+| Reasonix | 桌面 IDE | **1.21.5** | ✅ 已支持 |
 | 其他国内可用工具 | — | — | 🚧 规划中，欢迎贡献适配器 |
 
 > ⚠️ **版本说明**：上表仅列出作者**实测通过**的版本。其他更高/更低版本未经测试，数据结构可能变化，使用前请先在本机做一次「导出 → 校验」验证。
@@ -200,8 +200,8 @@ build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 /
 | --- | --- | --- | --- |
 | Qoder CN (formerly Lingma, JetBrains plugin) | Desktop IDE plugin | **3.3.3** | ✅ Supported |
 | Qoder CN IDE (standalone desktop client) | Standalone IDE | **1.10.0** | ✅ Supported |
-| CodeBuddy | Desktop IDE | **4.11.0** | ✅ Supported (user-level & global data, common root = user home; adapter logic implemented, primarily IDE in practice) |
-| Reasonix | Desktop IDE | **1.21.5** | ✅ Supported (config/data under `AppData/Roaming/reasonix`, cache under `AppData/Local/reasonix`; verified on Windows) |
+| CodeBuddy | Desktop IDE | **4.11.0** | ✅ Supported |
+| Reasonix | Desktop IDE | **1.21.5** | ✅ Supported |
 | Other China-usable tools | — | — | 🚧 Planned — adapters welcome |
 
 > ⚠️ **Version note**: only author-tested versions are listed above. Untested higher/lower versions may have changed data layouts — do an Export→Verify on your machine first.
