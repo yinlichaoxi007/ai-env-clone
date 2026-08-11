@@ -336,8 +336,12 @@ class QoderBackupApp:
             content_h = self.list_frame.winfo_reqheight()
         except Exception:
             content_h = 0
-        # canvas 高度：内容少则贴合内容、内容多则封顶并滚动（下限避免过扁）
-        LIST_MIN, LIST_MAX = 120, 380
+        # canvas 高度：内容少则贴合内容、内容多则封顶并滚动（下限避免过扁）。
+        # LIST_MAX 与 Qoder 适配器保持一致（紧凑封顶）：CodeBuddy 备份项较多，
+        # 内容过多时若不给足上限，主窗口高度会随内容无限增长；在 DPI 放大
+        # （缩放 > 100%）场景下更易顶到屏幕边缘导致显示不全。统一封顶 300，
+        # 超出部分由 canvas 滚动条承载，主窗口高度保持受控。
+        LIST_MIN, LIST_MAX = 120, 300
         canvas_h = max(LIST_MIN, min(content_h, LIST_MAX))
         try:
             self._canvas.configure(height=canvas_h)
@@ -1159,7 +1163,32 @@ class QoderBackupApp:
         self._run_bg(work)
 
 
+def _enable_dpi_awareness() -> None:
+    """让进程在 Windows 上感知 DPI，确保 tk 的几何/字体缩放与系统一致。
+
+    默认 Python 进程是 DPI-UNAWARE：Windows 会把整个窗口位图虚化放大到
+    当前缩放比，导致 ``winfo_screenheight`` 与 ``geometry`` 量纲错配、
+    高分屏（缩放 > 100%）下主窗口被放得过大而显示不全。声明 Per-Monitor
+    Aware v2 后，tk 用 ``tk scaling`` 精确渲染，窗口相对屏幕大小在任意
+    DPI 下恒定，不再被虚化放大。非 Windows 平台直接跳过（无 DPI 概念）。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        # 2 = PROCESS_PER_MONITOR_DPI_AWARE_V2（Win8.1+，最稳）
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # type: ignore[attr-defined]
+    except Exception:
+        # 回退：Win7/Vista 的进程级 DPI 感知
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDPIAware()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
 def main() -> None:
+    _enable_dpi_awareness()
     root = tk.Tk()
     try:
         ttk.Style().theme_use("vista")
