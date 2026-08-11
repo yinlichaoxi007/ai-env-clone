@@ -131,6 +131,19 @@ class BaseAdapter(ABC):
     def restore(self, zip_path: str, root: str, progress=None, **kw) -> dict:
         return import_backup(zip_path, root, progress=progress, **kw)
 
+    # ------------------------------------------------------------------ #
+    # 还原路径重写（跨电脑迁移用，可重写）
+    # ------------------------------------------------------------------ #
+    def restore_path_rewrite(self) -> "Callable[[str], str] | None":
+        """
+        返回一个「归档内相对路径 -> 还原目标相对路径」的重写函数；
+        用于跨电脑还原时把源机器特有的标识（如用户 UUID）重映射到
+        本机当前用户，避免数据落到「死目录」里而界面读不到。
+
+        默认返回 ``None``（不做任何重写）。
+        """
+        return None
+
     @staticmethod
     def join(root: str, *parts: str) -> str:
         return os.path.join(root, *parts)

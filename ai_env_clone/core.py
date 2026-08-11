@@ -611,6 +611,7 @@ def import_backup(
     expected_kind: str | None = None,
     strict: bool = False,
     match_structure: "Callable[[Sequence[str]], tuple[bool, list[str]]] | None" = None,
+    path_rewrite: "Callable[[str], str] | None" = None,
 ) -> dict:
     """
     恢复备份到根目录。
@@ -630,6 +631,12 @@ def import_backup(
         抛出 ``BackupError``，用于防止伪造声明文件的恶意备份。
     :param match_structure: 结构指纹回调函数（同 :func:`inspect_backup`）。
         缺 manifest 或 ``strict`` 模式下用于判定数据类型与结构是否匹配。
+    :param path_rewrite: 可选「归档内相对路径 -> 还原目标相对路径」重写函数，
+        用于跨电脑还原时把源机器特有标识（如用户 UUID）重映射为本机当前用户，
+        避免数据落到目标机器读不到的「死目录」（典型症状：界面能看到历史会话
+        列表残留，但点开看不到具体对话内容）。返回 ``None`` 表示不改写。
+        注意：重写仅改变落盘位置，回滚快照的「被覆盖文件」判定也基于重写后的
+        目标路径，确保回滚能正确对照新位置。
     :return: {'restored': int, 'skipped': int, 'blocked': [str], 'rollback': str|None,
               'kind': str|None, 'tool': str|None, 'source_root': str|None,
               'structure_match': bool|None, 'structure_missing': list[str]}
@@ -702,9 +709,10 @@ def import_backup(
         if make_rollback:
             victims = []
             for m in members:
-                t = safe_target(root_real, m.filename)
+                arcname = path_rewrite(m.filename) if path_rewrite else m.filename
+                t = safe_target(root_real, arcname)
                 if t and os.path.isfile(t):
-                    victims.append((t, m.filename))
+                    victims.append((t, arcname))
             if victims:
                 rb_dir = os.path.realpath(rollback_dir) if rollback_dir else root_real
                 os.makedirs(rb_dir, exist_ok=True)
@@ -739,9 +747,10 @@ def import_backup(
                     rollback_path = None
 
         for idx, m in enumerate(members, 1):
-            target = safe_target(root_real, m.filename)
+            arcname = path_rewrite(m.filename) if path_rewrite else m.filename
+            target = safe_target(root_real, arcname)
             if target is None:
-                blocked.append(m.filename)
+                blocked.append(arcname)
                 continue
 
             if os.path.exists(target) and not overwrite:
