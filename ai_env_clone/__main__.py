@@ -159,8 +159,43 @@ class QoderBackupApp:
         self.detect_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
         self.detect_summary = ttk.Label(self.detect_frame, text="", foreground="#0a6")
         self.detect_summary.pack(fill=tk.X, anchor="w")
-        self.detect_rows_frame = ttk.Frame(self.detect_frame)
-        self.detect_rows_frame.pack(fill=tk.X, anchor="w", padx=(0, 0))
+        # 识别到的数据根目录逐行区：用 canvas 包一层，限制最大高度（约两行），
+        # 超出则显示竖向滚动条，避免数据根过多时把主窗口整体高度撑高。
+        self.detect_rows_canvas = tk.Canvas(
+            self.detect_frame, highlightthickness=0
+        )
+        self.detect_rows_sb = ttk.Scrollbar(
+            self.detect_frame, orient="vertical",
+            command=self.detect_rows_canvas.yview,
+        )
+        self.detect_rows_frame = ttk.Frame(self.detect_rows_canvas)
+        self.detect_rows_frame.bind(
+            "<Configure>",
+            lambda e: self.detect_rows_canvas.configure(
+                scrollregion=self.detect_rows_canvas.bbox("all")
+            ),
+        )
+        self.detect_rows_canvas.create_window(
+            (0, 0), window=self.detect_rows_frame, anchor="nw", tags="__drf__"
+        )
+        self.detect_rows_canvas.configure(
+            yscrollcommand=self.detect_rows_sb.set
+        )
+
+        # 内嵌窗口宽度跟随 canvas 可视宽，否则内容被压成竖线
+        def _sync_detect_width(evt=None):
+            w = self.detect_rows_canvas.winfo_width()
+            if w > 1:
+                self.detect_rows_canvas.itemconfig("__drf__", width=w)
+
+        self.detect_rows_canvas.bind("<Configure>", _sync_detect_width)
+        self._sync_detect_width = _sync_detect_width
+        # 最大高度：约两行（单行行高 × 2 + 行间距），用真实渲染字体度量
+        line_h = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+        self._detect_max_h = line_h * 2 + 6
+        self.detect_rows_canvas.configure(height=self._detect_max_h)
+        self.detect_rows_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.detect_rows_sb.pack(side=tk.RIGHT, fill=tk.Y)
         # 当前登录用户 UID（记忆区默认备份对象，下拉切换）
         uid_row = ttk.Frame(self.dir_frame)
         uid_row.pack(fill=tk.X, padx=10, pady=(0, 8))
@@ -373,6 +408,12 @@ class QoderBackupApp:
             self.root.update_idletasks()
         except Exception:
             pass
+        # 同步数据根识别区的内嵌窗口宽度（首屏布局后宽度才稳定）
+        if getattr(self, "_sync_detect_width", None):
+            try:
+                self._sync_detect_width()
+            except Exception:
+                pass
 
     def _reset_options(self) -> None:
         """把选项区域各参数复位到初始默认值，防用户改乱后无从选择。
@@ -716,6 +757,11 @@ class QoderBackupApp:
         # 清空上一次逐行内容（成对处理：先清后填，避免旧行残留）
         for w in self.detect_rows_frame.winfo_children():
             w.destroy()
+        # 每次刷新先收起滚动条，填充后按需再显示（成对处理，避免残留）
+        try:
+            self.detect_rows_sb.pack_forget()
+        except Exception:
+            pass
         if not ok:
             self.detect_summary.config(
                 text="未找到数据目录，请手动指定", foreground="#c00"
@@ -741,6 +787,19 @@ class QoderBackupApp:
             ttk.Label(
                 self.detect_rows_frame, text=line, foreground=color, anchor="w"
             ).pack(fill=tk.X, anchor="w", pady=(1, 0))
+        # 动态显隐竖向滚动条：内容超过最大高度（约两行）才显示，否则收起，
+        # 避免数据根多时也把主窗口整体高度撑高（主窗高度固定为屏 3/4）。
+        try:
+            if getattr(self, "_sync_detect_width", None):
+                self._sync_detect_width()
+            self.detect_rows_canvas.update_idletasks()
+            content_h = self.detect_rows_frame.winfo_reqheight()
+            if content_h > self._detect_max_h:
+                self.detect_rows_sb.pack(side=tk.RIGHT, fill=tk.Y)
+            else:
+                self.detect_rows_sb.pack_forget()
+        except Exception:
+            pass
 
     def _redetect(self) -> None:
         self.root_dir = self._detect_root(self.root_var.get() or None)
