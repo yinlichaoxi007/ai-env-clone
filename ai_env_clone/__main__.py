@@ -194,7 +194,10 @@ class QoderBackupApp:
         line_h = tkfont.nametofont("TkDefaultFont").metrics("linespace")
         self._detect_max_h = line_h * 2 + 6
         self.detect_rows_canvas.configure(height=self._detect_max_h)
-        self.detect_rows_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # 注意：canvas 不要 expand=True，否则父容器若有额外垂直空间会把
+        # canvas 拉高、导致限高失效、数据根全部显示。高度由上面
+        # configure(height=_detect_max_h) 固定即可。
+        self.detect_rows_canvas.pack(side=tk.LEFT, fill=tk.X)
         self.detect_rows_sb.pack(side=tk.RIGHT, fill=tk.Y)
         # 当前登录用户 UID（记忆区默认备份对象，下拉切换）
         uid_row = ttk.Frame(self.dir_frame)
