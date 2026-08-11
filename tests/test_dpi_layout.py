@@ -4,9 +4,8 @@
 1. 进程 DPI 感知声明（Windows Per-Monitor v2）不抛异常，确保高分屏
    （缩放 > 100%）下 tk 几何/字体缩放与系统一致，窗口相对屏幕大小
    恒定、不再被虚化放大导致显示不全。
-2. 备份内容区（canvas）最大高度封顶到 220（CodeBuddy 项多、Qoder 项少，
-   统一封顶让两工具观感对齐且主窗口更紧凑），内容过多时主窗口高度受控、
-   不超出屏幕可用高度的 90%。
+2. 备份内容区（canvas）高度统一为固定值 285（不贴合 reqheight，与项数无关），
+   切换工具时内容区高度不变；主窗口总高统一为屏幕高度的 75%，三工具完全一致。
 """
 import os
 import sys
@@ -51,7 +50,8 @@ class TestFitLayoutCaps(unittest.TestCase):
         app = QoderBackupApp(root)
         return root, app
 
-    def test_canvas_height_capped_at_220_when_content_huge(self):
+    def test_canvas_height_uniform_285_when_content_huge(self):
+        """三工具统一：内容过多时 canvas 仍为固定 285（不贴合 reqheight）。"""
         root, app = self._make_app()
         try:
             with mock.patch.object(app.list_frame, "winfo_reqheight",
@@ -64,17 +64,19 @@ class TestFitLayoutCaps(unittest.TestCase):
                                                return_value=738):
                             app._fit_layout()
             canvas_h = int(app._canvas.cget("height"))
-            self.assertLessEqual(canvas_h, 220,
-                                 "内容区高度应封顶 220，避免主窗口过高")
-            # 窗口高度不超过屏幕可用高度 90%
+            self.assertEqual(canvas_h, 285,
+                             "canvas 高度应统一为固定值 285，与项数/请求高度无关")
+            # 主窗口总高 ≤ screen*0.75（封顶），不超出屏 75%
             geo = root.geometry().split("+")[0]
             wh = int(geo.split("x")[1])
-            self.assertLessEqual(wh, int(1080 * 0.9))
+            self.assertLessEqual(wh, int(1080 * 0.75),
+                                 "主窗口总高应封顶到屏 75% 以内")
         finally:
             app._cancel_after()
             root.destroy()
 
-    def test_canvas_shrinks_to_content_when_small(self):
+    def test_canvas_height_uniform_285_when_content_small(self):
+        """内容少时 canvas 仍统一为 285（不贴合 reqheight），三工具完全一致。"""
         root, app = self._make_app()
         try:
             with mock.patch.object(app.list_frame, "winfo_reqheight",
@@ -87,8 +89,8 @@ class TestFitLayoutCaps(unittest.TestCase):
                                                return_value=738):
                             app._fit_layout()
             canvas_h = int(app._canvas.cget("height"))
-            # 150 在 [120, 300] 区间内，贴合内容
-            self.assertEqual(canvas_h, 150)
+            self.assertEqual(canvas_h, 285,
+                             "canvas 高度应统一为 285，不因 reqheight 小而缩短")
         finally:
             app._cancel_after()
             root.destroy()
