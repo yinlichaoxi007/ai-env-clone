@@ -93,7 +93,7 @@ GUI 界面要点：
 - **备份内容路径可见**：每个备份项的说明文字后附带其相对于数据目录的具体路径，方便确认备份范围。
 - **未找到项标红**：当数据目录未正确识别时，备份内容中找不到的每一项会标红并注明「（未找到）」，备份内容区右上角同时显示「N 项未找到」；已勾选项保持不变，仅作提示，不会自动取消勾选。
 - **估算大小**：点击「估算大小」按钮可预估所选备份项打包后的体积。
-- **高分屏适配**：窗口声明 DPI 感知（Per-Monitor v2），缩放系数超过 100% 时不会被系统虚化放大；备份内容区高度封顶（与 Qoder 一致），内容过多时由滚动条承载，主窗口相对屏幕大小恒定、不会显示不全。
+- **高分屏适配**：窗口声明 DPI 感知（Per-Monitor v2），缩放系数超过 100% 时不会被系统虚化放大；备份内容区高度封顶（CodeBuddy 与 Qoder 共用同一上限，内容过多时由滚动条承载），主窗口相对屏幕大小恒定、不会显示不全。
 
 也可双击仓库内的 `run.bat`（Windows，需本机已装 Python 3.10+）一键启动。
 
@@ -289,7 +289,7 @@ GUI highlights:
 - **Backup-item paths visible**: each backup item shows its concrete relative path after its description, so you can confirm the backup scope.
 - **Missing items highlighted**: when the data directory is not correctly detected, every item that cannot be found is shown in red and labelled "(未找到 / not found)"; the top-right of the backup list also shows "N 项未找到" (N items not found). Already-checked items keep their state — only a hint, no auto-uncheck.
 - **Estimate size**: click "估算大小" (estimate size) to preview the packed size of selected items.
-- **Hi-DPI support**: the window declares DPI awareness (Per-Monitor v2), so it is not blurry-scaled by the OS when the scaling factor exceeds 100%. The backup content area has a capped height (matching Qoder), with a scrollbar for overflow, so the main window keeps a constant relative size on screen and never gets clipped.
+- **Hi-DPI support**: the window declares DPI awareness (Per-Monitor v2), so it is not blurry-scaled by the OS when the scaling factor exceeds 100%. The backup content area has a capped height (CodeBuddy and Qoder share the same cap, with a scrollbar for overflow), so the main window keeps a constant relative size on screen and never gets clipped.
 
 On Windows you can also double-click `run.bat` (requires Python 3.10+ installed locally).
 

@@ -337,11 +337,11 @@ class QoderBackupApp:
         except Exception:
             content_h = 0
         # canvas 高度：内容少则贴合内容、内容多则封顶并滚动（下限避免过扁）。
-        # LIST_MAX 与 Qoder 适配器保持一致（紧凑封顶）：CodeBuddy 备份项较多，
-        # 内容过多时若不给足上限，主窗口高度会随内容无限增长；在 DPI 放大
-        # （缩放 > 100%）场景下更易顶到屏幕边缘导致显示不全。统一封顶 300，
-        # 超出部分由 canvas 滚动条承载，主窗口高度保持受控。
-        LIST_MIN, LIST_MAX = 120, 300
+        # LIST_MAX 两工具共用同一封顶值：CodeBuddy 备份项类别多（会话/记忆/规则/
+        # 检查点/灵感/专家历史/插件等）reqheight 可达 500+，Qoder 项较少约 268。
+        # 统一封顶 220 让两工具观感对齐且主窗口更紧凑，高分屏缩放（>100%）下
+        # 也不易顶到屏幕边缘导致显示不全；超出部分由 canvas 滚动条承载。
+        LIST_MIN, LIST_MAX = 120, 220
         canvas_h = max(LIST_MIN, min(content_h, LIST_MAX))
         try:
             self._canvas.configure(height=canvas_h)
