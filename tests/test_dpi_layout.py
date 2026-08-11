@@ -4,8 +4,9 @@
 1. 进程 DPI 感知声明（Windows Per-Monitor v2）不抛异常，确保高分屏
    （缩放 > 100%）下 tk 几何/字体缩放与系统一致，窗口相对屏幕大小
    恒定、不再被虚化放大导致显示不全。
-2. 备份内容区（canvas）最大高度封顶到 300（与 Qoder 适配器一致），
-   内容过多时主窗口高度受控、不超出屏幕可用高度的 90%。
+2. 备份内容区（canvas）最大高度封顶到 220（CodeBuddy 项多、Qoder 项少，
+   统一封顶让两工具观感对齐且主窗口更紧凑），内容过多时主窗口高度受控、
+   不超出屏幕可用高度的 90%。
 """
 import os
 import sys
@@ -50,7 +51,7 @@ class TestFitLayoutCaps(unittest.TestCase):
         app = QoderBackupApp(root)
         return root, app
 
-    def test_canvas_height_capped_at_300_when_content_huge(self):
+    def test_canvas_height_capped_at_220_when_content_huge(self):
         root, app = self._make_app()
         try:
             with mock.patch.object(app.list_frame, "winfo_reqheight",
@@ -63,8 +64,8 @@ class TestFitLayoutCaps(unittest.TestCase):
                                                return_value=738):
                             app._fit_layout()
             canvas_h = int(app._canvas.cget("height"))
-            self.assertLessEqual(canvas_h, 300,
-                                 "内容区高度应封顶 300，避免主窗口过高")
+            self.assertLessEqual(canvas_h, 220,
+                                 "内容区高度应封顶 220，避免主窗口过高")
             # 窗口高度不超过屏幕可用高度 90%
             geo = root.geometry().split("+")[0]
             wh = int(geo.split("x")[1])
