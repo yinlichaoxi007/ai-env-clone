@@ -1,3 +1,4 @@
-# Qoder 备份迁移工具 依赖
-# 仅 GUI 运行所需；打包成 exe 时由 PyInstaller 一并封入。
+# Dependency for building the executable.
+# PyInstaller bundles the GUI app and the ai_env_clone package into a single file.
+# Run `python -m pip install -r requirements.txt` before `python build_exe.py`.
 PyInstaller>=6.0.0
