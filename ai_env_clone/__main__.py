@@ -336,12 +336,12 @@ class QoderBackupApp:
             content_h = self.list_frame.winfo_reqheight()
         except Exception:
             content_h = 0
-        # canvas 高度：内容少则贴合内容、内容多则封顶并滚动（下限避免过扁）。
-        # LIST_MAX 两工具共用同一封顶值：CodeBuddy 备份项类别多（会话/记忆/规则/
-        # 检查点/灵感/专家历史/插件等）reqheight 可达 500+，Qoder 项较少约 268。
-        # 统一封顶 220 让两工具观感对齐且主窗口更紧凑，高分屏缩放（>100%）下
-        # 也不易顶到屏幕边缘导致显示不全；超出部分由 canvas 滚动条承载。
-        LIST_MIN, LIST_MAX = 120, 220
+        # canvas 高度：所有工具统一为同一固定值，与项数/请求高度无关。
+        # CodeBuddy 备份项类别多（会话/记忆/规则/检查点/灵感/专家历史/插件等）
+        # reqheight 可达 500+，Qoder/Reasonix 项少约 268/285；不贴合 reqheight
+        # 而是强制统一，让三工具（Qoder/CodeBuddy/Reasonix）观感完全一致——
+        # 切换工具时主窗口与内容区高度都不变。超出部分由 canvas 滚动条承载。
+        LIST_MIN, LIST_MAX = 285, 285
         canvas_h = max(LIST_MIN, min(content_h, LIST_MAX))
         try:
             self._canvas.configure(height=canvas_h)
@@ -351,7 +351,11 @@ class QoderBackupApp:
             self.root.update_idletasks()
         except Exception:
             pass
-        # 主窗口高度：取内容请求高，封顶到屏幕可用高度的 90%，并满足 minsize
+        # 主窗口高度：取内容请求高，封顶到屏幕高度的 75%（约 675，1080p 屏→810）。
+        # CodeBuddy 备份项说明文字长、others_block 大，reqheight 可达 870；
+        # Qoder 项少约 681；Reasonix 约 831。三工具 reqh 差异大，统一封顶到
+        # 屏 75% 后总高基本一致（CodeBuddy 855→675、Reasonix 831→675、Qoder
+        # 681→675），既不显示不全也不显空旷；下限 560 保证小屏也不至于过扁。
         try:
             want = self.root.winfo_reqheight()
         except Exception:
@@ -360,11 +364,16 @@ class QoderBackupApp:
             screen = self.root.winfo_screenheight()
         except Exception:
             screen = 900
-        win_max = max(520, int(screen * 0.9))
+        win_max = max(560, int(screen * 0.75))
         cur_w = self.root.winfo_width() or 738
         want = max(want, 460)
         want = min(want, win_max)
         self.root.geometry("%dx%d" % (cur_w, want))
+        # 强制重算以让 winfo 系列在下一次读取前同步新尺寸
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
 
     def _reset_options(self) -> None:
         """把选项区域各参数复位到初始默认值，防用户改乱后无从选择。
