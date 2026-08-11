@@ -492,3 +492,50 @@ class CodeBuddyAdapter(BaseAdapter):
             current_uid = detect_current_uid()
         self.last_detected_uid = current_uid
         return build_items(root_dir, detect_global_root(), current_uid, detect_session_root(current_uid))
+
+    def restore_path_rewrite(self) -> "Callable[[str], str] | None":
+        """
+        跨电脑还原时，把归档内相对路径里的旧登录用户 UUID 重映射到本机当前用户。
+
+        CodeBuddy 集中会话/检查点路径含登录用户标识：
+        ``.../CodeBuddyExtension/Data/<uuid>/CodeBuddyIDE/<uuid>/...``。
+        备份时该 <uuid> 是源电脑的当前用户；若在新电脑直接按原相对路径落回，
+        会写进一个本机当前用户读不到的「死目录」——界面能看到历史会话列表残留，
+        但点开看不到具体对话内容（这正是跨电脑还原后的典型症状）。
+
+        本方法检测 ``Data/<uuid>/CodeBuddyIDE/<uuid>`` 模式（按通用段匹配，
+        不依赖 Windows ``AppData/Local`` 前缀，兼容 darwin/linux 同名结构），
+        把两段 <uuid> 都替换为 ``detect_current_uid()``（本机最近活跃用户）。
+        本机从未登录过（取不到 uuid）时返回 ``None``，不做重写（至少不破坏原路径）。
+        """
+        new_uid = detect_current_uid()
+        if not new_uid:
+            return None
+
+        def _rewrite(rel_path: str) -> str:
+            parts = rel_path.replace("\\", "/").split("/")
+            out = []
+            i = 0
+            n = len(parts)
+            # 模式：.../<Data>/<uuid>/CodeBuddyIDE/<uuid>/...
+            # 其中第一段 <uuid> 正好紧跟在名为 'Data' 的段之后
+            while i < n:
+                seg = parts[i]
+                if (
+                    seg == "Data"
+                    and i + 3 < n
+                    and _looks_like_uuid(parts[i + 1])
+                    and parts[i + 2] == "CodeBuddyIDE"
+                    and _looks_like_uuid(parts[i + 3])
+                ):
+                    out.append("Data")
+                    out.append(new_uid)          # 外层 uuid -> 本机当前用户
+                    out.append("CodeBuddyIDE")
+                    out.append(new_uid)          # 内层 uuid -> 本机当前用户
+                    i += 4
+                    continue
+                out.append(seg)
+                i += 1
+            return "/".join(out)
+
+        return _rewrite

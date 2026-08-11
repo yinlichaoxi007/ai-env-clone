@@ -1140,6 +1140,7 @@ class QoderBackupApp:
                 expected_kind=expected_kind,
                 strict=strict,
                 match_structure=self.adapter.match_structure,
+                path_rewrite=self.adapter.restore_path_rewrite(),
             )
             extra = "\n回滚快照：%s" % r["rollback"] if r["rollback"] else ""
             if r["blocked"]:

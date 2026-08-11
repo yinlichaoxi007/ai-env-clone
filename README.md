@@ -75,6 +75,8 @@ python build_exe.py --name AiEnvClone            # 在当前平台产出对应�
 
 > 在 Windows 上产出 `AiEnvClone.exe`，macOS 上产出 `AiEnvClone.app`，Linux 上产出 `AiEnvClone`（无后缀）。CI 中的 `build-release.yml` 即在三平台（Windows / macOS / Linux）分别调用此脚本并汇总发布（macOS 按 arm64 与 x86_64 各产一份）。
 
+- **Windows 一键打包**：双击仓库内的 `build.bat` 即可（自动检查 Python → 安装 `requirements.txt` 依赖 → 调用 `build_exe.py`，产物位于 `dist/AiEnvClone.exe`）。该 exe 可拷贝到任何无 Python 的 Windows 电脑双击运行。
+
 ## 使用
 
 ### GUI（图形界面）
@@ -114,6 +116,12 @@ python -m ai_env_clone --restore --in ./my-backup.zip
 - 在「备份浏览器」（点「还原备份包」打开）中可查看明细、校验完整性、选择还原。校验结果会显示在列表「完整性」列，切换选择后仍可见。
 - 恢复时会**自动覆盖**同名文件，并在覆盖前在工具运行目录下的 `backup/<工具名>/`（例如 `QoderBackupTool.exe` 同级的 `backup/qoder/`，与备份文件同一目录）生成 `<工具名>_rollback_<时间戳>.zip` 回滚快照，可随时还原到恢复前状态，也方便按文件时间信息对比选择。备份默认同样导出到 `backup/<工具名>/`，随工具一起拷贝即可。
 - **防误还原**：还原时以包内 manifest 的 `kind` 为准，仅改文件名无法骗过校验；若包内记录的 `source_root` 与当前还原目标不一致，会弹窗二次确认，防止覆盖错误目录的数据。备份与回滚快照均可还原。
+
+### 跨电脑还原：CodeBuddy 会话 UUID 自动重映射
+
+CodeBuddy 的集中会话/检查点按**登录用户 UUID** 分目录存放（`CodeBuddyExtension/Data/<uuid>/CodeBuddyIDE/<uuid>/`）。备份把该 UUID 固化进归档相对路径，直接按原路径还原到新电脑会写进一个**当前登录用户读不到的「死目录」**——表现为「历史会话列表看得到、点开却没内容」。
+
+还原时本工具会自动把旧 UUID 重映射为本机**当前登录用户 UUID**（启发式取 `Data` 下最近活动的 UID），确保会话落到本机 CodeBuddy 实际读取的目录。若本机从未登录过 CodeBuddy（取不到 UUID），则保持原路径、不做重写，至少不破坏备份。
 
 ## 架构
 
@@ -262,6 +270,8 @@ python build_exe.py --name AiEnvClone            # produces the platform-native 
 
 > On Windows it produces `AiEnvClone.exe`, on macOS `AiEnvClone.app`, on Linux `AiEnvClone` (no suffix). The CI `build-release.yml` invokes this script on three platforms (Windows / macOS / Linux) and publishes the results (macOS yields both arm64 and x86_64 builds).
 
+- **Windows one-click build**: double-click `build.bat` in the repo (auto-checks Python → installs `requirements.txt` deps → runs `build_exe.py`; output at `dist/AiEnvClone.exe`). Copy that exe to any Windows PC without Python and run it directly.
+
 ## Usage
 
 ### GUI
@@ -297,6 +307,12 @@ python -m ai_env_clone --restore --in ./my-backup.zip
 - A standard `.zip` named `<tool>_backup_<timestamp>.zip`, with a `qoder_backup_manifest.json` (kind, tool, creation time, source dir, modules, file count, …).
 - Viewable via the "备份浏览器" (open from "还原备份包"): inspect details, verify integrity, and choose what to restore.
 - Restore **overwrites** existing files and auto-creates a `<tool>_rollback_<timestamp>.zip` snapshot beforehand, so you can revert anytime. Type is verified against the manifest to prevent accidental restore of a misnamed file.
+
+### Cross-computer restore: CodeBuddy session UUID auto-remap
+
+CodeBuddy stores its centralized sessions/checkpoints under the **logged-in user UUID** (`CodeBuddyExtension/Data/<uuid>/CodeBuddyIDE/<uuid>/`). The backup pins this UUID into the archive's relative paths; restoring them verbatim on a new computer would write into a "dead directory" the current user cannot read — showing up as "session list visible, but empty when opened".
+
+On restore, the tool auto-remaps the old UUID to the **current logged-in user UUID** on this machine (heuristically the most recently active UID under `Data`), so sessions land where this machine's CodeBuddy actually reads them. If CodeBuddy has never been logged into on this machine (no UUID found), paths are left unchanged rather than broken.
 
 ## Architecture
 
