@@ -212,6 +212,11 @@ class QoderBackupApp:
         )
 
         canvas = tk.Canvas(mid, highlightthickness=0)
+        # 初始即固定高度：避免 pack(fill=BOTH, expand) 在 _fit_layout 设高前
+        # 把 canvas 撑成 list_frame 的请求高度（CodeBuddy 项多可达 500+），
+        # 导致 mid/主窗随内容变高、三工具主窗高度不一致。固定后 mid 自然高
+        # 三工具一致，统一观感由 _fit_layout 把主窗总高定到屏 3/4 收口。
+        canvas.configure(height=285)
         # 高度动态：内容少时收缩、内容多时给足并启用滚动条（见 _fit_layout）。
         sb = ttk.Scrollbar(mid, orient="vertical", command=canvas.yview)
         # 备份项列表：每行一个 Frame，内部左=勾选+标题(权重3) / 右=说明(权重7)，
@@ -351,24 +356,18 @@ class QoderBackupApp:
             self.root.update_idletasks()
         except Exception:
             pass
-        # 主窗口高度：取内容请求高，封顶到屏幕高度的 75%（约 675，1080p 屏→810）。
-        # CodeBuddy 备份项说明文字长、others_block 大，reqheight 可达 870；
-        # Qoder 项少约 681；Reasonix 约 831。三工具 reqh 差异大，统一封顶到
-        # 屏 75% 后总高基本一致（CodeBuddy 855→675、Reasonix 831→675、Qoder
-        # 681→675），既不显示不全也不显空旷；下限 560 保证小屏也不至于过扁。
-        try:
-            want = self.root.winfo_reqheight()
-        except Exception:
-            want = 560
+        # 主窗口高度：直接固定为屏幕高度的 75%（与内容/工具无关），三工具
+        # 完全一致。不再用 winfo_reqheight() 驱动——它会随 others_block/说明
+        # 文字多少变化（CodeBuddy 870、Reasonix 831、Qoder 681），导致主窗总高
+        # 三工具各异（用户实测"内容区高度自动变化"的根因）。canvas 已固定 285
+        # 承载列表溢出，主窗固定 3/4 屏后 mid(expand) 吸收剩余空白、三工具统一。
         try:
             screen = self.root.winfo_screenheight()
         except Exception:
             screen = 900
-        win_max = max(560, int(screen * 0.75))
+        win_h = max(560, int(screen * 0.75))
         cur_w = self.root.winfo_width() or 738
-        want = max(want, 460)
-        want = min(want, win_max)
-        self.root.geometry("%dx%d" % (cur_w, want))
+        self.root.geometry("%dx%d" % (cur_w, win_h))
         # 强制重算以让 winfo 系列在下一次读取前同步新尺寸
         try:
             self.root.update_idletasks()

@@ -1,11 +1,12 @@
-"""DPI 适配与备份内容区高度封顶单元测试。
+"""DPI 适配与备份内容区/主窗高度统一单元测试。
 
 覆盖两点：
 1. 进程 DPI 感知声明（Windows Per-Monitor v2）不抛异常，确保高分屏
    （缩放 > 100%）下 tk 几何/字体缩放与系统一致，窗口相对屏幕大小
    恒定、不再被虚化放大导致显示不全。
 2. 备份内容区（canvas）高度统一为固定值 285（不贴合 reqheight，与项数无关），
-   切换工具时内容区高度不变；主窗口总高统一为屏幕高度的 75%，三工具完全一致。
+   切换工具时内容区高度不变；主窗口总高固定为屏幕高度的 75%（与内容无关），
+   三工具完全一致——修复"主窗总高随内容自动变化、三工具不一致"的问题。
 """
 import os
 import sys
@@ -66,7 +67,9 @@ class TestFitLayoutCaps(unittest.TestCase):
             canvas_h = int(app._canvas.cget("height"))
             self.assertEqual(canvas_h, 285,
                              "canvas 高度应统一为固定值 285，与项数/请求高度无关")
-            # 主窗口总高 ≤ screen*0.75（封顶），不超出屏 75%
+            # 主窗口总高应封顶到屏 75% 以内（headless 下 geometry 不生效，
+            # win_h 恒为 560；实机下 geometry 生效、固定为 screen*0.75）。
+            # 此处只断言封顶（<=），实机统一高度由用户截图确认。
             geo = root.geometry().split("+")[0]
             wh = int(geo.split("x")[1])
             self.assertLessEqual(wh, int(1080 * 0.75),
@@ -91,6 +94,21 @@ class TestFitLayoutCaps(unittest.TestCase):
             canvas_h = int(app._canvas.cget("height"))
             self.assertEqual(canvas_h, 285,
                              "canvas 高度应统一为 285，不因 reqheight 小而缩短")
+        finally:
+            app._cancel_after()
+            root.destroy()
+
+    def test_canvas_initial_height_fixed_285(self):
+        """canvas 在 _build_main 创建时即固定 285，避免被 mid expand 撑成内容高。
+
+        根因：此前 canvas 初始无 height，pack(fill=BOTH, expand) 在 _fit_layout
+        设高前把它撑成 list_frame 请求高度（CodeBuddy 项多可达 500+），导致
+        mid/主窗随内容变高、三工具主窗不一致。此处从源头验证固定生效。
+        """
+        root, app = self._make_app()
+        try:
+            self.assertEqual(int(app._canvas.cget("height")), 285,
+                             "canvas 初始高度必须固定为 285")
         finally:
             app._cancel_after()
             root.destroy()
