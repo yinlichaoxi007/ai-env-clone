@@ -171,6 +171,13 @@ def _longpath(path: str) -> str:
     return path
 
 
+def _strip_longpath(path: str) -> str:
+    """去掉 ``\\\\?\\`` 长路径前缀，便于 ``os.path.relpath`` 计算归档相对路径。"""
+    if path.startswith("\\\\?\\"):
+        return path[4:]
+    return path
+
+
 def is_critical(rel_path: str) -> bool:
     """判断是否为不受体积上限约束的关键数据文件。"""
     p = _norm_for_match(rel_path)
@@ -206,15 +213,17 @@ def scan_items(
         if item.is_dir:
             walker = (
                 os.path.join(dp, fn)
-                for dp, _, fns in os.walk(item.path)
+                for dp, _, fns in os.walk(_longpath(item.path))
                 for fn in fns
             )
         else:
             walker = iter([item.path])
 
         for full in walker:
+            # walk 入口加了 \\?\ 前缀后，返回的子路径也带前缀；归档名需先去前缀
+            plain = _strip_longpath(full)
             try:
-                rel = _arcname(full, root)
+                rel = _arcname(plain, root)
             except ValueError:
                 continue
             if rel.startswith(".."):
@@ -224,7 +233,7 @@ def scan_items(
                 continue
 
             try:
-                size = os.path.getsize(_longpath(full))
+                size = os.path.getsize(full)
             except OSError:
                 continue
 

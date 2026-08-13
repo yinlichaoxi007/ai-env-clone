@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import json
 import tempfile
 import unittest
 from unittest import mock
@@ -424,36 +425,72 @@ class TestRegistration(unittest.TestCase):
 )
 class TestLongPathSessionRoundTrip(TempEnv):
     """回归：CodeBuddy 会话消息文件层级深、绝对路径常超 260 字符，
+    且消息体含 role 区分（user/assistant/tool）、parentId 树状关联、tool_calls 关联。
     修复前 scan_items 的 getsize/open 因 WinError 3 静默丢弃全部 messages，
-    导致还原后「有会话列表、点开无内容」。本用例固化长路径文件能被完整备份+还原。"""
+    导致还原后「有会话列表、点开无内容」。本用例固化长路径文件能被完整备份+还原，
+    且内容（逐字符 + 真实语义片段）原样往返。"""
 
-    def _make_deep_session(self) -> tuple[int, int]:
-        # 构造一条绝对路径显著超过 260 字符的会话（history/<ws>/<sid>/messages/<name>.json）
+    # 真实语义内容片段：还原后仍需能检索到，验证「内容未丢、非简单密文」
+    REAL_USER_TEXT = "codebuddy恢复数据缺少会话详细内容的问题，建议你匹配一下我真实发的内容片段"
+    REAL_ASSISTANT_TEXT = "会话内容以明文 JSON 存储，role 区分 user/assistant/tool，并用 parentId 串联成树"
+    REAL_TOOL_OUTPUT = "scan_items 已用 _longpath 修复 Windows 260 长路径限制"
+
+    def _make_deep_session(self):
+        # 构造一条绝对路径显著超过 260 字符、且含真实角色/关联结构的会话
         from ai_env_clone.core import _longpath
 
-        ws = "a" * 32
-        sid = "b" * 32
-        msg_dir = os.path.join(
-            self.session_root, "history", ws, sid, "messages"
-        )
+        ws = "a" * 60  # 长目录名，保证绝对路径 > 260
+        sid = "b" * 60
+        hist_dir = os.path.join(self.session_root, "history", ws, sid)
+        msg_dir = os.path.join(hist_dir, "messages")
         os.makedirs(_longpath(msg_dir), exist_ok=True)
-        n = 20
-        for i in range(n):
-            # 文件名填长到让整体绝对路径远超 260
-            name = ("c" * 40) + str(i)
-            p = os.path.join(msg_dir, name + ".json")
-            with open(_longpath(p), "w", encoding="utf-8") as f:
-                f.write('{"role":"user","content":"msg %d"}' % i)
-        # 同目录再放一个 index.json（短路径，必被保留）
-        idx = os.path.join(self.session_root, "history", ws, sid, "index.json")
-        with open(_longpath(idx), "w", encoding="utf-8") as f:
-            f.write('{"messages":[]}')
-        return n, len(
-            os.path.join(msg_dir, ("c" * 40) + "0.json")
-        )
 
-    def test_deep_messages_survive_round_trip(self) -> None:
-        n_msgs, longest = self._make_deep_session()
+        # index.json 描述会话元信息与消息树（标题可被列表显示）
+        index = {
+            "title": "恢复数据缺少会话详细内容排查",
+            "messages": [
+                {"id": "m1", "role": "user", "parentId": None},
+                {"id": "m2", "role": "assistant", "parentId": "m1"},
+                {"id": "m3", "role": "tool", "parentId": "m2", "toolCallId": "tc1"},
+                {"id": "m4", "role": "assistant", "parentId": "m3", "toolCallId": "tc1"},
+            ],
+        }
+        with open(_longpath(os.path.join(hist_dir, "index.json")), "w", encoding="utf-8") as f:
+            f.write(json.dumps(index, ensure_ascii=False, indent=2))
+
+        # messages/<id>.json：message 字段是二次 json.loads 的 JSON 字符串（明文，含 role/关联）
+        bodies = {
+            "m1": {"role": "user", "content": self.REAL_USER_TEXT, "parentId": None},
+            "m2": {
+                "role": "assistant", "content": self.REAL_ASSISTANT_TEXT,
+                "parentId": "m1",
+                "tool_calls": [{"id": "tc1", "type": "function",
+                                "function": {"name": "grep", "arguments": '{"q":"_longpath"}'}}],
+            },
+            "m3": {
+                "role": "tool", "content": self.REAL_TOOL_OUTPUT,
+                "parentId": "m2", "tool_call_id": "tc1",
+            },
+            "m4": {
+                "role": "assistant", "content": "已定位根因并修复，长路径会话消息完整还原。",
+                "parentId": "m3", "tool_call_id": "tc1",
+            },
+        }
+        sources = {}
+        for mid, body in bodies.items():
+            p = os.path.join(msg_dir, mid + ".json")
+            with open(_longpath(p), "w", encoding="utf-8") as f:
+                f.write(json.dumps({"id": mid, "message": json.dumps(body, ensure_ascii=False)},
+                                   ensure_ascii=False, indent=2))
+            sources[os.path.relpath(p, self.tmp)] = p
+        sources[os.path.relpath(os.path.join(hist_dir, "index.json"), self.tmp)] = \
+            os.path.join(hist_dir, "index.json")
+
+        longest = max(len(p) for p in sources.values())
+        return sources, longest
+
+    def test_deep_messages_content_survives_round_trip(self) -> None:
+        sources, longest = self._make_deep_session()
         self.assertGreater(
             longest, 260, "测试前置：会话消息绝对路径应超过 260 字符（实际 %d）" % longest
         )
@@ -467,7 +504,6 @@ class TestLongPathSessionRoundTrip(TempEnv):
         adp.export(zip_path, self.tmp, sel, progress=lambda *a: None)
         self.assertTrue(os.path.exists(zip_path))
 
-        # 还原到独立目录，逐条校验 messages 文件齐全
         restore_root = os.path.join(self.tmp, "restore")
         os.makedirs(restore_root, exist_ok=True)
         res = adp.restore(zip_path, restore_root, progress=lambda *a: None)
@@ -478,22 +514,31 @@ class TestLongPathSessionRoundTrip(TempEnv):
             "长路径会话消息不应被还原阻塞: %s" % res["blocked"][:3]
         )
 
-        # 实际落盘的长路径 walk 也需 _longpath 才能数到深层文件。
-        # 只校验我们构造的超深会话目录（history/aaaa.../bbbb.../messages）下是否 20 个齐全，
-        # 避免与 _make_tree 自带的浅层 history/messages/1.json 混淆。
+        # 逐字符比对：每个源文件还原后内容完全一致（验证「内容未丢、非密文、关联结构 intact」）
         from ai_env_clone.core import _longpath
+        for rel, src_path in sources.items():
+            target = os.path.join(restore_root, rel)
+            self.assertTrue(os.path.isfile(_longpath(target)),
+                            "还原后缺失文件: %s" % rel)
+            with open(_longpath(src_path), encoding="utf-8") as f:
+                want = f.read()
+            with open(_longpath(target), encoding="utf-8") as f:
+                got = f.read()
+            self.assertEqual(got, want, "内容不一致: %s" % rel)
+
+        # 语义片段检索：把还原后的全部 messages 内容拼起来，确认真实话语原样存在
+        blob_parts = []
         deep_dir = os.path.join(
-            restore_root, "data", self.uuid, "CodeBuddyIDE", self.uuid,
-            "history", "a" * 32, "b" * 32, "messages",
+            restore_root, "data", self.uuid, "CodeBuddyIDE", self.uuid, "history"
         )
-        restored_msgs = 0
-        if os.path.isdir(_longpath(deep_dir)):
-            for _, _, fs in os.walk(_longpath(deep_dir)):
-                restored_msgs += sum(1 for f in fs if f.endswith(".json"))
-        self.assertEqual(
-            restored_msgs, n_msgs,
-            "长路径会话消息应完整还原（期望 %d，实际 %d）" % (n_msgs, restored_msgs)
-        )
+        for dp, _, fs in os.walk(_longpath(deep_dir)):
+            for fn in fs:
+                if fn.endswith(".json"):
+                    with open(_longpath(os.path.join(dp, fn)), encoding="utf-8") as f:
+                        blob_parts.append(f.read())
+        blob = "\n".join(blob_parts)
+        for snippet in (self.REAL_USER_TEXT, self.REAL_ASSISTANT_TEXT, self.REAL_TOOL_OUTPUT):
+            self.assertIn(snippet, blob, "真实语义片段未原样还原: %r" % snippet[:20])
 
 
 if __name__ == "__main__":
