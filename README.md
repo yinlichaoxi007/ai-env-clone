@@ -93,7 +93,7 @@ GUI 界面要点：
 - **备份内容路径可见**：每个备份项的说明文字后附带其相对于数据目录的具体路径，方便确认备份范围。
 - **未找到项标红**：当数据目录未正确识别时，备份内容中找不到的每一项会标红并注明「（未找到）」，备份内容区右上角同时显示「N 项未找到」；已勾选项保持不变，仅作提示，不会自动取消勾选。
 - **估算大小**：点击「估算大小」按钮可预估所选备份项打包后的体积。
-- **高分屏适配**：窗口声明 DPI 感知（Per-Monitor v2），缩放系数超过 100% 时不会被系统虚化放大；备份内容区高度统一为固定值（与工具/项数无关），主窗口总高固定为屏幕高度的 3/4（**不随内容/工具变化**，切换 Qoder / CodeBuddy / Reasonix 时主窗口与内容区高度完全一致），内容过多时由滚动条承载，不会显示不全。
+- **高分屏适配**：窗口声明 DPI 感知（Per-Monitor v2），缩放系数超过 100% 时不会被系统虚化放大；备份内容区高度统一为固定值（与工具/项数无关），切换 Qoder / CodeBuddy / Reasonix 时内容区高度完全一致，内容过多时由滚动条承载。主窗口高度**自适应内容**（上限屏幕高度 92%、下限 460px），内容少的工具（如 Qoder）窗口更紧凑，底部不再有大面积空白。
 
 也可双击仓库内的 `run.bat`（Windows，需本机已装 Python 3.10+）一键启动。
 
@@ -115,7 +115,10 @@ python -m ai_env_clone --restore --in ./my-backup.zip
 
 - 备份产物是一个标准 `.zip` 文件，文件名形如 `<工具名>_backup_<时间戳>.zip`（例如 `qoder_backup_20260805_095519.zip`）。包内含 `qoder_backup_manifest.json` 清单，记录 `kind`（类型）、`tool`（工具名）、`created_at`（创建时间）、`source_root`（来源目录）、`items`（包含模块）、文件数等。
 - 在「备份浏览器」（点「还原备份包」打开）中可查看明细、校验完整性、选择还原。校验结果会显示在列表「完整性」列，切换选择后仍可见。
-- 恢复时会**自动覆盖**同名文件，并在覆盖前在工具运行目录下的 `backup/<工具名>/`（例如 `QoderBackupTool.exe` 同级的 `backup/qoder/`，与备份文件同一目录）生成 `<工具名>_rollback_<时间戳>.zip` 回滚快照，可随时还原到恢复前状态，也方便按文件时间信息对比选择。备份默认同样导出到 `backup/<工具名>/`，随工具一起拷贝即可。
+- 恢复时会**自动覆盖**同名文件，并在覆盖前在备份目录下的 `backup/<工具名>/` 生成 `<工具名>_rollback_<时间戳>.zip` 回滚快照，可随时还原到恢复前状态，也方便按文件时间信息对比选择。备份默认同样导出到该 `backup/<工具名>/`。
+- **备份目录位置**：与启动方式同级。
+  - 源码模式（`python -m ai_env_clone` / `run.bat`）：`<仓库根>/backup/<工具名>/`。
+  - 打包模式（单文件 exe / app / 二进制）：可执行程序是独立分发物，备份目录放在 **exe 同级**的 `backup/<工具名>/`（如 `dist/backup/qoder/`），让程序与它的备份数据在一起，便于随程序一起拷贝/迁移。重打包（`build_exe.py` / `build.bat`）只会覆盖 exe 本身，不会清空 `backup/` 子目录，备份数据安全。
 - **防误还原**：还原时以包内 manifest 的 `kind` 为准，仅改文件名无法骗过校验；若包内记录的 `source_root` 与当前还原目标不一致，会弹窗二次确认，防止覆盖错误目录的数据。备份与回滚快照均可还原。
 
 ### 跨电脑还原：CodeBuddy 会话 UUID 自动重映射
@@ -289,7 +292,7 @@ GUI highlights:
 - **Backup-item paths visible**: each backup item shows its concrete relative path after its description, so you can confirm the backup scope.
 - **Missing items highlighted**: when the data directory is not correctly detected, every item that cannot be found is shown in red and labelled "(未找到 / not found)"; the top-right of the backup list also shows "N 项未找到" (N items not found). Already-checked items keep their state — only a hint, no auto-uncheck.
 - **Estimate size**: click "估算大小" (estimate size) to preview the packed size of selected items.
-- **Hi-DPI support**: the window declares DPI awareness (Per-Monitor v2), so it is not blurry-scaled by the OS when the scaling factor exceeds 100%. The backup content area uses a fixed uniform height (independent of tool/item count), and the main window height is fixed at 3/4 of the screen height (**independent of content/tool**, so switching Qoder / CodeBuddy / Reasonix keeps both the main window and content area height identical), with a scrollbar for overflow, so the window never gets clipped.
+- **Hi-DPI support**: the window declares DPI awareness (Per-Monitor v2), so it is not blurry-scaled by the OS when the scaling factor exceeds 100%. The backup content area uses a fixed uniform height (independent of tool/item count), so switching Qoder / CodeBuddy / Reasonix keeps the content area height identical; when content overflows a scrollbar appears. The **main window height is adaptive** — it fits the content (capped at 92% of screen height, floored at 460px), so tools with less content (e.g. Qoder) get a more compact window with no large blank gap at the bottom.
 
 On Windows you can also double-click `run.bat` (requires Python 3.10+ installed locally).
 
@@ -308,7 +311,8 @@ python -m ai_env_clone --restore --in ./my-backup.zip
 
 - A standard `.zip` named `<tool>_backup_<timestamp>.zip`, with a `qoder_backup_manifest.json` (kind, tool, creation time, source dir, modules, file count, …).
 - Viewable via the "备份浏览器" (open from "还原备份包"): inspect details, verify integrity, and choose what to restore.
-- Restore **overwrites** existing files and auto-creates a `<tool>_rollback_<timestamp>.zip` snapshot beforehand, so you can revert anytime. Type is verified against the manifest to prevent accidental restore of a misnamed file.
+- Restore **overwrites** existing files and auto-creates a `<tool>_rollback_<timestamp>.zip` snapshot beforehand in the same `backup/<tool>/` directory, so you can revert anytime. Type is verified against the manifest to prevent accidental restore of a misnamed file.
+- **Backup directory location**: next to the launch method. Source mode (`python -m ai_env_clone` / `run.bat`) → `<repo root>/backup/<tool>/`. Packaged mode (single-file exe / app / binary) → the executable is a standalone distributable, so backups go to `backup/<tool>/` **next to the exe** (e.g. `dist/backup/qoder/`), keeping the program and its data together. Re-packaging (`build_exe.py` / `build.bat`) only overwrites the exe itself and never clears the `backup/` subfolder, so backups are safe.
 
 ### Cross-computer restore: CodeBuddy session UUID auto-remap
 
