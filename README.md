@@ -129,7 +129,7 @@ CodeBuddy 的集中会话/检查点按**登录用户 UUID** 分目录存放（`C
 
 ### 深层会话消息长路径修复（Windows）
 
-CodeBuddy 会话消息文件层级深（`history/<ws>/<sid>/messages/<id>.json`），其绝对路径常超过 Windows 的 **260 字符 MAX_PATH** 限制。旧版在扫描/`getsize`/`open` 时因 `WinError 3`（系统找不到指定的路径）**静默丢弃全部 `messages/` 文件**——表现为「历史会话列表看得到、点开却没内容」。**当前版本已对所有文件操作加 `\\?\` 长路径前缀**（`scan_items`、`export_backup`、`import_backup` 全程），深层会话消息可完整备份与还原。
+CodeBuddy 会话消息文件层级深（`history/<ws>/<sid>/messages/<id>.json`），其绝对路径常超过 Windows 的 **260 字符 MAX_PATH** 限制。旧版在扫描/`getsize`/`open` 时因 `WinError 3`（系统找不到指定的路径）**静默丢弃全部 `messages/` 文件**——表现为「历史会话列表看得到、点开却没内容」。**当前版本已对所有文件操作加 `\\?\` 长路径前缀**（`scan_items` 的 `os.walk` 入口目录与 `getsize`、`export_backup` 的 `zf.write`、`import_backup` 全程），深层会话消息可完整备份与还原。其中 `os.walk` 入口目录加前缀尤为关键：未加时超 260 的会话目录根本扫不进去、`scan_items` 直接返回空、导出报"没扫到文件"，比单文件 `getsize` 失败更彻底。
 
 ## 架构
 
@@ -326,7 +326,7 @@ On restore, the tool auto-remaps the old UUID to the **current logged-in user UU
 
 ### Deep session message long-path fix (Windows)
 
-CodeBuddy session message files are deeply nested (`history/<ws>/<sid>/messages/<id>.json`) and their absolute paths often exceed Windows' **260-char MAX_PATH** limit. Older versions silently dropped every `messages/` file because `getsize`/`open` raised `WinError 3` (path not found) — showing up as "session list visible, but empty when opened". **The current build adds the `\\?\` long-path prefix to all file operations** (`scan_items`, `export_backup`, `import_backup`), so deep session messages are backed up and restored completely.
+CodeBuddy session message files are deeply nested (`history/<ws>/<sid>/messages/<id>.json`) and their absolute paths often exceed Windows' **260-char MAX_PATH** limit. Older versions silently dropped every `messages/` file because `getsize`/`open` raised `WinError 3` (path not found) — showing up as "session list visible, but empty when opened". **The current build adds the `\\?\` long-path prefix to all file operations** (`scan_items`'s `os.walk` entry directory and `getsize`, `export_backup`'s `zf.write`, `import_backup` throughout), so deep session messages are backed up and restored completely. The `os.walk` entry-directory prefix is especially critical: without it, session directories over 260 chars are never traversed at all — `scan_items` returns empty and export fails with "no files found", which is more severe than a single-file `getsize` failure.
 
 ## Architecture
 
