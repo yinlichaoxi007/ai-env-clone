@@ -156,16 +156,28 @@ class QoderBackupApp:
         )
         # 识别状态区：在数据目录输入框与当前用户行之间，列出探测到的各数据根目录
         self.detect_frame = ttk.Frame(self.dir_frame)
-        self.detect_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
+        self.detect_frame.pack(fill=tk.X, padx=10, pady=(0, 4))
         self.detect_summary = ttk.Label(self.detect_frame, text="", foreground="#0a6")
-        self.detect_summary.pack(fill=tk.X, anchor="w")
+        # summary 默认 pack（保证 ok=False 时的「未找到数据目录」提示可见），
+        # 单项成功时由 _refresh_detect_status pack_forget，避免 1 个数据根时看着偏高+留白。
+        # 用 grid 严格按 row 垂直堆叠（pack side=TOP 在 ttk.Frame 内多次实测位置反转/重叠，
+        # 实测 summary y=42、detect_body y=0；grid 按 row=0/1 强制垂直序，更稳）。
+        self.detect_frame.columnconfigure(0, weight=1)
+        self.detect_summary.grid(row=0, column=0, sticky="ew")
+        self._detect_summary_packed = True
+        # canvas + scrollbar 包到子 frame (detect_body)，确保与 summary 垂直堆叠——
+        # 若都直接 pack 到 detect_frame，side 混用（TOP/LEFT）会出现 summary 与 canvas
+        # 在同一行重叠覆盖（实测 y=0 都从 0 开始）。
+        self.detect_body = ttk.Frame(self.detect_frame)
         # 识别到的数据根目录逐行区：用 canvas 包一层，限制最大高度（约两行），
         # 超出则显示竖向滚动条，避免数据根过多时把主窗口整体高度撑高。
+        # canvas + scrollbar 改为包到 detect_body 子 frame，确保与上方 summary 垂直堆叠
+        # （detect_frame 内直接 pack 不同 side 会导致 summary 与 canvas 同 y=0 重叠）。
         self.detect_rows_canvas = tk.Canvas(
-            self.detect_frame, highlightthickness=0
+            self.detect_body, highlightthickness=0
         )
         self.detect_rows_sb = ttk.Scrollbar(
-            self.detect_frame, orient="vertical",
+            self.detect_body, orient="vertical",
             command=self.detect_rows_canvas.yview,
         )
         self.detect_rows_frame = ttk.Frame(self.detect_rows_canvas)
@@ -190,15 +202,54 @@ class QoderBackupApp:
 
         self.detect_rows_canvas.bind("<Configure>", _sync_detect_width)
         self._sync_detect_width = _sync_detect_width
-        # 最大高度：约两行（单行行高 × 2 + 行间距），用真实渲染字体度量
+
+        # 滚轮滚动：鼠标在识别结果区域时直接驱动内容纵向滚动，方便查看多条数据根。
+        # 是否拦截滚轮由「刷新时算好的稳定标志」_detect_overflow 决定（内容超过最大
+        # 两行高才拦截），不再实时量 winfo_reqheight()——避免刷新时序里 canvas 高度
+        # 变更触发重排导致量值抖动、与滚动条显隐判据打架，从而在「识别结果区域」滚轮
+        # 明明该滚却因误判「未超」而 return 不拦截（表现为滚轮无响应）。
+        def _on_detect_mousewheel(event):
+            # 内容未超过最大高度（不需要滚动）时放行滚轮给父容器，不拦截。
+            if not getattr(self, "_detect_overflow", False):
+                return
+            # Windows: delta 为 ±120 的整数倍；其他平台用 Button-4/5
+            if event.num == 4:
+                delta = -1
+            elif event.num == 5:
+                delta = 1
+            else:
+                delta = -1 if event.delta > 0 else 1
+            # 以「行」为单位平滑滚动（yscrollincrement 已设为单行高），小幅超限也能
+            # 逐行滚动手感自然，且明确区别于「只能在滚动条上」的原生像素滚动。
+            # 最大高度（两行）保持不变。
+            self.detect_rows_canvas.yview_scroll(delta, "units")
+            return "break"  # 阻止事件继续冒泡到主窗口
+
+        # 存为实例方法：rows 生成处（逐行 label）也要复用同一 handler 绑定，
+        # 否则鼠标停在文字 label 上时 <MouseWheel> 不会冒泡到父 frame，导致
+        # 「文字区域滚轮无反应、只能在滚动条上滚」（Tk 该事件不自动向上冒泡）。
+        self._on_detect_mousewheel = _on_detect_mousewheel
+
+        # 滚轮绑定覆盖：内嵌 frame（逐行）、canvas、以及外层 detect_frame
+        # （含 canvas 与滚动条之间缝隙），确保鼠标停在该行区任意位置都能触发。
+        for _w in (self.detect_rows_canvas, self.detect_rows_frame, self.detect_frame, self.detect_body):
+            _w.bind("<MouseWheel>", _on_detect_mousewheel)
+            _w.bind("<Button-4>", _on_detect_mousewheel)
+            _w.bind("<Button-5>", _on_detect_mousewheel)
+        # 最大高度：恰好容纳两行识别结果（含行间间距），用真实渲染字体度量。
+        # 公式取两行内容高（2*line_h + 行间 pady）再 +2 余量，使「正好两行」时
+        # 不触发滚动条、第三行起才截断并显示滚动条（最多显示两行）。
         line_h = tkfont.nametofont("TkDefaultFont").metrics("linespace")
-        self._detect_max_h = line_h * 2 + 6
-        self.detect_rows_canvas.configure(height=self._detect_max_h)
-        # 注意：canvas 不要 expand=True，否则父容器若有额外垂直空间会把
-        # canvas 拉高、导致限高失效、数据根全部显示。高度由上面
-        # configure(height=_detect_max_h) 固定即可。
+        self._detect_max_h = line_h * 2 + 8
+        # 滚轮以「行」为单位平滑滚动（值=单行高），小幅超限也能逐行滚动手感自然
+        self.detect_rows_canvas.configure(yscrollincrement=line_h)
+        # canvas 高度自适应：刷新时设为 min(内容高, 最大两行高)，不固定为两行。
+        # 不要 expand=True，否则父容器若有额外垂直空间会把 canvas 拉高。
+        self.detect_rows_canvas.configure(height=self._detect_max_h)  # 初始默认两行高，刷新时再按内容收
         self.detect_rows_canvas.pack(side=tk.LEFT, fill=tk.X)
         self.detect_rows_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        # detect_body 紧跟 summary 之后垂直堆叠（grid row=1，与 summary row=0 严格按序）
+        self.detect_body.grid(row=1, column=0, sticky="ew")
         # 当前登录用户 UID（记忆区默认备份对象，下拉切换）
         uid_row = ttk.Frame(self.dir_frame)
         uid_row.pack(fill=tk.X, padx=10, pady=(0, 8))
@@ -216,8 +267,12 @@ class QoderBackupApp:
         ).pack(side=tk.LEFT, padx=(6, 0))
 
         # 备份内容
+        # mid 不 expand：高度由内部（bar + 锁高 inner 285）自然决定，不吸收主窗
+        # 剩余竖向空间——否则识别区较矮的 qoder 会把大量空白灌到 mid 内 inner
+        # 下方，显得「列表区高度偏大」。mid 自然高三工具一致（inner 锁 285）。
         mid = ttk.LabelFrame(self.root, text="备份内容（勾选即生效）")
-        mid.pack(fill=tk.BOTH, expand=True, **pad)
+        mid.pack(fill=tk.X, expand=False, **pad)
+        self._mid = mid
 
         bar = ttk.Frame(mid)
         bar.pack(fill=tk.X, padx=8, pady=(8, 4))
@@ -249,14 +304,24 @@ class QoderBackupApp:
             side=tk.LEFT, padx=8
         )
 
-        canvas = tk.Canvas(mid, highlightthickness=0)
+        # 锁高容器 inner：ttk.Frame 尊重 height 配置，pack_propagate(False) +
+        # expand=False 后高度严格锁定 285，不吸收 mid 多余竖向空间（否则 expand
+        # 分配的额外空间会覆盖锁定高度、把 canvas 撑大）；canvas 在其中 fill=BOTH
+        # 横向撑满（解决说明列被压到靠左）+ 纵向占满固定的 285，三工具一致。
+        inner = ttk.Frame(mid)
+        inner.pack(fill=tk.X, expand=False, padx=8, pady=4)
+        inner.pack_propagate(False)
+        inner.configure(height=285)
+        self._list_inner = inner
+
+        canvas = tk.Canvas(inner, highlightthickness=0)
         # 初始即固定高度：避免 pack(fill=BOTH, expand) 在 _fit_layout 设高前
         # 把 canvas 撑成 list_frame 的请求高度（CodeBuddy 项多可达 500+），
         # 导致 mid/主窗随内容变高、三工具主窗高度不一致。固定后 mid 自然高
         # 三工具一致，统一观感由 _fit_layout 把主窗总高定到屏 3/4 收口。
         canvas.configure(height=285)
         # 高度动态：内容少时收缩、内容多时给足并启用滚动条（见 _fit_layout）。
-        sb = ttk.Scrollbar(mid, orient="vertical", command=canvas.yview)
+        sb = ttk.Scrollbar(inner, orient="vertical", command=canvas.yview)
         # 备份项列表：每行一个 Frame，内部左=勾选+标题(权重3) / 右=说明(权重7)，
         # 同行 grid 保证标题与说明行严格对齐（双独立列堆叠会导致累计错位）。
         self.list_frame = ttk.Frame(canvas)
@@ -286,8 +351,10 @@ class QoderBackupApp:
         self._sync_canvas_width = _sync_width
         self._wrap_labels: list = []  # 说明列 Label，随宽度自动换行
 
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0), pady=4)
-        sb.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 8), pady=4)
+        # canvas 在 inner 内 fill=BOTH：横向撑满 inner 宽（说明列不靠左），
+        # 纵向占满 inner 锁定的 285，三工具列表区高度严格一致。
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 0), pady=0)
+        sb.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 0), pady=0)
 
         # 选项
         opt = ttk.LabelFrame(self.root, text="选项")
@@ -388,22 +455,29 @@ class QoderBackupApp:
         canvas_h = max(LIST_MIN, min(content_h, LIST_MAX))
         try:
             self._canvas.configure(height=canvas_h)
+            self._list_inner.configure(height=canvas_h)
         except Exception:
             pass
         try:
             self.root.update_idletasks()
         except Exception:
             pass
-        # 主窗口高度：直接固定为屏幕高度的 75%（与内容/工具无关），三工具
-        # 完全一致。不再用 winfo_reqheight() 驱动——它会随 others_block/说明
-        # 文字多少变化（CodeBuddy 870、Reasonix 831、Qoder 681），导致主窗总高
-        # 三工具各异（用户实测"内容区高度自动变化"的根因）。canvas 已固定 285
-        # 承载列表溢出，主窗固定 3/4 屏后 mid(expand) 吸收剩余空白、三工具统一。
+        # 主窗口高度自适应：取各区块请求高度之和（含列表区锁定的 285），
+        # 不写死为屏幕固定比例——否则像 qoder 这种识别区矮、项少的工具，
+        # 内容远小于写死高度，会在底部（进度条与状态栏之间）留下大片空白。
+        # 改为贴合内容：内容多（codebuddy 识别区高/项多）窗自然高，内容少
+        # （qoder）窗自然矮，三工具都无底部留白，也无需为「统一窗高」牺牲紧凑。
+        # 上限取屏幕 92%（留边距避免顶到任务栏），下限取 minsize 460。
+        try:
+            natural_h = self.root.winfo_reqheight()
+        except Exception:
+            natural_h = 560
         try:
             screen = self.root.winfo_screenheight()
         except Exception:
             screen = 900
-        win_h = max(560, int(screen * 0.75))
+        max_h = int(screen * 0.92)
+        win_h = max(460, min(natural_h, max_h))
         cur_w = self.root.winfo_width() or 738
         self.root.geometry("%dx%d" % (cur_w, win_h))
         # 强制重算以让 winfo 系列在下一次读取前同步新尺寸
@@ -780,6 +854,25 @@ class QoderBackupApp:
         self.detect_summary.config(
             text="已识别 %d 个数据根目录：" % found, foreground="#0a6"
         )
+        # 单项（只探测到 1 个数据根）时不显示独立 summary 描述行（避免 1 个
+        # 数据根时看着偏高+留白），「已识别」信息并入 canvas 首行前缀；多项
+        # 时保持独立 summary 行。判据用「根的总数==1」而非「found==1」——qoder
+        # 永远只返回 1 个根（含 found=0 即目录不存在的情况），无论该根是否
+        # 存在都应单行紧凑、隐藏 summary，避免「偏高+空行」。
+        # 成对处理：根数变化（1 ↔ 多）时 summary 的 pack 状态对应切换，绝不残留旧 pack。
+        if len(roots) == 1:
+            if self._detect_summary_packed:
+                # grid 控件用 grid_remove 隐藏（保留 grid 配置便于重新显示）
+                self.detect_summary.grid_remove()
+                self._detect_summary_packed = False
+            r0 = roots[0]
+            leading = "已识别 %d 个数据根目录：" % found if r0.get("exists") else "未找到数据根目录："
+        else:
+            if not self._detect_summary_packed:
+                # 恢复 summary 显示（grid row=0, column=0 与 __init__ 一致）
+                self.detect_summary.grid(row=0, column=0, sticky="ew")
+                self._detect_summary_packed = True
+            leading = None
         for r in roots:
             rel = r.get("rel", "")
             exists = r.get("exists", False)
@@ -787,22 +880,38 @@ class QoderBackupApp:
             status = "✓ 已识别" if exists else "✗ 未找到"
             color = "#0a6" if exists else "#c00"
             line = "• %s   %s%s" % (rel, status, ("  " + note) if note else "")
-            ttk.Label(
+            if leading:
+                line = leading + "  " + line
+                leading = None  # 仅首行加前缀
+            lbl = ttk.Label(
                 self.detect_rows_frame, text=line, foreground=color, anchor="w"
-            ).pack(fill=tk.X, anchor="w", pady=(1, 0))
-        # 动态显隐竖向滚动条：内容超过最大高度（约两行）才显示，否则收起，
+            )
+            # 文字 label 自身也绑定滚轮：Tk 的 <MouseWheel> 不会从子 widget 自动
+            # 冒泡到父 frame，鼠标停在文字上时必须由 label 自己拦截，否则「文字
+            # 区域滚轮无反应、只能在滚动条上滚」。handler 复用实例方法。
+            lbl.bind("<MouseWheel>", self._on_detect_mousewheel)
+            lbl.bind("<Button-4>", self._on_detect_mousewheel)
+            lbl.bind("<Button-5>", self._on_detect_mousewheel)
+            lbl.pack(fill=tk.X, anchor="w", pady=0)
+        # 动态显隐竖向滚动条：内容超过最大高度（两行）才显示，否则收起，
         # 避免数据根多时也把主窗口整体高度撑高（主窗高度固定为屏 3/4）。
+        # canvas 高度自适应：内容少则贴合内容、最多两行高（不固定两行）。
+        # 稳定记录「是否溢出」供滚轮 handler 复用，避免实时量高导致判据抖动。
         try:
             if getattr(self, "_sync_detect_width", None):
                 self._sync_detect_width()
             self.detect_rows_canvas.update_idletasks()
             content_h = self.detect_rows_frame.winfo_reqheight()
-            if content_h > self._detect_max_h:
+            # 高度 = min(内容实际高, 最大两行高)：1 行就 1 行高，2 行以上截断
+            canvas_h = min(content_h, self._detect_max_h)
+            self.detect_rows_canvas.configure(height=canvas_h)
+            self._detect_overflow = content_h > self._detect_max_h
+            if self._detect_overflow:
                 self.detect_rows_sb.pack(side=tk.RIGHT, fill=tk.Y)
             else:
                 self.detect_rows_sb.pack_forget()
         except Exception:
-            pass
+            self._detect_overflow = False
 
     def _redetect(self) -> None:
         self.root_dir = self._detect_root(self.root_var.get() or None)
@@ -855,13 +964,18 @@ class QoderBackupApp:
     def _tool_dir(self, sub: str) -> str:
         """返回备份/快照存放目录：<备份工具启动目录>/<sub>/<工具名>/。
 
-        即与 run.bat（源码模式）或打包后的 exe 同一级目录下的 backup/<工具名>/，
-        按工具名分目录，便于区分不同工具的备份数据。不放在被备份工具
-        （如 Qoder）的数据根目录，也不在 ai_env_clone 包内部。
-        源码模式下 __main__.py 位于 <仓库根>/ai_env_clone/，故取上级（仓库根）；
-        单文件 exe 模式下取 exe 自身所在目录。
+        即与启动方式同级目录下的 backup/<工具名>/，按工具名分目录，便于区分
+        不同工具的备份数据。不放在被备份工具（如 Qoder）的数据根目录，
+        也不在 ai_env_clone 包内部。
+        - 源码模式（python -m ai_env_clone）：__main__.py 在 <仓库根>/ai_env_clone/，
+          取上级即仓库根，备份落在 <仓库根>/backup/<工具名>/。
+        - 打包模式（单文件 exe / app / 二进制）：可执行程序是独立分发物，备份目录
+          放在 exe 同级（如 dist/backup/<工具名>/），让程序与它的备份数据在一起，
+          便于随程序一起拷贝/迁移，而不必跳回源码仓库根。
         """
         if getattr(sys, "frozen", False):
+            # 打包后的 exe：备份目录放在 exe 同级（如 dist/backup/<工具名>/），
+            # 让可执行程序与它的备份数据在一起，便于随程序分发/迁移。
             base = os.path.dirname(os.path.abspath(sys.executable))
         else:
             # __main__.py 在 <仓库根>/ai_env_clone/，仓库根在其上级
