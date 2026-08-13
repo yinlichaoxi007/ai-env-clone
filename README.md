@@ -127,6 +127,10 @@ CodeBuddy 的集中会话/检查点按**登录用户 UUID** 分目录存放（`C
 
 还原时本工具会自动把旧 UUID 重映射为本机**当前登录用户 UUID**（启发式取 `Data` 下最近活动的 UID），确保会话落到本机 CodeBuddy 实际读取的目录。若本机从未登录过 CodeBuddy（取不到 UUID），则保持原路径、不做重写，至少不破坏备份。
 
+### 深层会话消息长路径修复（Windows）
+
+CodeBuddy 会话消息文件层级深（`history/<ws>/<sid>/messages/<id>.json`），其绝对路径常超过 Windows 的 **260 字符 MAX_PATH** 限制。旧版在扫描/`getsize`/`open` 时因 `WinError 3`（系统找不到指定的路径）**静默丢弃全部 `messages/` 文件**——表现为「历史会话列表看得到、点开却没内容」。**当前版本已对所有文件操作加 `\\?\` 长路径前缀**（`scan_items`、`export_backup`、`import_backup` 全程），深层会话消息可完整备份与还原。
+
 ## 架构
 
 ```
@@ -319,6 +323,10 @@ python -m ai_env_clone --restore --in ./my-backup.zip
 CodeBuddy stores its centralized sessions/checkpoints under the **logged-in user UUID** (`CodeBuddyExtension/Data/<uuid>/CodeBuddyIDE/<uuid>/`). The backup pins this UUID into the archive's relative paths; restoring them verbatim on a new computer would write into a "dead directory" the current user cannot read — showing up as "session list visible, but empty when opened".
 
 On restore, the tool auto-remaps the old UUID to the **current logged-in user UUID** on this machine (heuristically the most recently active UID under `Data`), so sessions land where this machine's CodeBuddy actually reads them. If CodeBuddy has never been logged into on this machine (no UUID found), paths are left unchanged rather than broken.
+
+### Deep session message long-path fix (Windows)
+
+CodeBuddy session message files are deeply nested (`history/<ws>/<sid>/messages/<id>.json`) and their absolute paths often exceed Windows' **260-char MAX_PATH** limit. Older versions silently dropped every `messages/` file because `getsize`/`open` raised `WinError 3` (path not found) — showing up as "session list visible, but empty when opened". **The current build adds the `\\?\` long-path prefix to all file operations** (`scan_items`, `export_backup`, `import_backup`), so deep session messages are backed up and restored completely.
 
 ## Architecture
 

@@ -418,5 +418,83 @@ class TestRegistration(unittest.TestCase):
         self.assertGreater(len(items), 0)
 
 
+@unittest.skipUnless(
+    os.name == "nt",
+    "长路径（>260 字符）超出 MAX_PATH 限制是 Windows 特有问题",
+)
+class TestLongPathSessionRoundTrip(TempEnv):
+    """回归：CodeBuddy 会话消息文件层级深、绝对路径常超 260 字符，
+    修复前 scan_items 的 getsize/open 因 WinError 3 静默丢弃全部 messages，
+    导致还原后「有会话列表、点开无内容」。本用例固化长路径文件能被完整备份+还原。"""
+
+    def _make_deep_session(self) -> tuple[int, int]:
+        # 构造一条绝对路径显著超过 260 字符的会话（history/<ws>/<sid>/messages/<name>.json）
+        from ai_env_clone.core import _longpath
+
+        ws = "a" * 32
+        sid = "b" * 32
+        msg_dir = os.path.join(
+            self.session_root, "history", ws, sid, "messages"
+        )
+        os.makedirs(_longpath(msg_dir), exist_ok=True)
+        n = 20
+        for i in range(n):
+            # 文件名填长到让整体绝对路径远超 260
+            name = ("c" * 40) + str(i)
+            p = os.path.join(msg_dir, name + ".json")
+            with open(_longpath(p), "w", encoding="utf-8") as f:
+                f.write('{"role":"user","content":"msg %d"}' % i)
+        # 同目录再放一个 index.json（短路径，必被保留）
+        idx = os.path.join(self.session_root, "history", ws, sid, "index.json")
+        with open(_longpath(idx), "w", encoding="utf-8") as f:
+            f.write('{"messages":[]}')
+        return n, len(
+            os.path.join(msg_dir, ("c" * 40) + "0.json")
+        )
+
+    def test_deep_messages_survive_round_trip(self) -> None:
+        n_msgs, longest = self._make_deep_session()
+        self.assertGreater(
+            longest, 260, "测试前置：会话消息绝对路径应超过 260 字符（实际 %d）" % longest
+        )
+
+        items = build_items(self.tmp, self.global_root)
+        sel = [it for it in items if it.key == "user_sessions:history"]
+        self.assertTrue(sel, "应存在 user_sessions:history 备份项")
+
+        zip_path = os.path.join(self.tmp, "sess.zip")
+        adp = get_adapter("codebuddy")
+        adp.export(zip_path, self.tmp, sel, progress=lambda *a: None)
+        self.assertTrue(os.path.exists(zip_path))
+
+        # 还原到独立目录，逐条校验 messages 文件齐全
+        restore_root = os.path.join(self.tmp, "restore")
+        os.makedirs(restore_root, exist_ok=True)
+        res = adp.restore(zip_path, restore_root, progress=lambda *a: None)
+
+        # 还原报告不应有长路径文件被 blocked
+        self.assertEqual(
+            res["blocked"], [],
+            "长路径会话消息不应被还原阻塞: %s" % res["blocked"][:3]
+        )
+
+        # 实际落盘的长路径 walk 也需 _longpath 才能数到深层文件。
+        # 只校验我们构造的超深会话目录（history/aaaa.../bbbb.../messages）下是否 20 个齐全，
+        # 避免与 _make_tree 自带的浅层 history/messages/1.json 混淆。
+        from ai_env_clone.core import _longpath
+        deep_dir = os.path.join(
+            restore_root, "data", self.uuid, "CodeBuddyIDE", self.uuid,
+            "history", "a" * 32, "b" * 32, "messages",
+        )
+        restored_msgs = 0
+        if os.path.isdir(_longpath(deep_dir)):
+            for _, _, fs in os.walk(_longpath(deep_dir)):
+                restored_msgs += sum(1 for f in fs if f.endswith(".json"))
+        self.assertEqual(
+            restored_msgs, n_msgs,
+            "长路径会话消息应完整还原（期望 %d，实际 %d）" % (n_msgs, restored_msgs)
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

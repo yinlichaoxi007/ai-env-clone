@@ -161,6 +161,16 @@ def _arcname(abs_path: str, root: str) -> str:
     return os.path.relpath(abs_path, root).replace(os.sep, "/")
 
 
+def _longpath(path: str) -> str:
+    """Windows 长路径前缀（``\\\\?\\``），绕过 260 字符 MAX_PATH 限制；
+    其他平台原样返回。CodeBuddy 等会话消息文件层级深、绝对路径常超 260，
+    不加前缀会导致 getsize/open 报 WinError 3。"""
+    if os.name == "nt" and not path.startswith("\\\\?\\"):
+        if os.path.isabs(path):
+            return "\\\\?\\" + os.path.abspath(path)
+    return path
+
+
 def is_critical(rel_path: str) -> bool:
     """判断是否为不受体积上限约束的关键数据文件。"""
     p = _norm_for_match(rel_path)
@@ -214,7 +224,7 @@ def scan_items(
                 continue
 
             try:
-                size = os.path.getsize(full)
+                size = os.path.getsize(_longpath(full))
             except OSError:
                 continue
 
@@ -288,7 +298,7 @@ def snapshot_sqlite(src: str, dst: str) -> bool:
 
 def _is_sqlite(path: str) -> bool:
     try:
-        with open(path, "rb") as f:
+        with open(_longpath(path), "rb") as f:
             return f.read(16) == b"SQLite format 3\x00"
     except OSError:
         return False
@@ -367,7 +377,7 @@ def export_backup(
                     else:
                         snap = None
                 try:
-                    zf.write(write_from, arcname=rel)
+                    zf.write(_longpath(write_from), arcname=rel)
                 except (OSError, PermissionError) as exc:
                     manifest.setdefault("failed", []).append(
                         {"path": rel, "error": str(exc)}
@@ -711,7 +721,7 @@ def import_backup(
             for m in members:
                 arcname = path_rewrite(m.filename) if path_rewrite else m.filename
                 t = safe_target(root_real, arcname)
-                if t and os.path.isfile(t):
+                if t and os.path.isfile(_longpath(t)):
                     victims.append((t, arcname))
             if victims:
                 rb_dir = os.path.realpath(rollback_dir) if rollback_dir else root_real
@@ -738,7 +748,7 @@ def import_backup(
                             progress(
                                 ProgressInfo(idx, len(victims), "生成回滚快照 %s" % arc)
                             )
-                            rb.write(t, arcname=arc)
+                            rb.write(_longpath(t), arcname=arc)
                         rb.writestr(
                             MANIFEST_NAME,
                             json.dumps(rb_manifest, ensure_ascii=False, indent=2),
@@ -758,9 +768,10 @@ def import_backup(
                 continue
 
             progress(ProgressInfo(idx, total, "恢复 %s" % m.filename))
-            os.makedirs(os.path.dirname(target), exist_ok=True)
+            parent = os.path.dirname(target)
+            os.makedirs(_longpath(parent), exist_ok=True)
             try:
-                with zf.open(m) as src, open(target, "wb") as dst:
+                with zf.open(m) as src, open(_longpath(target), "wb") as dst:
                     shutil.copyfileobj(src, dst, 1024 * 256)
                 restored += 1
                 if target.lower().endswith((".db", ".sqlite")):
@@ -771,9 +782,9 @@ def import_backup(
     for db in restored_dbs:
         for suffix in ("-wal", "-shm"):
             stray = db + suffix
-            if os.path.exists(stray):
+            if os.path.exists(_longpath(stray)):
                 try:
-                    os.remove(stray)
+                    os.remove(_longpath(stray))
                 except OSError:
                     pass
 
