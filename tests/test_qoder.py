@@ -16,6 +16,7 @@ import sqlite3
 import tempfile
 import unittest
 import zipfile
+from unittest import mock
 
 from ai_env_clone.core import (
     MANIFEST_NAME,
@@ -674,6 +675,15 @@ class TestGuiThreadSafety(TempEnv):
         # 无头模式：隐藏导入流程中弹出的备份浏览器子窗口，避免测试闪窗。
         gui.HEADLESS = True
         self.addCleanup(lambda: setattr(gui, "HEADLESS", False))
+
+        # 隔离用户偏好缓存：默认工具固定走注册序第一个（qoder），
+        # 且不写真实用户缓存目录，保证测试确定性与不污染用户数据。
+        self._load_patch = mock.patch.object(gui, "_load_last_tool", return_value=None)
+        self._save_patch = mock.patch.object(gui, "_save_last_tool", return_value=None)
+        self._load_patch.start()
+        self._save_patch.start()
+        self.addCleanup(self._save_patch.stop)
+        self.addCleanup(self._load_patch.stop)
 
         self.app = gui.QoderBackupApp(self.tk_root)
         # 指向测试目录（主目录语义：.qoder-cn 在其下），避免动用真实 Qoder 数据

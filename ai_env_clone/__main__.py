@@ -58,6 +58,42 @@ def human_size(n: float) -> str:
     return "%.1f GB" % n
 
 
+# --------------------------------------------------------------------------- #
+# 用户偏好缓存（记住上次选择的工具，下次启动保持）
+# --------------------------------------------------------------------------- #
+#: 偏好缓存文件名，存于 ``compress_estimate.cache_dir()``（用户级缓存目录，不进仓库）。
+_PREFS_FILENAME = "prefs.json"
+
+
+def _prefs_path() -> str:
+    """偏好缓存文件完整路径。"""
+    from ai_env_clone.compress_estimate import cache_dir
+
+    return os.path.join(cache_dir(), _PREFS_FILENAME)
+
+
+def _load_last_tool() -> str | None:
+    """读用户上次选择的工具标识；无缓存 / 损坏 / 该工具已注销则返回 None（回退默认）。"""
+    try:
+        with open(_prefs_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        name = data.get("last_tool")
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(name, str) or name not in list_adapters():
+        return None
+    return name
+
+
+def _save_last_tool(name: str) -> None:
+    """记录用户当前选择的工具，供下次启动保持。写失败静默，不影响主流程。"""
+    try:
+        with open(_prefs_path(), "w", encoding="utf-8") as f:
+            json.dump({"last_tool": name}, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
 class QoderBackupApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -67,9 +103,10 @@ class QoderBackupApp:
         root.minsize(700, 460)
 
         # 工具切换下拉列出所有已注册适配器（新增适配器后自动出现）。
-        # 默认工具固定为 qoder（已实测主力工具）；下拉仍列出全部，用户可手动切换。
+        # 默认工具：优先沿用用户上次选择（缓存），无缓存/失效时按注册顺序取第一个。
         self._tool_names = list_adapters()
-        default_tool = "qoder" if "qoder" in self._tool_names else (self._tool_names[0] if self._tool_names else "")
+        last_tool = _load_last_tool()
+        default_tool = last_tool or (self._tool_names[0] if self._tool_names else "")
         self.adapter = get_adapter(default_tool)
         self.root.title(APP_TITLE_TPL % self.adapter.display_name)
 
@@ -116,6 +153,8 @@ class QoderBackupApp:
 
         self._refresh_items()
         self._refresh_uid_combo()
+        # 记住用户本次选择，下次启动默认沿用
+        _save_last_tool(self.adapter.name)
         self.status.configure(text="已切换到 %s" % self.adapter.display_name)
 
     def _build_ui(self) -> None:
