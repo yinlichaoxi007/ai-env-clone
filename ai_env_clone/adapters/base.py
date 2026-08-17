@@ -169,4 +169,10 @@ def get_adapter(name: str) -> BaseAdapter:
 
 
 def list_adapters() -> list[str]:
-    return sorted(_ADAPTERS)
+    """按**注册顺序**返回全部已注册适配器标识（`@register` 触发顺序）。
+
+    注册顺序即 ``adapters/__init__.py`` 的导入顺序，也是 GUI 默认工具与
+    下拉列表的顺序（第一个为默认工具）。与排序无关，刻意保持注册序，
+    让「默认工具」由适配器注册顺序决定、可预测。
+    """
+    return list(_ADAPTERS)

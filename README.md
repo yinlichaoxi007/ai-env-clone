@@ -26,6 +26,7 @@
 | Qoder CN IDE（独立桌面客户端） | 独立 IDE | **1.10.0** | ✅ 已支持 |
 | CodeBuddy | 桌面 IDE | **4.11.0** | ✅ 已支持 |
 | Reasonix | 桌面 IDE | **1.21.5** | ✅ 已支持 |
+| DeepSeek Harness（DSH） | CLI / Web 智能体框架 | — | ✅ 已支持 |
 | 其他国内可用工具 | — | — | 🚧 规划中，欢迎贡献适配器 |
 
 > ⚠️ **版本说明**：上表仅列出作者**实测通过**的版本。其他更高/更低版本未经测试，数据结构可能变化，使用前请先在本机做一次「导出 → 校验」验证。
@@ -56,7 +57,7 @@
   ./AiEnvClone-linux
   ```
 
-> 各平台分发与运行方式均经打包流程验证可产出；**实际运行仅在 Windows x64 上实测过**，macOS / Linux 因暂无对应设备未做端到端实测，但代码路径与打包流程跨平台通用。
+> 各平台分发与运行方式均经打包流程验证可产出；**实际运行仅在 Windows x64 上做过真机端到端实测**。macOS / Linux 暂无对应真机设备，未做端到端实测，但三平台代码路径（路径解析、缓存目录、适配器探测、DPI 感知等）已由**跨平台单元测试覆盖**（测试中以 mock 平台分支逐一断言 Windows / macOS / Linux 的路径布局与行为），打包流程同样跨平台通用。
 
 ### 方式二：从源码运行（需 Python 3.10+）
 
@@ -93,7 +94,7 @@ GUI 界面要点：
 - **备份内容路径可见**：每个备份项的说明文字后附带其相对于数据目录的具体路径，方便确认备份范围。
 - **未找到项标红**：当数据目录未正确识别时，备份内容中找不到的每一项会标红并注明「（未找到）」，备份内容区右上角同时显示「N 项未找到」；已勾选项保持不变，仅作提示，不会自动取消勾选。
 - **估算大小**：点击「估算大小」按钮可预估所选备份项打包后的体积。
-- **高分屏适配**：窗口声明 DPI 感知（Per-Monitor v2），缩放系数超过 100% 时不会被系统虚化放大；备份内容区高度统一为固定值（与工具/项数无关），切换 Qoder / CodeBuddy / Reasonix 时内容区高度完全一致，内容过多时由滚动条承载。主窗口高度**自适应内容**（上限屏幕高度 92%、下限 460px），内容少的工具（如 Qoder）窗口更紧凑，底部不再有大面积空白。
+- **高分屏适配**：窗口声明 DPI 感知（Per-Monitor v2），缩放系数超过 100% 时不会被系统虚化放大；备份内容区高度统一为固定值（与工具/项数无关），切换任意已支持工具时内容区高度完全一致，内容过多时由滚动条承载。主窗口高度**自适应内容**（上限屏幕高度 92%、下限 460px），内容少的工具（如 Qoder）窗口更紧凑，底部不再有大面积空白。
 
 也可双击仓库内的 `run.bat`（Windows，需本机已装 Python 3.10+）一键启动。
 
@@ -120,6 +121,13 @@ python -m ai_env_clone --restore --in ./my-backup.zip
   - 源码模式（`python -m ai_env_clone` / `run.bat`）：`<仓库根>/backup/<工具名>/`。
   - 打包模式（单文件 exe / app / 二进制）：可执行程序是独立分发物，备份目录放在 **exe 同级**的 `backup/<工具名>/`（如 `dist/backup/qoder/`），让程序与它的备份数据在一起，便于随程序一起拷贝/迁移。重打包（`build_exe.py` / `build.bat`）只会覆盖 exe 本身，不会清空 `backup/` 子目录，备份数据安全。
 - **防误还原**：还原时以包内 manifest 的 `kind` 为准，仅改文件名无法骗过校验；若包内记录的 `source_root` 与当前还原目标不一致，会弹窗二次确认，防止覆盖错误目录的数据。备份与回滚快照均可还原。
+- **关于「覆盖 vs 融合」**：恢复时同名文件是**整体覆盖**（覆盖前自动生成回滚快照，可随时还原到覆盖前状态），而不是按内容结构做「追加不同、覆盖相同」的融合。这是**各 AI 工具数据格式的限制**：会话日志是压缩/加密/二进制格式（如 DSH 的 `session.jsonl.zstd`、Qoder 加密的 `local.db`），本工具无法读取其内部结构去逐条合并；对明文 JSON/JSONL 虽可解析，但半吊子的「部分融合」可能造成同一会话在不同机器上内容不一致、甚至让工具无法正常打开数据，比整体覆盖更危险。因此**多台电脑使用时应「串行」而非「交叉并行」**——精确的粒度是**同一工作区的同一会话**：
+  1. **同一工作区的同一会话**，同一时间只在一台电脑上使用（不同工作区、不同会话互不影响，可并行）；
+  2. 换电脑前，先在当前电脑**导出备份**；
+  3. 到新电脑后，先**还原该备份**再开始使用；
+  4. 切勿在两台电脑上交叉使用同一个工作区/会话后互相还原——覆盖会丢失其中一侧的增量，融合则可能产生冲突数据。
+  - harness 自身的设置（含自定义模型配置，如 DSH 的 `settings.yaml`）理论上可按 key 融合，但**没必要**：设置本就应随会话一起串行修改、随备份整体迁移，恢复时同样整体覆盖同名文件即可，避免跨机器设置漂移。
+  - 若某台电脑上已经产生了新数据（还原目标里已有备份之外的会话/记忆），还原前请先手动导出该电脑的备份（或直接使用自动生成的回滚快照），确保新旧数据各有一份可回退的副本，再决定保留哪一侧。
 
 ### 跨电脑还原：CodeBuddy 会话 UUID 自动重映射
 
@@ -144,6 +152,7 @@ ai_env_clone/                包（import 名 ai_env_clone，产品名 AiEnvClon
 │   ├── qoder.py       Qoder 适配器（参考实现，自包含）
 │   └── codebuddy.py   CodeBuddy 适配器（用户级/全局数据，公共根为用户主目录）
 │   └── reasonix.py    Reasonix 适配器（配置/数据在 AppData/Roaming/reasonix，缓存在 AppData/Local/reasonix）
+│   └── dsh.py         DeepSeek Harness 适配器（数据在 ~/.dsh，含会话日志/存储索引/用户全局指令）
 └── backup/            备份/恢复执行与回滚快照
 build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 / macOS x86_64 / Linux 可执行程序）
 .github/workflows/     build-release.yml（打 tag 自动构建多平台可执行程序并发布 Release）+ mirror-to-gitee.yml（镜像到 Gitee）
@@ -155,12 +164,12 @@ build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 /
 
 | 平台 | 架构 | 分发格式 | 编译/打包 | 运行实测 |
 | --- | --- | --- | --- | --- |
-| Windows | x64 | `AiEnvClone-windows.exe`（单文件） | ✅ CI 自动构建 | ✅ 已实测 |
-| macOS | Apple Silicon / Intel（arm64 + x86_64） | `AiEnvClone-macos-*.app.zip` | ✅ CI 自动构建 | ⚠️ 暂无设备，未实测 |
-| Linux | x64 | `AiEnvClone-linux`（单文件） | ✅ CI 自动构建 | ⚠️ 暂无设备，未实测 |
+| Windows | x64 | `AiEnvClone-windows.exe`（单文件） | ✅ CI 自动构建 | ✅ 已真机实测 |
+| macOS | Apple Silicon / Intel（arm64 + x86_64） | `AiEnvClone-macos-*.app.zip` | ✅ CI 自动构建 | ✅ 已由跨平台测试覆盖（暂无真机设备，未做端到端实测） |
+| Linux | x64 | `AiEnvClone-linux`（单文件） | ✅ CI 自动构建 | ✅ 已由跨平台测试覆盖（暂无真机设备，未做端到端实测） |
 
 - **编译与打包**：三个平台的产物均由 GitHub Actions 在对应系统（Windows / macOS / Ubuntu）上由 PyInstaller 跨平台打包产出，流程已验证可正常产出。
-- **运行实测**：目前仅在 **Windows x64** 上做过完整端到端运行验证；macOS 与 Linux 因暂无对应设备，未做真机实测。代码路径（路径解析、缓存目录、适配器检测均使用 `os.path.expanduser("~")` 等跨平台写法）与打包流程本身跨平台通用，但首次在这些平台上运行如遇问题，欢迎反馈 Issue。
+- **运行实测**：目前仅在 **Windows x64** 上做过真机端到端运行验证。macOS 与 Linux 因暂无对应设备未做真机端到端实测，但**跨平台路径逻辑已由单元测试覆盖**——各适配器与核心层的平台分支（`%APPDATA%` / `~/Library/Application Support` / `~/.config` 等路径布局、DPI 感知声明、缓存目录）均以 mock 平台分支逐项断言三平台行为，测试套件在任意平台上运行都会覆盖三平台路径。若在真机上遇到问题，欢迎反馈 Issue。
 - **适配器（被备份的工具）的平台支持**：取决于各工具自身提供的平台。例如 CatPaw 目前仅提供 Windows / macOS，无 Linux 版，因此在 Linux 上该适配器会检测不到数据目录而跳过；这不影响本工具在 Linux 上备份其它已支持的工具。
 
 ## 测试
@@ -218,6 +227,7 @@ build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 /
 | Qoder CN IDE (standalone desktop client) | Standalone IDE | **1.10.0** | ✅ Supported |
 | CodeBuddy | Desktop IDE | **4.11.0** | ✅ Supported |
 | Reasonix | Desktop IDE | **1.21.5** | ✅ Supported |
+| DeepSeek Harness (DSH) | CLI / Web agent framework | — | ✅ Supported |
 | Other China-usable tools | — | — | 🚧 Planned — adapters welcome |
 
 > ⚠️ **Version note**: only author-tested versions are listed above. Untested higher/lower versions may have changed data layouts — do an Export→Verify on your machine first.
@@ -237,12 +247,12 @@ All adapters follow the same policy for which backup items are checked by defaul
 
 | Platform | Arch | Distribution | Built by CI | Runtime tested |
 | --- | --- | --- | --- | --- |
-| Windows | x64 | `AiEnvClone-windows.exe` (single-file) | ✅ automated | ✅ verified |
-| macOS | Apple Silicon / Intel (arm64 + x86_64) | `AiEnvClone-macos-*.app.zip` | ✅ automated | ⚠️ no device, untested |
-| Linux | x64 | `AiEnvClone-linux` (single-file) | ✅ automated | ⚠️ no device, untested |
+| Windows | x64 | `AiEnvClone-windows.exe` (single-file) | ✅ automated | ✅ verified on real hardware |
+| macOS | Apple Silicon / Intel (arm64 + x86_64) | `AiEnvClone-macos-*.app.zip` | ✅ automated | ✅ covered by cross-platform tests (no real device yet; no end-to-end test) |
+| Linux | x64 | `AiEnvClone-linux` (single-file) | ✅ automated | ✅ covered by cross-platform tests (no real device yet; no end-to-end test) |
 
 - **Build & packaging**: all three platform artifacts are produced by GitHub Actions on their native OS (Windows / macOS / Ubuntu) via cross-platform PyInstaller; the flow is verified to produce valid outputs.
-- **Runtime tested**: full end-to-end runtime is verified only on **Windows x64** so far. macOS and Linux are not yet exercised on real hardware (none available). The code paths (path resolution, cache dir, adapter detection all use cross-platform `os.path.expanduser("~")`) and the packaging flow are cross-platform by design, but if you hit issues on those platforms, please file an Issue.
+- **Runtime tested**: full end-to-end runtime is verified on real hardware only on **Windows x64** so far. macOS and Linux are not yet exercised on real devices (none available), but the cross-platform path logic **is covered by unit tests** — every platform branch in the adapters and core (path layouts like `%APPDATA%` / `~/Library/Application Support` / `~/.config`, DPI awareness, cache dir) is asserted for all three platforms by mocking the platform branch, so the test suite exercises three-platform paths no matter which OS it runs on. If you hit issues on those platforms, please file an Issue.
 - **Platform support of backed-up tools**: depends on each tool's own offerings. For example CatPaw currently ships Windows / macOS only (no Linux build), so on Linux its adapter will simply detect no data dir and skip — this does not affect backing up other supported tools on Linux.
 
 ## Install
@@ -259,7 +269,7 @@ Get the single-file build from [Releases](https://github.com/yinlichaoxi007/ai-e
   ./AiEnvClone-linux
   ```
 
-> Distribution and launch steps for every platform are validated by the packaging flow. **End-to-end runtime is verified only on Windows x64**; macOS / Linux are not yet tested on real devices (no hardware available), but the code paths and packaging are cross-platform by design.
+> Distribution and launch steps for every platform are validated by the packaging flow. **End-to-end runtime is verified on real hardware only on Windows x64**; macOS / Linux are not yet tested on real devices (none available), but the three-platform code paths (path resolution, cache dir, adapter detection, DPI awareness) are **covered by cross-platform unit tests** — each platform branch is asserted for Windows / macOS / Linux by mocking the platform, and the packaging flow is cross-platform by design.
 
 ### Option B: Run from source (Python 3.10+ required)
 
@@ -296,7 +306,7 @@ GUI highlights:
 - **Backup-item paths visible**: each backup item shows its concrete relative path after its description, so you can confirm the backup scope.
 - **Missing items highlighted**: when the data directory is not correctly detected, every item that cannot be found is shown in red and labelled "(未找到 / not found)"; the top-right of the backup list also shows "N 项未找到" (N items not found). Already-checked items keep their state — only a hint, no auto-uncheck.
 - **Estimate size**: click "估算大小" (estimate size) to preview the packed size of selected items.
-- **Hi-DPI support**: the window declares DPI awareness (Per-Monitor v2), so it is not blurry-scaled by the OS when the scaling factor exceeds 100%. The backup content area uses a fixed uniform height (independent of tool/item count), so switching Qoder / CodeBuddy / Reasonix keeps the content area height identical; when content overflows a scrollbar appears. The **main window height is adaptive** — it fits the content (capped at 92% of screen height, floored at 460px), so tools with less content (e.g. Qoder) get a more compact window with no large blank gap at the bottom.
+- **Hi-DPI support**: the window declares DPI awareness (Per-Monitor v2), so it is not blurry-scaled by the OS when the scaling factor exceeds 100%. The backup content area uses a fixed uniform height (independent of tool/item count), so switching between any supported tools keeps the content area height identical; when content overflows a scrollbar appears. The **main window height is adaptive** — it fits the content (capped at 92% of screen height, floored at 460px), so tools with less content (e.g. Qoder) get a more compact window with no large blank gap at the bottom.
 
 On Windows you can also double-click `run.bat` (requires Python 3.10+ installed locally).
 
@@ -317,6 +327,13 @@ python -m ai_env_clone --restore --in ./my-backup.zip
 - Viewable via the "备份浏览器" (open from "还原备份包"): inspect details, verify integrity, and choose what to restore.
 - Restore **overwrites** existing files and auto-creates a `<tool>_rollback_<timestamp>.zip` snapshot beforehand in the same `backup/<tool>/` directory, so you can revert anytime. Type is verified against the manifest to prevent accidental restore of a misnamed file.
 - **Backup directory location**: next to the launch method. Source mode (`python -m ai_env_clone` / `run.bat`) → `<repo root>/backup/<tool>/`. Packaged mode (single-file exe / app / binary) → the executable is a standalone distributable, so backups go to `backup/<tool>/` **next to the exe** (e.g. `dist/backup/qoder/`), keeping the program and its data together. Re-packaging (`build_exe.py` / `build.bat`) only overwrites the exe itself and never clears the `backup/` subfolder, so backups are safe.
+- **About "overwrite vs merge"**: restoring **overwrites same-named files as a whole** (a rollback snapshot is auto-created first so you can always revert to the pre-restore state) rather than merging "append different content, overwrite same content" at the structural level. This is a **limitation of each AI tool's data format**: session logs are compressed/encrypted/binary (e.g. DSH's `session.jsonl.zstd`, Qoder's encrypted `local.db`), which this tool cannot read internally to merge line by line; and even for plain JSON/JSONL, a partial merge could leave the same conversation inconsistent across machines or even make the tool unable to open its data — worse than a whole-file overwrite. Therefore, when using multiple computers, use the tool **serially, not concurrently** — the precise granularity is **the same session in the same workspace**:
+  1. Use **one session of one workspace on only one computer** at a time (different workspaces/sessions are unaffected and can be used in parallel);
+  2. Before switching machines, **export a backup** on the current computer;
+  3. On the new computer, **restore that backup first**, then start using the tool;
+  4. Never use the same workspace/session concurrently on two computers and then restore back and forth — overwriting loses one side's increments, while merging can produce conflicting data.
+  - Harness settings themselves (including custom model configs, e.g. DSH's `settings.yaml`) could theoretically be merged by key, but there is **no need**: settings should travel with the sessions — modify them serially on one machine, let them migrate with the backup, and restore them by whole-file overwrite like everything else, avoiding cross-machine settings drift.
+  - If the restore target already has new data (sessions/memories beyond the backup), first export that computer's own backup manually (or keep the auto-generated rollback snapshot) so both old and new data each have a revertible copy, then decide which side to keep.
 
 ### Cross-computer restore: CodeBuddy session UUID auto-remap
 
@@ -341,6 +358,7 @@ ai_env_clone/                package (import name ai_env_clone, product name AiE
 │   ├── qoder.py       Qoder adapter (reference implementation, self-contained)
 │   └── codebuddy.py   CodeBuddy adapter (user-level & global data, common root = user home)
 │   └── reasonix.py    Reasonix adapter (config/data under AppData/Roaming/reasonix, cache under AppData/Local/reasonix)
+│   └── dsh.py         DeepSeek Harness adapter (data under ~/.dsh: session logs / storage indexes / user global instructions)
 └── backup/            backup/restore execution & rollback snapshots
 build_exe.py           package into cross-platform executables via PyInstaller (Windows / macOS arm64 / macOS x86_64 / Linux)
 .github/workflows/     build-release.yml (tag → auto-build multi-platform binaries & publish Release) + mirror-to-gitee.yml (mirror to Gitee)

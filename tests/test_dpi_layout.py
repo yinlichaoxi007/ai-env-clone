@@ -46,9 +46,12 @@ class TestFitLayoutCaps(unittest.TestCase):
     def _make_app(self):
         import tkinter as tk
         from ai_env_clone.__main__ import QoderBackupApp
-        root = tk.Tk()
-        root.withdraw()
-        app = QoderBackupApp(root)
+        # 隔离用户偏好缓存：默认工具固定走注册序第一个，且不写真实缓存
+        with mock.patch("ai_env_clone.__main__._load_last_tool", return_value=None), \
+             mock.patch("ai_env_clone.__main__._save_last_tool", return_value=None):
+            root = tk.Tk()
+            root.withdraw()
+            app = QoderBackupApp(root)
         return root, app
 
     def test_canvas_height_uniform_285_when_content_huge(self):
