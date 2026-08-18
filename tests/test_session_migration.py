@@ -157,5 +157,72 @@ class TestMigrateRoundTrip(unittest.TestCase):
         self.assertTrue(os.path.isfile(existing))
 
 
+class TestMigrateWarnings(unittest.TestCase):
+    """迁移时的提示逻辑（warn 回调）验证：仅当位置可能「读不到」时才触发。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _collect(self):
+        msgs = []
+        return msgs, lambda m: msgs.append(m)
+
+    def test_warn_target_root_not_current_user(self):
+        # 目标根设为一个明显非当前用户根的临时目录 -> 应触发落点警告
+        msgs, warn = self._collect()
+        sessions_parent = os.path.join(self.tmp, "projects_not_current")
+        new_id = migrate_session(
+            source_tool="reasonix", source_path=RX_SESSION,
+            target_tool="reasonix", target_root=sessions_parent,
+            scope="d--project-demo", warn=warn,
+        )
+        self.assertTrue(new_id)
+        self.assertTrue(any("不是当前登录用户" in m for m in msgs),
+                        "落点非当前用户应触发警告，实际：%r" % msgs)
+
+    def test_warn_workspace_id_missing(self):
+        # 不传 workspace_id -> 生成随机 wid，应触发「未指定 workspaceId」警告
+        msgs, warn = self._collect()
+        hist_root = os.path.join(self.tmp, "history")
+        new_id = migrate_session(
+            source_tool="reasonix", source_path=RX_SESSION,
+            target_tool="codebuddy", target_root=hist_root, warn=warn,
+        )
+        self.assertTrue(new_id)
+        self.assertTrue(any("未指定目标 workspaceId" in m for m in msgs),
+                        "未指定 workspaceId 应触发警告，实际：%r" % msgs)
+
+    def test_warn_workspace_not_exist(self):
+        # 显式传入目标机不存在的 workspaceId -> 应触发「工作区不存在」警告
+        msgs, warn = self._collect()
+        hist_root = os.path.join(self.tmp, "history")
+        new_id = migrate_session(
+            source_tool="reasonix", source_path=RX_SESSION,
+            target_tool="codebuddy", target_root=hist_root,
+            workspace_id="ffffffff-ffff-ffff-ffff-ffffffffffff", warn=warn,
+        )
+        self.assertTrue(new_id)
+        self.assertTrue(any("目标工作区" in m and "不存在" in m for m in msgs),
+                        "目标工作区不存在应触发警告，实际：%r" % msgs)
+
+    def test_no_warn_when_workspace_exists(self):
+        # 目标工作区已存在 -> 不应触发「工作区不存在」警告（落点警告可能仍取决于根）
+        msgs, warn = self._collect()
+        hist_root = os.path.join(self.tmp, "history")
+        wid = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        os.makedirs(os.path.join(hist_root, wid), exist_ok=True)
+        new_id = migrate_session(
+            source_tool="reasonix", source_path=RX_SESSION,
+            target_tool="codebuddy", target_root=hist_root,
+            workspace_id=wid, warn=warn,
+        )
+        self.assertTrue(new_id)
+        self.assertFalse(any("目标工作区" in m and "不存在" in m for m in msgs),
+                          "目标工作区已存在不应触发不存在警告，实际：%r" % msgs)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,7 @@ from unittest import mock
 from ai_env_clone.adapters import get_adapter, list_adapters
 from ai_env_clone.adapters import codebuddy as cb_mod
 from ai_env_clone.adapters.codebuddy import (
+    CodeBuddyAdapter,
     _codebuddy_extension_data_root,
     _rule_item,
     build_items,
@@ -305,6 +306,37 @@ class TestMultiUser(unittest.TestCase):
         self.assertEqual(short_uid(self.uids[0]), self.uids[0][:8] + "…")
         # 短串回退：不足长度原样
         self.assertEqual(short_uid("abc"), "abc")
+
+    def test_preview_path_rewrite_detects_different_user(self) -> None:
+        # 归档来自另一台电脑（源 UUID 与当前不同）-> will_rewrite=True
+        src = self.uids[0]  # 非当前用户
+        entries = [
+            "CodeBuddyExtension/Data/%s/CodeBuddyIDE/%s/history/abc/index.json"
+            % (src, src),
+        ]
+        with mock.patch.object(cb_mod, "_codebuddy_extension_data_root",
+                               return_value=self.data_root), \
+             mock.patch.object(cb_mod, "detect_current_uid",
+                               return_value=self.current):
+            adapter = get_adapter("codebuddy")
+            preview = adapter.preview_path_rewrite(entries)
+        self.assertTrue(preview["will_rewrite"])
+        self.assertEqual(preview["source_uids"], [src])
+        self.assertEqual(preview["current_uid"], self.current)
+
+    def test_preview_path_rewrite_same_user_no_rewrite(self) -> None:
+        # 归档来自同一用户（源 UUID == 当前）-> will_rewrite=False
+        entries = [
+            "CodeBuddyExtension/Data/%s/CodeBuddyIDE/%s/history/abc/index.json"
+            % (self.current, self.current),
+        ]
+        with mock.patch.object(cb_mod, "_codebuddy_extension_data_root",
+                               return_value=self.data_root), \
+             mock.patch.object(cb_mod, "detect_current_uid",
+                               return_value=self.current):
+            adapter = get_adapter("codebuddy")
+            preview = adapter.preview_path_rewrite(entries)
+        self.assertFalse(preview["will_rewrite"])
 
 
 class TestRuleItem(unittest.TestCase):

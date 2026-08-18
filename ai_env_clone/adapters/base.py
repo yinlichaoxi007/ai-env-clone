@@ -144,6 +144,16 @@ class BaseAdapter(ABC):
         """
         return None
 
+    def preview_path_rewrite(self, entries: "Sequence[str]") -> "dict | None":
+        """
+        预览跨电脑还原是否会发生路径重映射，供还原前向用户提示。
+
+        默认实现返回 ``{"will_rewrite": False, "source_uids": [], "current_uid": None}``，
+        即基类不做任何重映射、也不提示。有登录用户 UUID 概念的适配器（如 CodeBuddy）
+        应重写本方法以检测源机器 UUID 与当前用户是否不同。
+        """
+        return {"will_rewrite": False, "source_uids": [], "current_uid": None}
+
     @staticmethod
     def join(root: str, *parts: str) -> str:
         return os.path.join(root, *parts)

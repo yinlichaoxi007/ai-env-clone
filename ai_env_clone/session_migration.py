@@ -35,7 +35,9 @@ import os
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
+
+from .adapters.codebuddy import detect_current_uid, detect_session_root
 
 
 def _longpath(path: str) -> str:
@@ -344,7 +346,8 @@ def _now_iso() -> str:
 
 def migrate_session(source_tool: str, source_path: str,
                      target_tool: str, target_root: str,
-                     scope: str = "", workspace_id: str = "") -> str:
+                     scope: str = "", workspace_id: str = "",
+                     warn: "Callable[[str], None] | None" = None) -> str:
     """统一入口：从 source 解析并以 target 原生格式写出，返回新会话 id。
 
     :param source_tool: "reasonix" / "codebuddy"
@@ -353,7 +356,13 @@ def migrate_session(source_tool: str, source_path: str,
     :param target_root: Reasonix 传 sessions 父目录（projects）；CodeBuddy 传 history 根
     :param scope: Reasonix 目标作用域（项目目录名）
     :param workspace_id: CodeBuddy 目标 workspaceId
+    :param warn: 可选的警告回调。当写入位置可能落在目标机「读不到」的孤立
+        工作区 / 根目录时调用（仍照常写入，仅提示，不阻断）。
     """
+    def _warn(msg: str) -> None:
+        if warn:
+            warn(msg)
+
     if source_tool == "reasonix":
         if source_path.endswith(".jsonl.meta"):
             jsonl = source_path[:-len(".meta")]
@@ -368,9 +377,47 @@ def migrate_session(source_tool: str, source_path: str,
         raise ValueError(f"不支持的源工具: {source_tool}")
 
     if target_tool == "reasonix":
+        # Reasonix 无登录用户 UUID 概念，按项目路径编码隔离（scope）。
+        # 若 target_root 不是本机 Reasonix 当前 projects 根，仅提示落点确认。
+        expected = detect_session_root(detect_current_uid())
+        if expected and os.path.realpath(target_root) != os.path.realpath(expected):
+            _warn(
+                "迁移目标根目录 %s 不是当前登录用户 Reasonix 数据根（%s）。\n"
+                "请确认目标机器上该项目路径与源机器一致，否则会话可能不被索引显示。"
+                % (target_root, expected)
+            )
         return SessionWriter.write_reasonix(session, target_root, scope=scope)
     elif target_tool == "codebuddy":
-        wid = workspace_id or _new_uuid()
+        # CodeBuddy 会话按「项目路径派生的 workspaceId」索引，且外层 Data/<uuid>
+        # 为登录用户标识。落点必须落在当前登录用户的 detect_session_root() 之下，
+        # 否则会话会写进「读不到」的孤立工作区。
+        expected = detect_session_root(detect_current_uid())
+        if expected and os.path.realpath(target_root) != os.path.realpath(expected):
+            _warn(
+                "迁移目标根目录 %s 不是当前登录用户 CodeBuddy 数据根（%s）。\n"
+                "会话将落在其他用户读不到的位置，请确认目标机器项目路径同源。"
+                % (target_root, expected)
+            )
+        wid = workspace_id
+        if not wid:
+            wid = _new_uuid()
+            _warn(
+                "未指定目标 workspaceId，已生成新的随机 workspaceId。\n"
+                "CodeBuddy 按项目路径派生 workspaceId 索引会话，若目标机器不存在该"
+                "随机工作区，会话可能不被索引显示。请确认目标机器项目路径一致，"
+                "或显式传入与源机器对应的 workspaceId。"
+            )
+        else:
+            # 目标工作区在目标机是否存在：不存在则提示（仍写入）。
+            ws_dir = os.path.join(target_root, wid)
+            if not os.path.exists(ws_dir):
+                _warn(
+                    "目标工作区 %s 在目标机器上不存在，已照常写入。\n"
+                    "CodeBuddy 按项目路径派生 workspaceId 索引会话，若该工作区在目标"
+                    "机器未被打开过 / 项目路径不一致，会话可能不被索引显示。\n"
+                    "补救方法：把目标机器项目放到与源机器相同路径，或先打开该工程再重启 IDE。"
+                    % wid
+                )
         return SessionWriter.write_codebuddy(session, target_root, wid)
     else:
         raise ValueError(f"不支持的目标工具: {target_tool}")

@@ -539,3 +539,42 @@ class CodeBuddyAdapter(BaseAdapter):
             return "/".join(out)
 
         return _rewrite
+
+    @staticmethod
+    def _scan_source_uids(entries: "Sequence[str]") -> "list[str]":
+        """从归档条目名中扫描源机器登录用户 UUID（``Data/<uuid>/CodeBuddyIDE/<uuid>``）。
+
+        返回去重后的源 UUID 列表（可能为空）。仅用于「跨电脑还原前向用户提示」，
+        不依赖 Windows 路径前缀。
+        """
+        found: list[str] = []
+        for name in entries or []:
+            parts = name.replace("\\", "/").split("/")
+            n = len(parts)
+            i = 0
+            while i + 3 < n:
+                if (
+                    parts[i] == "Data"
+                    and _looks_like_uuid(parts[i + 1])
+                    and parts[i + 2] == "CodeBuddyIDE"
+                    and _looks_like_uuid(parts[i + 3])
+                ):
+                    if parts[i + 1] not in found:
+                        found.append(parts[i + 1])
+                i += 1
+        return found
+
+    def preview_path_rewrite(self, entries: "Sequence[str]") -> "dict | None":
+        """预览跨电脑还原是否会发生登录用户 UUID 重映射，供还原前向用户提示。
+
+        返回 ``{"will_rewrite": bool, "source_uids": [...], "current_uid": str|None}``；
+        本机未登录（取不到 UUID）时不返回 ``None`` 而是 ``will_rewrite=False``。
+        """
+        new_uid = detect_current_uid()
+        src_uids = self._scan_source_uids(entries)
+        will = bool(new_uid) and bool(src_uids) and any(u != new_uid for u in src_uids)
+        return {
+            "will_rewrite": will,
+            "source_uids": src_uids,
+            "current_uid": new_uid,
+        }
