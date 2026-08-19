@@ -129,9 +129,13 @@ jobs:
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # 含 rc/beta/alpha/preview/dev 等标识即预发布；
+          # 纯 v1.2.3 这类稳定版本才标记正式版。
           case "$TAG" in
-            v*) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
-            *)  echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+            *[Rr][Cc]*|*[Bb][Ee][Tt][Aa]*|*[Aa][Ll][Pp][Hh][Aa]*|*[Pp][Rr][Ee][Vv][Ii][Ee][Ww]*|*[Dd][Ee][Vv]*)
+              echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
           esac
 
       - name: List assets
