@@ -193,7 +193,8 @@ jobs:
           echo "== upload assets =="
           for f in assets/*; do
             echo "uploading $(basename "$f")"
-            curl -sS -X POST "https://gitee.com/api/v5/repos/$REPO/releases/$RID/attach_files" \
-                 --data-urlencode "access_token=$GITEE_TOKEN" \
+            # 注意：curl 不允许 -F(multipart) 与 --data-urlencode 混用（exit 2），
+            # 因此 access_token 放 URL query string，文件用 -F 上传。
+            curl -sS -X POST "https://gitee.com/api/v5/repos/$REPO/releases/$RID/attach_files?access_token=$GITEE_TOKEN" \
                  -F "file=@$f" -w "\nHTTP %{http_code}\n"
           done
