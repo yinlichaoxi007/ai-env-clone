@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.asset }}
+    name: Build ${{ matrix.artifact }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -151,15 +151,20 @@ jobs:
 
       # 镜像 Release 到 Gitee（需仓库配置 GITEE_TOKEN secret）。
       # 需要 Gitee 上已存在同 tag（mirror-to-gitee.yml 已同步 git 与 tag）。
+      # 注意：secrets 不允许用在 if 条件中（workflow 解析会失败），
+      # 因此通过 env 传入，脚本内检查空值跳过。
       - name: Sync release to Gitee
-        if: ${{ secrets.GITEE_TOKEN != '' }}
         env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN || '' }}
           TAG: ${{ steps.meta.outputs.tag }}
           PRERELEASE: ${{ steps.meta.outputs.prerelease }}
         shell: bash
         run: |
           set -e
+          if [ -z "$GITEE_TOKEN" ]; then
+            echo "GITEE_TOKEN 未配置，跳过 Gitee 同步"
+            exit 0
+          fi
           REPO="yinlichaoxi007/ai-env-clone"
           echo "== check existing Gitee release: $TAG =="
           RID=$(curl -sS -G "https://gitee.com/api/v5/repos/$REPO/releases/tags/$TAG" \
