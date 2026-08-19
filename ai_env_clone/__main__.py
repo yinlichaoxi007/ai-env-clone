@@ -1389,6 +1389,9 @@ class QoderBackupApp:
                 strict=strict,
                 match_structure=self.adapter.match_structure,
                 path_rewrite=self.adapter.restore_path_rewrite(),
+                restore_post_hook=self.adapter.restore_post_hook(),
+                restore_index_merge=self.adapter.restore_index_merge(),
+                restore_index_merge_paths=self.adapter.restore_index_merge_paths(),
             )
             extra = "\n回滚快照：%s" % r["rollback"] if r["rollback"] else ""
             if r["blocked"]:

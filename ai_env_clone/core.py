@@ -631,6 +631,9 @@ def import_backup(
     strict: bool = False,
     match_structure: "Callable[[Sequence[str]], tuple[bool, list[str]]] | None" = None,
     path_rewrite: "Callable[[str], str] | None" = None,
+    restore_post_hook: "Callable[[str, list[str]], None] | None" = None,
+    restore_index_merge: "Callable[[str, bytes, bytes], bytes] | None" = None,
+    restore_index_merge_paths: "Sequence[str] | None" = None,
 ) -> dict:
     """
     恢复备份到根目录。
@@ -656,6 +659,29 @@ def import_backup(
         列表残留，但点开看不到具体对话内容）。返回 ``None`` 表示不改写。
         注意：重写仅改变落盘位置，回滚快照的「被覆盖文件」判定也基于重写后的
         目标路径，确保回滚能正确对照新位置。
+    :param restore_post_hook: 还原落盘全部完成后调用的回调
+        ``callback(root_real, restored_targets)``。``root_real`` 为经
+        ``os.path.realpath`` 解析的目标根目录；``restored_targets`` 为本次
+        实际落盘写入的**目标文件绝对路径**列表（不含被跳过项）。
+        用于跨电脑还原时修正「被整体覆盖的全局索引文件」——典型场景：
+        某工具的工作区名存在一个全局索引（如 DSH 的 ``storages/workspace.json``），
+        直接覆盖写入会抹掉目标机器原本的其他工作区，使它们变成 ``ungrouped``；
+        适配器可在本回调里把源索引与目标机器已有索引**合并**而非覆盖。
+        返回 ``None`` 表示不挂载任何后处理。
+    :param restore_index_merge: 针对「会被整体覆盖的全局索引文件」的合并回调
+        ``callback(relpath, source_bytes, original_bytes) -> merged_bytes``：
+        - ``relpath``：归档内相对路径（经 ``path_rewrite`` 重写后的目标相对路径）；
+        - ``source_bytes``：备份包里该文件的原始字节；
+        - ``original_bytes``：还原前目标机器上该文件的已有字节（不存在则为 ``b""``）；
+        - 返回：应写入目标的合并后字节。
+        仅当 ``relpath`` 出现在 ``restore_index_merge_paths`` 中时被调用，
+        用于跨电脑还原时把源索引与本机已有索引**合并**而非覆盖（避免抹掉本机
+        其他工作区）。与 ``restore_post_hook`` 互斥取舍：合并需在覆盖**前**拿到
+        本机旧内容，故用本参数；若不需旧内容、只做末端修补则用 ``restore_post_hook``。
+    :param restore_index_merge_paths: 需要走 ``restore_index_merge`` 的相对路径**后缀**集合
+        （如 ``["storages/workspace.json"]``）。匹配采用**后缀判定**：归档内成员名相对公共根
+        带根占位前缀（如 ``C__Users_x/.dsh/storages/workspace.json``），故只要成员名以
+        ``/<声明片段>`` 结尾即视为命中，避免写死根前缀而失效。``None`` 表示不启用合并。
     :return: {'restored': int, 'skipped': int, 'blocked': [str], 'rollback': str|None,
               'kind': str|None, 'tool': str|None, 'source_root': str|None,
               'structure_match': bool|None, 'structure_missing': list[str]}
@@ -718,6 +744,7 @@ def import_backup(
     restored = skipped = 0
     blocked: list[str] = []
     restored_dbs: list[str] = []
+    restored_targets: list[str] = []
 
     with zipfile.ZipFile(zip_path, "r") as zf:
         members = [
@@ -776,13 +803,43 @@ def import_backup(
                 skipped += 1
                 continue
 
+            # 该文件是否属于「需合并而非覆盖的全局索引」
+            # 注意：归档内成员名相对公共根，带「根占位前缀」（如 ``C__Users_x/.dsh/...``，
+            # 或 macOS/Linux 下的 ``Users/x/.dsh/...``），故 ``restore_index_merge_paths``
+            # 里声明的相对片段用**后缀匹配**（不以完整路径相等判定），避免写死根前缀而失效。
+            # 成员名已统一规范为正斜杠，Windows 反斜杠亦兜底替换。
+            arcname_norm = arcname.replace("\\", "/")
+            merge_paths_norm = (
+                {("/" + p.replace("\\", "/").lstrip("/")) for p in restore_index_merge_paths}
+                if restore_index_merge_paths is not None
+                else None
+            )
+            needs_merge = (
+                restore_index_merge is not None
+                and merge_paths_norm is not None
+                and any(arcname_norm.endswith(suffix) for suffix in merge_paths_norm)
+            )
+
             progress(ProgressInfo(idx, total, "恢复 %s" % m.filename))
             parent = os.path.dirname(target)
             os.makedirs(_longpath(parent), exist_ok=True)
             try:
-                with zf.open(m) as src, open(_longpath(target), "wb") as dst:
-                    shutil.copyfileobj(src, dst, 1024 * 256)
+                if needs_merge:
+                    # 合并写入：读源字节 + 本机原有字节，交由适配器合并后再落盘，
+                    # 避免直接覆盖抹掉目标机器原本的其他工作区（如 DSH 的 ungrouped 问题）。
+                    source_bytes = zf.read(m)
+                    original_bytes = b""
+                    if os.path.isfile(_longpath(target)):
+                        with open(_longpath(target), "rb") as oh:
+                            original_bytes = oh.read()
+                    merged = restore_index_merge(arcname_norm, source_bytes, original_bytes)
+                    with open(_longpath(target), "wb") as dst:
+                        dst.write(merged)
+                else:
+                    with zf.open(m) as src, open(_longpath(target), "wb") as dst:
+                        shutil.copyfileobj(src, dst, 1024 * 256)
                 restored += 1
+                restored_targets.append(target)
                 if target.lower().endswith((".db", ".sqlite")):
                     restored_dbs.append(target)
             except OSError as exc:
@@ -798,6 +855,18 @@ def import_backup(
                     pass
 
     progress(ProgressInfo(total, total, "完成"))
+
+    # 还原后处理：交由适配器修正「被整体覆盖的全局索引文件」（如 DSH 的
+    # workspace.json 工作区索引），避免覆盖目标机器原有的工作区关联。
+    # 即便 hook 内部抛错也不应中断已完成的还原，记录但不向上抛，
+    # 让 GUI 仍能报告还原成功（索引合并失败可手动补救）。
+    if restore_post_hook is not None and restored_targets:
+        try:
+            restore_post_hook(root_real, restored_targets)
+        except Exception:  # pragma: no cover - 防御性兜底，避免破坏已完成的还原
+            import traceback
+            traceback.print_exc()
+
     return {
         "restored": restored,
         "skipped": skipped,
