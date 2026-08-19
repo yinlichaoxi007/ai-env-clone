@@ -8,7 +8,7 @@
 
 ## 简介
 
-`ai-env-clone` 帮助你把本地 AI 编程工具（如 Qoder）积累的**记忆（memory）**、**会话历史（chat history）**、**规则（rules）** 等用户核心数据，打包成一个离线备份文件，方便在新电脑上完整恢复，避免重新训练和丢失上下文。
+`ai-env-clone` 帮助你把本地 AI 编程工具（如 Qoder、CodeBuddy、Reasonix、DeepSeek Harness）积累的**记忆（memory）**、**会话历史（chat history）**、**规则（rules）** 等用户核心数据，打包成一个离线备份文件，方便在新电脑上完整恢复，避免重新训练和丢失上下文。
 
 - 🖥️ **双形态**：同一套核心逻辑，既提供命令行（CLI）也提供图形界面（GUI，基于 Python 自带的 tkinter，无需额外安装）。
 - 📦 **零第三方依赖**：运行时不依赖任何第三方库，仅用 Python 标准库。发布版的**单文件 exe 双击即用、无需安装 Python**；从源码运行（`python -m ai_env_clone` 或 `run.bat`）则需本机已装 Python 3.10+。
@@ -26,7 +26,7 @@
 | Qoder CN IDE（独立桌面客户端） | 独立 IDE | **1.10.0** | ✅ 已支持 |
 | CodeBuddy | 桌面 IDE | **4.11.0** | ✅ 已支持 |
 | Reasonix | 桌面 IDE | **1.21.5** | ✅ 已支持 |
-| DeepSeek Harness（DSH） | CLI / Web 智能体框架 | — | ✅ 已支持 |
+| DeepSeek Harness（DSH） | CLI / Web 智能体框架 | **0.1.0-rc.7** | ✅ 已支持 |
 | 其他国内可用工具 | — | — | 🚧 规划中，欢迎贡献适配器 |
 
 > ⚠️ **版本说明**：上表仅列出作者**实测通过**的版本。其他更高/更低版本未经测试，数据结构可能变化，使用前请先在本机做一次「导出 → 校验」验证。
@@ -86,15 +86,18 @@ python build_exe.py --name AiEnvClone            # 在当前平台产出对应�
 python -m ai_env_clone
 ```
 
-启动后：自动检测数据目录 → 勾选要备份的内容 → 点击「导出备份」生成 zip，或「还原备份包」恢复。
+启动后：顶部「AI 工具」下拉选择要备份 / 迁移的工具 → 自动检测数据目录 → 勾选要备份的内容 → 点击「导出备份」生成 zip，或「还原备份包」恢复。
+
+![主界面](docs/images/main_window.png)
 
 GUI 界面要点：
 
+- **AI 工具切换**：顶部下拉切换 Qoder / CodeBuddy / Reasonix / DeepSeek Harness；切换后「数据目录」「备份内容」「当前用户」等区域按所选工具刷新。
 - **数据根识别状态区**：位于「数据目录」与「当前用户」之间，自动列出该工具在用户主目录下识别到的各个数据根目录（含完整相对路径），未找到的根以灰显 `✗` 标注；若完全未识别到数据目录会提示需手动指定。该区域最多显示约两行，根目录过多时显示竖向滚动条，避免把主窗口整体高度撑高。
 - **备份内容路径可见**：每个备份项的说明文字后附带其相对于数据目录的具体路径，方便确认备份范围。
 - **未找到项标红**：当数据目录未正确识别时，备份内容中找不到的每一项会标红并注明「（未找到）」，备份内容区右上角同时显示「N 项未找到」；已勾选项保持不变，仅作提示，不会自动取消勾选。
 - **估算大小**：点击「估算大小」按钮可预估所选备份项打包后的体积。
-- **高分屏适配**：窗口声明 DPI 感知（Per-Monitor v2），缩放系数超过 100% 时不会被系统虚化放大；备份内容区高度统一为固定值（与工具/项数无关），切换任意已支持工具时内容区高度完全一致，内容过多时由滚动条承载。主窗口高度**自适应内容**（上限屏幕高度 92%、下限 460px），内容少的工具（如 Qoder）窗口更紧凑，底部不再有大面积空白。
+- **高分屏适配**：窗口声明 DPI 感知（Per-Monitor v2），缩放系数超过 100% 时不会被系统虚化放大；备份内容区高度统一为固定值（与工具/项数无关），切换任意已支持工具时内容区高度完全一致，内容过多时由滚动条承载。主窗口高度**自适应内容**（上限屏幕高度 92%、下限 460px），内容少的工具窗口更紧凑，底部不再有大面积空白。
 
 也可双击仓库内的 `run.bat`（Windows，需本机已装 Python 3.10+）一键启动。
 
@@ -114,7 +117,7 @@ python -m ai_env_clone --restore --in ./my-backup.zip
 
 ### 备份包说明
 
-- 备份产物是一个标准 `.zip` 文件，文件名形如 `<工具名>_backup_<时间戳>.zip`（例如 `qoder_backup_20260805_095519.zip`）。包内含 `qoder_backup_manifest.json` 清单，记录 `kind`（类型）、`tool`（工具名）、`created_at`（创建时间）、`source_root`（来源目录）、`items`（包含模块）、文件数等。
+- 备份产物是一个标准 `.zip` 文件，文件名形如 `<工具名>_backup_<时间戳>.zip`（例如 `qoder_backup_20260805_095519.zip`）。包内含 `<工具名>_backup_manifest.json` 清单，记录 `kind`（类型）、`tool`（工具名）、`created_at`（创建时间）、`source_root`（来源目录）、`items`（包含模块）、文件数等。
 - 在「备份浏览器」（点「还原备份包」打开）中可查看明细、校验完整性、选择还原。校验结果会显示在列表「完整性」列，切换选择后仍可见。
 - 恢复时会**自动覆盖**同名文件，并在覆盖前在备份目录下的 `backup/<工具名>/` 生成 `<工具名>_rollback_<时间戳>.zip` 回滚快照，可随时还原到恢复前状态，也方便按文件时间信息对比选择。备份默认同样导出到该 `backup/<工具名>/`。
 - **备份目录位置**：与启动方式同级。
@@ -122,6 +125,7 @@ python -m ai_env_clone --restore --in ./my-backup.zip
   - 打包模式（单文件 exe / app / 二进制）：可执行程序是独立分发物，备份目录放在 **exe 同级**的 `backup/<工具名>/`（如 `dist/backup/qoder/`），让程序与它的备份数据在一起，便于随程序一起拷贝/迁移。重打包（`build_exe.py` / `build.bat`）只会覆盖 exe 本身，不会清空 `backup/` 子目录，备份数据安全。
 - **防误还原**：还原时以包内 manifest 的 `kind` 为准，仅改文件名无法骗过校验；若包内记录的 `source_root` 与当前还原目标不一致，会弹窗二次确认，防止覆盖错误目录的数据。备份与回滚快照均可还原。
 - **关于「覆盖 vs 融合」**：恢复时同名文件是**整体覆盖**（覆盖前自动生成回滚快照，可随时还原到覆盖前状态），而不是按内容结构做「追加不同、覆盖相同」的融合。这是**各 AI 工具数据格式的限制**：会话日志是压缩/加密/二进制格式（如 DSH 的 `session.jsonl.zstd`、Qoder 加密的 `local.db`），本工具无法读取其内部结构去逐条合并；对明文 JSON/JSONL 虽可解析，但半吊子的「部分融合」可能造成同一会话在不同机器上内容不一致、甚至让工具无法正常打开数据，比整体覆盖更危险。因此**多台电脑使用时应「串行」而非「交叉并行」**——精确的粒度是**同一工作区的同一会话**：
+  - **例外（安全的索引合并）**：面向「全局索引文件」这类**纯 JSON、结构可完整解析且合并语义明确**的文件，本工具会做**合并而非整体覆盖**，以保住目标机器原有的同名条目。典型即 DSH 的 `storages/workspace.json`（见下节）。
   1. **同一工作区的同一会话**，同一时间只在一台电脑上使用（不同工作区、不同会话互不影响，可并行）；
   2. 换电脑前，先在当前电脑**导出备份**；
   3. 到新电脑后，先**还原该备份**再开始使用；
@@ -129,15 +133,21 @@ python -m ai_env_clone --restore --in ./my-backup.zip
   - harness 自身的设置（含自定义模型配置，如 DSH 的 `settings.yaml`）理论上可按 key 融合，但**没必要**：设置本就应随会话一起串行修改、随备份整体迁移，恢复时同样整体覆盖同名文件即可，避免跨机器设置漂移。
   - 若某台电脑上已经产生了新数据（还原目标里已有备份之外的会话/记忆），还原前请先手动导出该电脑的备份（或直接使用自动生成的回滚快照），确保新旧数据各有一份可回退的副本，再决定保留哪一侧。
 
-### 跨电脑还原：CodeBuddy 会话 UUID 自动重映射
+### 跨电脑还原：登录用户 UUID 自动重映射
 
-CodeBuddy 的集中会话/检查点按**登录用户 UUID** 分目录存放（`CodeBuddyExtension/Data/<uuid>/CodeBuddyIDE/<uuid>/`）。备份把该 UUID 固化进归档相对路径，直接按原路径还原到新电脑会写进一个**当前登录用户读不到的「死目录」**——表现为「历史会话列表看得到、点开却没内容」。
+部分工具的会话 / 记忆按**登录用户 UUID** 分目录存放（例如 CodeBuddy 的 `CodeBuddyExtension/Data/<uuid>/CodeBuddyIDE/<uuid>/`）。备份把该 UUID 固化进归档相对路径，直接按原路径还原到新电脑会写进一个**当前登录用户读不到的「死目录」**——表现为「历史会话列表看得到、点开却没内容」。
 
-还原时本工具会自动把旧 UUID 重映射为本机**当前登录用户 UUID**（启发式取 `Data` 下最近活动的 UID），确保会话落到本机 CodeBuddy 实际读取的目录。若本机从未登录过 CodeBuddy（取不到 UUID），则保持原路径、不做重写，至少不破坏备份。
+还原时本工具会自动把旧 UUID 重映射为本机**当前登录用户 UUID**（启发式取该数据目录下最近活动的 UID），确保会话落到本机工具实际读取的目录。若本机从未登录过该工具（取不到 UUID），则保持原路径、不做重写，至少不破坏备份。
+
+### 跨电脑还原：全局索引文件合并
+
+某些工具的工作区 / 会话名**不只靠目录遍历得到**，还依赖一个全局索引文件（例如 DSH 的 `~/.dsh/storages/workspace.json`，记录工作区名 → 会话 ID 列表；工作区名来自索引而非目录名）。若还原时直接整体覆盖写入备份里带来的索引文件，会**抹掉目标机器原本的其他工作区 / 会话**，使它们在界面里变成「未分组 / 找不到」（磁盘内容都在，只是索引里查不到本机条目）。
+
+还原时本工具对这类**纯 JSON、结构可完整解析且合并语义明确的全局索引文件**走**合并而非覆盖**：以目标机器还原前的索引为基底，并入备份里带来的源条目，列表类字段去重合并，**绝不删除本机原有的条目**。其中每个条目的 `path` / `title` 等定位字段始终采用**本机真实路径**（备份里固化的是源机器绝对路径，跨电脑无效，故不采用），其余可合并字段并入。这样源机器迁移来的条目、与目标机器原本的条目可共存，都不会变成「未分组」。具体哪些索引文件参与合并由各工具适配器声明（见 `restore_index_merge_paths` / `restore_index_merge`）。
 
 ### 深层会话消息长路径修复（Windows）
 
-CodeBuddy 会话消息文件层级深（`history/<ws>/<sid>/messages/<id>.json`），其绝对路径常超过 Windows 的 **260 字符 MAX_PATH** 限制。旧版在扫描/`getsize`/`open` 时因 `WinError 3`（系统找不到指定的路径）**静默丢弃全部 `messages/` 文件**——表现为「历史会话列表看得到、点开却没内容」。**当前版本已对所有文件操作加 `\\?\` 长路径前缀**（`scan_items` 的 `os.walk` 入口目录与 `getsize`、`export_backup` 的 `zf.write`、`import_backup` 全程），深层会话消息可完整备份与还原。其中 `os.walk` 入口目录加前缀尤为关键：未加时超 260 的会话目录根本扫不进去、`scan_items` 直接返回空、导出报"没扫到文件"，比单文件 `getsize` 失败更彻底。
+部分工具的会话消息文件层级很深（例如 CodeBuddy 的 `history/<ws>/<sid>/messages/<id>.json`），其绝对路径常超过 Windows 的 **260 字符 MAX_PATH** 限制。旧版在扫描/`getsize`/`open` 时因 `WinError 3`（系统找不到指定的路径）**静默丢弃全部 `messages/` 文件**——表现为「历史会话列表看得到、点开却没内容」。**当前版本已对所有文件操作加 `\\?\` 长路径前缀**（`scan_items` 的 `os.walk` 入口目录与 `getsize`、`export_backup` 的 `zf.write`、`import_backup` 全程），深层会话消息可完整备份与还原。其中 `os.walk` 入口目录加前缀尤为关键：未加时超 260 的会话目录根本扫不进去、`scan_items` 直接返回空、导出报"没扫到文件"，比单文件 `getsize` 失败更彻底。
 
 ## 架构
 
@@ -209,7 +219,7 @@ build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 /
 
 ## Introduction
 
-`ai-env-clone` helps you package the **memory**, **chat history** and **rules** accumulated by your local AI coding tools (e.g. Qoder) — the user's core, irreproducible data — into an offline backup archive, so you can fully restore them on a new machine without retraining or losing context.
+`ai-env-clone` helps you package the **memory**, **chat history** and **rules** accumulated by your local AI coding tools (e.g. Qoder, CodeBuddy, Reasonix, DeepSeek Harness) — the user's core, irreproducible data — into an offline backup archive, so you can fully restore them on a new machine without retraining or losing context.
 
 - 🖥️ **Dual mode**: one core, both CLI and GUI (GUI via Python's built-in tkinter, no extra install).
 - 📦 **Zero runtime dependencies**: standard library only at runtime; the packaged single-file exe runs by double-click.
@@ -227,7 +237,7 @@ build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 /
 | Qoder CN IDE (standalone desktop client) | Standalone IDE | **1.10.0** | ✅ Supported |
 | CodeBuddy | Desktop IDE | **4.11.0** | ✅ Supported |
 | Reasonix | Desktop IDE | **1.21.5** | ✅ Supported |
-| DeepSeek Harness (DSH) | CLI / Web agent framework | — | ✅ Supported |
+| DeepSeek Harness (DSH) | CLI / Web agent framework | **0.1.0-rc.7** | ✅ Supported |
 | Other China-usable tools | — | — | 🚧 Planned — adapters welcome |
 
 > ⚠️ **Version note**: only author-tested versions are listed above. Untested higher/lower versions may have changed data layouts — do an Export→Verify on your machine first.
@@ -298,15 +308,18 @@ python build_exe.py --name AiEnvClone            # produces the platform-native 
 python -m ai_env_clone
 ```
 
-Auto-detect data dir → check items → "导出备份" (export) to make a zip, or "还原备份包" (restore) to recover.
+Select the AI tool from the top dropdown → auto-detect data dir → check items → "导出备份" (export) to make a zip, or "还原备份包" (restore) to recover.
+
+![main window](docs/images/main_window.png)
 
 GUI highlights:
 
+- **AI tool switcher**: top dropdown to switch between Qoder / CodeBuddy / Reasonix / DeepSeek Harness; the data-directory, backup-content, and current-user areas refresh for the selected tool.
 - **Data-root detection status**: shown between the data-directory field and the current-user selector; lists each detected data root under the user home (with its relative path). Missing roots are marked with a greyed `✗`; if nothing is detected, the tool prompts you to specify the directory manually. The area shows at most ~2 rows; when more roots are detected a vertical scrollbar appears, so the main window height is not pushed up.
 - **Backup-item paths visible**: each backup item shows its concrete relative path after its description, so you can confirm the backup scope.
 - **Missing items highlighted**: when the data directory is not correctly detected, every item that cannot be found is shown in red and labelled "(未找到 / not found)"; the top-right of the backup list also shows "N 项未找到" (N items not found). Already-checked items keep their state — only a hint, no auto-uncheck.
 - **Estimate size**: click "估算大小" (estimate size) to preview the packed size of selected items.
-- **Hi-DPI support**: the window declares DPI awareness (Per-Monitor v2), so it is not blurry-scaled by the OS when the scaling factor exceeds 100%. The backup content area uses a fixed uniform height (independent of tool/item count), so switching between any supported tools keeps the content area height identical; when content overflows a scrollbar appears. The **main window height is adaptive** — it fits the content (capped at 92% of screen height, floored at 460px), so tools with less content (e.g. Qoder) get a more compact window with no large blank gap at the bottom.
+- **Hi-DPI support**: the window declares DPI awareness (Per-Monitor v2), so it is not blurry-scaled by the OS when the scaling factor exceeds 100%. The backup content area uses a fixed uniform height (independent of tool/item count), so switching between any supported tools keeps the content area height identical; when content overflows a scrollbar appears. The **main window height is adaptive** — it fits the content (capped at 92% of screen height, floored at 460px), so tools with less content get a more compact window with no large blank gap at the bottom.
 
 On Windows you can also double-click `run.bat` (requires Python 3.10+ installed locally).
 
@@ -323,7 +336,7 @@ python -m ai_env_clone --restore --in ./my-backup.zip
 
 ### About the backup archive
 
-- A standard `.zip` named `<tool>_backup_<timestamp>.zip`, with a `qoder_backup_manifest.json` (kind, tool, creation time, source dir, modules, file count, …).
+- A standard `.zip` named `<tool>_backup_<timestamp>.zip`, with a `<tool>_backup_manifest.json` (kind, tool, creation time, source dir, modules, file count, …).
 - Viewable via the "备份浏览器" (open from "还原备份包"): inspect details, verify integrity, and choose what to restore.
 - Restore **overwrites** existing files and auto-creates a `<tool>_rollback_<timestamp>.zip` snapshot beforehand in the same `backup/<tool>/` directory, so you can revert anytime. Type is verified against the manifest to prevent accidental restore of a misnamed file.
 - **Backup directory location**: next to the launch method. Source mode (`python -m ai_env_clone` / `run.bat`) → `<repo root>/backup/<tool>/`. Packaged mode (single-file exe / app / binary) → the executable is a standalone distributable, so backups go to `backup/<tool>/` **next to the exe** (e.g. `dist/backup/qoder/`), keeping the program and its data together. Re-packaging (`build_exe.py` / `build.bat`) only overwrites the exe itself and never clears the `backup/` subfolder, so backups are safe.
@@ -332,18 +345,25 @@ python -m ai_env_clone --restore --in ./my-backup.zip
   2. Before switching machines, **export a backup** on the current computer;
   3. On the new computer, **restore that backup first**, then start using the tool;
   4. Never use the same workspace/session concurrently on two computers and then restore back and forth — overwriting loses one side's increments, while merging can produce conflicting data.
+  - **Exception (safe index merge)**: for "global index files" that are **plain JSON with a fully parseable structure and unambiguous merge semantics**, the tool **merges instead of overwriting** so the target machine's existing same-named entries are preserved. The typical case is DSH's `storages/workspace.json` (see next section).
   - Harness settings themselves (including custom model configs, e.g. DSH's `settings.yaml`) could theoretically be merged by key, but there is **no need**: settings should travel with the sessions — modify them serially on one machine, let them migrate with the backup, and restore them by whole-file overwrite like everything else, avoiding cross-machine settings drift.
   - If the restore target already has new data (sessions/memories beyond the backup), first export that computer's own backup manually (or keep the auto-generated rollback snapshot) so both old and new data each have a revertible copy, then decide which side to keep.
 
-### Cross-computer restore: CodeBuddy session UUID auto-remap
+### Cross-computer restore: logged-in user UUID auto-remap
 
-CodeBuddy stores its centralized sessions/checkpoints under the **logged-in user UUID** (`CodeBuddyExtension/Data/<uuid>/CodeBuddyIDE/<uuid>/`). The backup pins this UUID into the archive's relative paths; restoring them verbatim on a new computer would write into a "dead directory" the current user cannot read — showing up as "session list visible, but empty when opened".
+Some tools store sessions / memory under the **logged-in user UUID** (for example CodeBuddy uses `CodeBuddyExtension/Data/<uuid>/CodeBuddyIDE/<uuid>/`). The backup pins this UUID into the archive's relative paths; restoring them verbatim on a new computer would write into a "dead directory" the current user cannot read — showing up as "session list visible, but empty when opened".
 
-On restore, the tool auto-remaps the old UUID to the **current logged-in user UUID** on this machine (heuristically the most recently active UID under `Data`), so sessions land where this machine's CodeBuddy actually reads them. If CodeBuddy has never been logged into on this machine (no UUID found), paths are left unchanged rather than broken.
+On restore, the tool auto-remaps the old UUID to the **current logged-in user UUID** on this machine (heuristically the most recently active UID under that tool's data directory), so sessions land where this machine's tool actually reads them. If the tool has never been logged into on this machine (no UUID found), paths are left unchanged rather than broken.
+
+### Cross-computer restore: global index file merge
+
+For some tools, workspace / session names are **not derived purely from directory traversal** — they also rely on a global index file (for example DSH uses `~/.dsh/storages/workspace.json`, mapping workspace name → session ID list; the workspace name comes from the index, not the directory name). Overwriting such an index file verbatim with the one from the backup would **erase the target machine's other workspaces / sessions**, making them appear as "ungrouped / not found" in the UI (the disk content is all there, only the index no longer knows the local entries).
+
+On restore, the tool **merges rather than overwrites** this kind of **plain-JSON global index with a fully parseable structure and unambiguous merge semantics**: it keeps the target machine's pre-restore index as the base, then folds in the source entries brought by the backup, de-duplicating list fields and **never deleting the target's existing entries**. Each entry's `path` / `title` (and similar locator fields) always uses the **local machine's real path** (the backup hard-codes the source machine's absolute path, which is invalid across machines and is therefore not adopted), while other mergeable fields are folded in. Thus entries migrated from the source machine and entries originally on the target machine can coexist, and neither becomes "ungrouped". Which index files participate in this merge is declared by each tool's adapter (see `restore_index_merge_paths` / `restore_index_merge`).
 
 ### Deep session message long-path fix (Windows)
 
-CodeBuddy session message files are deeply nested (`history/<ws>/<sid>/messages/<id>.json`) and their absolute paths often exceed Windows' **260-char MAX_PATH** limit. Older versions silently dropped every `messages/` file because `getsize`/`open` raised `WinError 3` (path not found) — showing up as "session list visible, but empty when opened". **The current build adds the `\\?\` long-path prefix to all file operations** (`scan_items`'s `os.walk` entry directory and `getsize`, `export_backup`'s `zf.write`, `import_backup` throughout), so deep session messages are backed up and restored completely. The `os.walk` entry-directory prefix is especially critical: without it, session directories over 260 chars are never traversed at all — `scan_items` returns empty and export fails with "no files found", which is more severe than a single-file `getsize` failure.
+Some tools store session message files deeply nested (for example CodeBuddy uses `history/<ws>/<sid>/messages/<id>.json`), and their absolute paths often exceed Windows' **260-char MAX_PATH** limit. Older versions silently dropped all such deep files because `getsize`/`open` raised `WinError 3` (path not found) — showing up as "session list visible, but empty when opened". **The current build adds the `\\?\` long-path prefix to all file operations** (`scan_items`'s `os.walk` entry directory and `getsize`, `export_backup`'s `zf.write`, `import_backup` throughout), so deep session messages are backed up and restored completely. The `os.walk` entry-directory prefix is especially critical: without it, session directories over 260 chars are never traversed at all — `scan_items` returns empty and export fails with "no files found", which is more severe than a single-file `getsize` failure.
 
 ## Architecture
 

@@ -129,6 +129,16 @@ class BaseAdapter(ABC):
         return inspect_backup(zip_path)
 
     def restore(self, zip_path: str, root: str, progress=None, **kw) -> dict:
+        # 自动注入适配器声明的还原修正逻辑（跨电脑迁移用），
+        # 调用方未显式覆盖时才填入默认值，便于 CLI / 测试按需覆盖。
+        if "path_rewrite" not in kw:
+            kw["path_rewrite"] = self.restore_path_rewrite()
+        if "restore_post_hook" not in kw:
+            kw["restore_post_hook"] = self.restore_post_hook()
+        if "restore_index_merge" not in kw:
+            kw["restore_index_merge"] = self.restore_index_merge()
+        if "restore_index_merge_paths" not in kw:
+            kw["restore_index_merge_paths"] = self.restore_index_merge_paths()
         return import_backup(zip_path, root, progress=progress, **kw)
 
     # ------------------------------------------------------------------ #
@@ -153,6 +163,54 @@ class BaseAdapter(ABC):
         应重写本方法以检测源机器 UUID 与当前用户是否不同。
         """
         return {"will_rewrite": False, "source_uids": [], "current_uid": None}
+
+    def restore_index_merge_paths(self) -> "Sequence[str] | None":
+        """
+        返回还原时需要「合并而非覆盖」的归档内相对路径**后缀**集合。
+
+        典型场景：某工具的工作区名存储在一个**全局索引文件**（如 DSH 的
+        ``storages/workspace.json``），直接覆盖写入会抹掉目标机器原本的
+        其他工作区，使这些工作区的会话在界面里显示为 ``ungrouped``。
+
+        声明的值为**后缀片段**（如 ``"storages/workspace.json"``）：归档内成员名相对
+        公共根带根占位前缀（如 ``C__Users_x/.dsh/storages/workspace.json``），core 以
+        ``成员名.endswith("/" + 片段)`` 判定命中，故**不要**写完整绝对路径。命中后 core
+        先读取目标机器已有内容，再调用 :meth:`restore_index_merge` 合并后落盘。
+
+        默认返回 ``None``（不启用合并，走普通覆盖）。
+        """
+        return None
+
+    def restore_index_merge(self) -> "Callable[[str, bytes, bytes], bytes] | None":
+        """
+        返回「全局索引合并」回调 ``callback(relpath, source_bytes, original_bytes) -> merged_bytes``：
+
+        - ``relpath``：归档内相对路径（经 ``path_rewrite`` 重写后的目标相对路径）；
+        - ``source_bytes``：备份包里该文件的原始字节；
+        - ``original_bytes``：还原前目标机器上该文件的已有字节（不存在则为 ``b""``）；
+        - 返回：应写入目标的合并后字节。
+
+        仅当 ``relpath`` 出现在 :meth:`restore_index_merge_paths` 中时由 core 调用。
+        适配器应在此把源索引与本机已有索引**合并**（保留本机原有的全部工作区 /
+        会话），而非简单覆盖。默认返回 ``None``（不做合并）。
+        """
+        return None
+
+    def restore_post_hook(self) -> "Callable[[str, list[str]], None] | None":
+        """
+        还原落盘全部完成后的回调工厂：返回一个 ``callback(root_real, restored_targets)``。
+
+        - ``root_real``：经 ``os.path.realpath`` 解析的目标根目录。
+        - ``restored_targets``：本次实际写入的**目标文件绝对路径**列表。
+
+        用于末端修补「被整体覆盖的全局索引文件」——典型场景：某工具的工作区名
+        存储在一个全局索引（如 DSH 的 ``storages/workspace.json``），直接覆盖
+        会抹掉目标机器原本的其他工作区，使它们显示为 ``ungrouped``。适配器
+        可在此回调里把源机器索引与目标机器已有索引**合并**而非覆盖。
+
+        默认返回 ``None``（不挂载任何后处理）；需要合并索引的适配器应重写本方法。
+        """
+        return None
 
     @staticmethod
     def join(root: str, *parts: str) -> str:

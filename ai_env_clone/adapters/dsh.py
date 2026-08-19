@@ -43,10 +43,11 @@ DSH 数据全部位于 ``~/.dsh/`` 目录下（``$DSH_HOME`` 环境变量可覆�
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
-from ..core import BackupItem
+from ..core import BackupItem, _longpath
 from .base import BaseAdapter, register
 
 
@@ -98,6 +99,103 @@ def _detect_workspace_session_dirs() -> list[str]:
         if os.path.isdir(full) and not name.startswith("."):
             workspace_dirs.append(full)
     return workspace_dirs
+
+
+def _safe_json_load(raw: bytes):
+    """把字节安全解析为 JSON，失败返回 ``None``。"""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return parsed
+
+
+def _merge_values(base, incoming):
+    """
+    递归合并两个值，返回合并结果。
+
+    规则（以「本机为基底，并入源，绝不删除本机条目」）：
+
+    - dict：逐 key 合并——源有的 key 并入；本机已有的 key 递归合并；
+      标量 key 保留**本机值**（重要：``tables.workspaces.<uuid>.path/title``
+      等路径元数据必须用本机真实路径，源的跨电脑绝对路径不可用）。
+    - list：并集去重，本机元素在前、源新增元素追加在后。
+    - 标量：保留本机值（base）。
+    """
+    # 都是 dict -> 递归
+    if isinstance(base, dict) and isinstance(incoming, dict):
+        out = dict(base)
+        for k, iv in incoming.items():
+            if k not in out:
+                out[k] = iv
+            else:
+                out[k] = _merge_values(out[k], iv)
+        return out
+    # 都是 list -> 并集去重（本机在前）
+    if isinstance(base, list) and isinstance(incoming, list):
+        seen = list(base)
+        seen_set = set(base)
+        for x in incoming:
+            if x not in seen_set:
+                seen_set.add(x)
+                seen.append(x)
+        return seen
+    # 其他情况（含标量、或类型不一致）：保留本机值
+    return base
+
+
+def _merge_workspace_index_bytes(
+    relpath: str, source_bytes: bytes, original_bytes: bytes
+) -> bytes:
+    """
+    合并 DSH 的全局工作区索引 ``storages/workspace.json``（core 在覆盖前调用）。
+
+    问题背景：DSH 客户端显示工作区名时**不只遍历** ``sessions/<workspace_dir>/``
+    目录，而是先查全局索引 ``workspace.json``。直接覆盖写入备份里带来的
+    ``workspace.json`` 会**抹掉目标机器原本的其他工作区**，使这些工作区的会话
+    在界面里变成 ``ungrouped``（磁盘内容都在，只是索引里查不到本机工作区名）。
+
+    真实文件结构（三层）：
+    - ``unit``：元数据（``name``/``version``），标量，取本机即可。
+    - ``global``：``{initialized, workspaceIds:[uuid...], archivedSessionIds:[...]}``
+      —— **需合并**；``workspaceIds`` 是本机所有工作区 UUID 列表，整体覆盖会
+      丢掉本机其他工作区（ungrouped 根因之一）。
+    - ``tables.workspaces``：``{uuid: {path, title, sessionIds:[...], createdAt,
+      updatedAt}}`` —— **核心需合并**；每个工作区 UUID 含其会话 ID 列表，整体
+      覆盖同样会丢本机工作区（ungrouped 根因之二）。
+
+    合并策略（保留本机全部工作区，并入源机器新增项，绝不删本机条目）：
+
+    - 以「目标机器还原前已有的 ``workspace.json``」（``original_bytes``）为基底；
+    - 备份里带来的 ``workspace.json``（``source_bytes``）作为**源**；
+    - 递归合并：dict 逐 key 合并、list 并集去重（本机在前）、标量保留本机值；
+    - 特别地：``tables.workspaces.<uuid>`` 已存在时保留本机 ``path``/``title``
+      （本机真实路径），仅把源 ``sessionIds`` 并入本机列表；源新增的 UUID 直接
+      采用源条目（跨电脑迁移来的工作区）。
+    - 返回合并后的 JSON 字节；源损坏则回退保留本机原内容，绝不破坏本机工作区。
+
+    :param relpath: 归档内相对路径（``.dsh/storages/workspace.json`` 等带前缀）。
+    :param source_bytes: 备份包里 ``workspace.json`` 的原始字节。
+    :param original_bytes: 还原前目标机器上该文件的已有字节（不存在则为 ``b""``）。
+    :return: 合并后应写入的 JSON 字节。
+    """
+    source = _safe_json_load(source_bytes)
+    original = _safe_json_load(original_bytes)
+
+    # 源损坏 / 非预期：保留本机，不破坏本机工作区
+    if not isinstance(source, dict):
+        if isinstance(original, dict):
+            return json.dumps(original, ensure_ascii=False, indent=2).encode("utf-8")
+        return source_bytes
+
+    # 本机无原文件：直接采用源（首次还原到空机器）
+    if not isinstance(original, dict):
+        return json.dumps(source, ensure_ascii=False, indent=2).encode("utf-8")
+
+    merged = _merge_values(original, source)
+    return json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
 
 
 def _count_session_files(sessions_root: str) -> int:
@@ -337,3 +435,15 @@ class DSHAdapter(BaseAdapter):
         ``current_uid`` 为兼容性参数（DSH 单用户扁平结构，无 UID 拆分），忽略。
         """
         return build_items(root_dir, _dsh_home())
+
+    def restore_index_merge_paths(self) -> "Sequence[str] | None":
+        """还原时需「合并而非覆盖」的索引文件：DSH 全局工作区索引。
+
+        该文件记录「工作区名 -> 会话 ID 列表」映射；直接覆盖会抹掉目标机器
+        原本的其他工作区，使它们变为 ``ungrouped``。故还原时合并本机已有索引。
+        """
+        return [os.path.join("storages", "workspace.json")]
+
+    def restore_index_merge(self) -> "Callable[[str, bytes, bytes], bytes] | None":
+        """返回 DSH 工作区索引合并回调（见 :func:`_merge_workspace_index_bytes`）。"""
+        return _merge_workspace_index_bytes
