@@ -96,6 +96,27 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # 生成 release notes 需要完整 git 历史来比较 tag 范围
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 项目直接 push 无 PR 流程，GitHub 自动 notes 的 "What's Changed"
+      # 为空只剩 Full Changelog 链接；改为用 git log 列出实际 commit。
+      - name: Generate release notes
+        id: notes
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          PREV_TAG=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ] && [ "$PREV_TAG" != "$TAG" ]; then
+            git log --oneline --no-decorate "$PREV_TAG".."$TAG" > notes.md
+          else
+            git log --oneline --no-decorate "$TAG" > notes.md
+          fi
+          echo "===== notes.md ====="; cat notes.md
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -121,5 +142,5 @@ jobs:
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           files: assets/*
+          body_path: notes.md
           prerelease: ${{ steps.meta.outputs.prerelease }}
-          generate_release_notes: true
