@@ -34,7 +34,7 @@ jobs:
             base_name: AiEnvClone-macos-arm64
             upload_path: dist/AiEnvClone-macos-arm64.app
             zip_app: true
-          - os: macos-13            # Intel (x86_64)
+          - os: macos-15-intel      # Intel (x86_64)，macos-13 已于 2025-12-04 退役
             artifact: AiEnvClone-macos-x86_64
             base_name: AiEnvClone-macos-x86_64
             upload_path: dist/AiEnvClone-macos-x86_64.app
