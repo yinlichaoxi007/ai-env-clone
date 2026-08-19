@@ -179,6 +179,7 @@ jobs:
                   --data-urlencode "access_token=$GITEE_TOKEN" \
                   --data-urlencode "tag_name=$TAG" \
                   --data-urlencode "name=$TAG" \
+                  --data-urlencode "target_commitish=main" \
                   --data-urlencode "body@notes.md" \
                   --data-urlencode "prerelease=$PRERELEASE" || true)
             echo "create response: $RESP"
