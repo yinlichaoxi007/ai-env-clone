@@ -22,6 +22,19 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Windows 控制台默认编码可能是 cp1252，无法打印中文。优先切 UTF-8；
+# 若控制台不允许改编码，退而求其次只把 errors 设为 replace，避免中文打印直接抛异常。
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (ValueError, OSError):
+        try:
+            sys.stdout.reconfigure(errors="replace")
+            sys.stderr.reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass
+
 HERE = Path(__file__).resolve().parent
 ENTRY = HERE / "ai_env_clone" / "__main__.py"
 DIST = HERE / "dist"
