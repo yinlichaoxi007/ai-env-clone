@@ -167,20 +167,22 @@ jobs:
           fi
           REPO="yinlichaoxi007/ai-env-clone"
           echo "== check existing Gitee release: $TAG =="
-          RID=$(curl -sS -G "https://gitee.com/api/v5/repos/$REPO/releases/tags/$TAG" \
-                --data-urlencode "access_token=$GITEE_TOKEN" | \
-                python -c "import sys,json;d=json.load(sys.stdin);print(d.get('id',''))" 2>/dev/null || true)
+          RESP=$(curl -sS -G "https://gitee.com/api/v5/repos/$REPO/releases/tags/$TAG" \
+                 --data-urlencode "access_token=$GITEE_TOKEN" || true)
+          echo "query response: $RESP"
+          RID=$(printf '%s' "$RESP" | python -c "import sys,json;d=json.load(sys.stdin);print(d.get('id',''))" 2>/dev/null || true)
           if [ -n "$RID" ]; then
             echo "already exists, release id=$RID"
           else
             echo "== create Gitee release =="
-            RID=$(curl -sS -X POST "https://gitee.com/api/v5/repos/$REPO/releases" \
+            RESP=$(curl -sS -X POST "https://gitee.com/api/v5/repos/$REPO/releases" \
                   --data-urlencode "access_token=$GITEE_TOKEN" \
                   --data-urlencode "tag_name=$TAG" \
                   --data-urlencode "name=$TAG" \
                   --data-urlencode "body@notes.md" \
-                  --data-urlencode "prerelease=$PRERELEASE" | \
-                  python -c "import sys,json;d=json.load(sys.stdin);print(d.get('id',''))")
+                  --data-urlencode "prerelease=$PRERELEASE" || true)
+            echo "create response: $RESP"
+            RID=$(printf '%s' "$RESP" | python -c "import sys,json;d=json.load(sys.stdin);print(d.get('id',''))" 2>/dev/null || true)
             echo "created, release id=$RID"
           fi
           if [ -z "$RID" ]; then
