@@ -3,6 +3,9 @@ name: Mirror to Gitee
 on:
   push:
     branches: [main, master]
+    # 发布 tag 推送时也镜像，确保 Gitee 上 tag 与 GitHub 一致
+    # （Gitee Release 创建需要同名 tag 已存在）
+    tags: ["v*", "beta*", "rc*", "alpha*"]
   workflow_dispatch:
 
 jobs:

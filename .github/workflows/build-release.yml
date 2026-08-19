@@ -148,3 +148,44 @@ jobs:
           files: assets/*
           body_path: notes.md
           prerelease: ${{ steps.meta.outputs.prerelease }}
+
+      # 镜像 Release 到 Gitee（需仓库配置 GITEE_TOKEN secret）。
+      # 需要 Gitee 上已存在同 tag（mirror-to-gitee.yml 已同步 git 与 tag）。
+      - name: Sync release to Gitee
+        if: ${{ secrets.GITEE_TOKEN != '' }}
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -e
+          REPO="yinlichaoxi007/ai-env-clone"
+          echo "== check existing Gitee release: $TAG =="
+          RID=$(curl -sS -G "https://gitee.com/api/v5/repos/$REPO/releases/tags/$TAG" \
+                --data-urlencode "access_token=$GITEE_TOKEN" | \
+                python -c "import sys,json;d=json.load(sys.stdin);print(d.get('id',''))" 2>/dev/null || true)
+          if [ -n "$RID" ]; then
+            echo "already exists, release id=$RID"
+          else
+            echo "== create Gitee release =="
+            RID=$(curl -sS -X POST "https://gitee.com/api/v5/repos/$REPO/releases" \
+                  --data-urlencode "access_token=$GITEE_TOKEN" \
+                  --data-urlencode "tag_name=$TAG" \
+                  --data-urlencode "name=$TAG" \
+                  --data-urlencode "body@notes.md" \
+                  --data-urlencode "prerelease=$PRERELEASE" | \
+                  python -c "import sys,json;d=json.load(sys.stdin);print(d.get('id',''))")
+            echo "created, release id=$RID"
+          fi
+          if [ -z "$RID" ]; then
+            echo "!! failed to get Gitee release id"
+            exit 1
+          fi
+          echo "== upload assets =="
+          for f in assets/*; do
+            echo "uploading $(basename "$f")"
+            curl -sS -X POST "https://gitee.com/api/v5/repos/$REPO/releases/$RID/attach_files" \
+                 --data-urlencode "access_token=$GITEE_TOKEN" \
+                 -F "file=@$f" -w "\nHTTP %{http_code}\n"
+          done
