@@ -49,15 +49,32 @@ if [ -n "$RID" ]; then
   echo "already exists, release id=$RID"
 else
   echo "== create Gitee release =="
-  RESP=$(curl -sS -X POST "https://gitee.com/api/v5/repos/$REPO/releases" \
-        --data-urlencode "access_token=$GITEE_TOKEN" \
-        --data-urlencode "tag_name=$TAG" \
-        --data-urlencode "name=$TAG" \
-        --data-urlencode "target_commitish=main" \
-        --data-urlencode "prerelease=$PRERELEASE" || true)
-  RID=$(printf '%s' "$RESP" | python -c "import sys,json;d=json.load(sys.stdin);print(d.get('id',''))" 2>/dev/null || true)
+  # Gitee 创建 release 必须带 body（缺省会报 {"messages":["body is missing"]}）。
+  # 优先用 notes.md（构建流程生成），手动补传场景无该文件则用默认说明。
+  BODY_ARGS=()
+  if [ -f notes.md ]; then
+    BODY_ARGS+=(--data-urlencode "body@notes.md")
+  else
+    BODY_ARGS+=(--data-urlencode "body=$TAG (auto-created by gitee_upload.sh)")
+  fi
+  RID=""
+  for attempt in 1 2 3; do
+    RESP=$(curl -sS -X POST "https://gitee.com/api/v5/repos/$REPO/releases" \
+          --data-urlencode "access_token=$GITEE_TOKEN" \
+          --data-urlencode "tag_name=$TAG" \
+          --data-urlencode "name=$TAG" \
+          --data-urlencode "target_commitish=main" \
+          --data-urlencode "prerelease=$PRERELEASE" \
+          "${BODY_ARGS[@]}" || true)
+    RID=$(printf '%s' "$RESP" | python -c "import sys,json;d=json.load(sys.stdin);print(d.get('id',''))" 2>/dev/null || true)
+    if [ -n "$RID" ]; then
+      break
+    fi
+    echo "  create attempt $attempt failed, response: $RESP"
+    sleep 3
+  done
   if [ -z "$RID" ]; then
-    echo "!! failed to create Gitee release, response: $RESP"
+    echo "!! failed to create Gitee release after 3 attempts"
     exit 1
   fi
   echo "created, release id=$RID"
