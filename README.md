@@ -177,7 +177,7 @@ ai_env_clone/                包（import 名 ai_env_clone，产品名 AiEnvClon
 │   └── dsh.py         DeepSeek Harness 适配器（数据在 ~/.dsh，含会话日志/存储索引/用户全局指令）
 └── backup/            备份/恢复执行与回滚快照
 build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 / macOS x86_64 / Linux 可执行程序）
-.github/workflows/     build-release.yml（打 tag 自动构建多平台可执行程序、发布 GitHub Release 并同步 Release 到 Gitee）+ mirror-to-gitee.yml（推送代码与 tag 到 Gitee 镜像）
+.github/workflows/     build-release.yml（打 tag 自动构建多平台可执行程序、发布 GitHub Release 并同步 Release 到 Gitee）+ sync-gitee.yml（手动补传 Gitee 资产）+ mirror-to-gitee.yml（推送代码与 tag 到 Gitee 镜像）
 ```
 
 **多工具扩展**：已采用统一的适配器接口（`detect_root()` / `detect_data_roots()` / `build_items()` / `export()` / `restore()`）。每种 AI 工具对应一个适配器模块，新增工具无需改动主流程，详见 `docs/CONTRIBUTING.md`。
@@ -405,7 +405,7 @@ ai_env_clone/                package (import name ai_env_clone, product name AiE
 │   └── dsh.py         DeepSeek Harness adapter (data under ~/.dsh: session logs / storage indexes / user global instructions)
 └── backup/            backup/restore execution & rollback snapshots
 build_exe.py           package into cross-platform executables via PyInstaller (Windows / macOS arm64 / macOS x86_64 / Linux)
-.github/workflows/     build-release.yml (tag → auto-build multi-platform binaries, publish GitHub Release & sync it to Gitee) + mirror-to-gitee.yml (mirror code & tags to Gitee)
+.github/workflows/     build-release.yml (tag → auto-build multi-platform binaries, publish GitHub Release & sync it to Gitee) + sync-gitee.yml (manual re-upload of release assets to Gitee) + mirror-to-gitee.yml (mirror code & tags to Gitee)
 ```
 
 **Multi-tool**: a unified adapter interface (`detect_root()` / `detect_data_roots()` / `build_items()` / `export()` / `restore()`). Each AI tool maps to one adapter module; adding a tool never touches the main flow. See `docs/CONTRIBUTING.md`.
