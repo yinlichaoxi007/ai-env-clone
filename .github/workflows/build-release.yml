@@ -141,6 +141,22 @@ jobs:
       - name: List assets
         run: ls -la assets
 
+      # 幂等化：重打标签（tag 移动/删除重建）时，GitHub 上可能残留同名旧 release
+      # （删除 tag 不会自动删除 release），softprops/action-gh-release 创建会报
+      # "Too many retries"。先删除已存在的同 tag release 再创建，保证资产是最新构建。
+      - name: Delete existing release (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "== deleting existing release $TAG =="
+            gh release delete "$TAG" --yes
+          else
+            echo "no existing release $TAG"
+          fi
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -156,6 +172,9 @@ jobs:
       - name: Sync release to Gitee
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN || '' }}
+          # GITEE_REBUILD=1：每次构建都删除 Gitee 同名 release 后重建（资产全量上传），
+          # 避免幂等跳过导致 Gitee 残留上一次构建的旧资产。
+          GITEE_REBUILD: "1"
           TAG: ${{ steps.meta.outputs.tag }}
           PRERELEASE: ${{ steps.meta.outputs.prerelease }}
         shell: bash

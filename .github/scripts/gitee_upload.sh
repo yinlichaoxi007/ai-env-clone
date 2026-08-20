@@ -5,7 +5,9 @@
 #   bash .github/scripts/gitee_upload.sh <REPO> <TAG> <PRERELEASE> <ASSETS_DIR>
 #
 # 环境变量：
-#   GITEE_TOKEN   Gitee 私人令牌（必填；为空时跳过并退出 0）
+#   GITEE_TOKEN    Gitee 私人令牌（必填；为空时跳过并退出 0）
+#   GITEE_REBUILD  设为 1 时删除已存在的同 tag release 后重建（资产清空后全量上传），
+#                  用于每次构建都要保证 Gitee 资产是最新产物的场景（默认空=幂等补传）。
 #
 # 说明：
 #   - 幂等：查询 release 现有资产名，已存在的自动跳过，重跑不会重复上传。
@@ -38,6 +40,11 @@ echo "== check existing Gitee release: $TAG =="
 RESP=$(curl -sS -G "https://gitee.com/api/v5/repos/$REPO/releases/tags/$TAG" \
        --data-urlencode "access_token=$GITEE_TOKEN" || true)
 RID=$(printf '%s' "$RESP" | python -c "import sys,json;d=json.load(sys.stdin);print(d.get('id',''))" 2>/dev/null || true)
+if [ -n "$RID" ] && [ "${GITEE_REBUILD:-}" = "1" ]; then
+  echo "== GITEE_REBUILD=1: delete existing release id=$RID, will rebuild =="
+  curl -sS -X DELETE "https://gitee.com/api/v5/repos/$REPO/releases/$RID?access_token=$GITEE_TOKEN" || true
+  RID=""
+fi
 if [ -n "$RID" ]; then
   echo "already exists, release id=$RID"
 else
