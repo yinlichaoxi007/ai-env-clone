@@ -52,6 +52,7 @@ UUID 是登录用户标识，不是项目；``CodeBuddyIDE`` 外层 UUID 同理�
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -412,6 +413,24 @@ def build_items(
                 )
             )
 
+    # 12) 自定义模型配置（~/.codebuddy/models.json，用户级）。默认不勾。
+    #     可能含明文敏感凭证（如各模型的 apiKey / token / 私人令牌等）；备份时脱敏，
+    #     恢复后需用户手动补填这些敏感凭证。敏感项。
+    models_file = os.path.join(codebuddy_home, "models.json")
+    items.append(
+        BackupItem(
+            key="user_models",
+            label="自定义模型配置（models.json）",
+            path=models_file,
+            uid=None,
+            description="CodeBuddy 自定义模型配置（models.json，可能含 apiKey/令牌等敏感凭证）。"
+                        "备份时已脱敏（敏感凭证替换为占位符），恢复后需用户在目标机手动补填。"
+                        "默认不勾。",
+            recommended=False,
+            sensitive=True,
+        )
+    )
+
     return items
 
 
@@ -539,6 +558,70 @@ class CodeBuddyAdapter(BaseAdapter):
             return "/".join(out)
 
         return _rewrite
+
+    # ------------------------------------------------------------------ #
+    # 导出脱敏：models.json 可能含明文敏感凭证，入库前替换为占位符
+    # ------------------------------------------------------------------ #
+    def export_transform_paths(self) -> "Sequence[str] | None":
+        """
+        ``models.json`` 里每个自定义模型可能含明文敏感凭证（apiKey / token / 令牌等），
+        导出前脱敏。
+        """
+        return ["models.json"]
+
+    # 字段名出现这些片段即视为「敏感凭证」，导出时脱敏
+    SENSITIVE_HINTS = (
+        "apikey", "api_key", "token", "secret", "password", "passwd",
+        "accesskey", "access_key", "privatekey", "private_key",
+        "credential", "auth",
+    )
+
+    @staticmethod
+    def _looks_sensitive(key: str) -> bool:
+        k = key.lower()
+        return any(hint in k for hint in CodeBuddyAdapter.SENSITIVE_HINTS)
+
+    def export_transform(self) -> "Callable[[str, bytes], bytes] | None":
+        """
+        扫描 ``models.json``，把任何「名称像敏感凭证」的字段（apiKey、token、secret、
+        私人令牌等）的明文值替换为占位符 ``***REDACTED***``，避免明文凭证落入备份包。
+
+        环境变量引用（``${ENV_VAR}`` 形式）本身不在配置文件里存明文，原样保留（跨电脑
+        只需保证目标机环境变量一致）。非 JSON 内容原样保留，保证恢复后配置结构完整、
+        模型条目仍可见，仅敏感凭证失效需用户在目标机手动补填。
+        """
+        REDACTED = "***REDACTED***"
+
+        def _transform(rel_path: str, source: bytes) -> bytes:
+            text = source.decode("utf-8", "replace")
+            try:
+                data = json.loads(text)
+            except (ValueError, UnicodeDecodeError):
+                return source  # 非 JSON，原样保留
+            changed = False
+
+            def _scrub(obj):
+                nonlocal changed
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if CodeBuddyAdapter._looks_sensitive(k) and isinstance(v, str) and v:
+                            # 仅脱敏「明文凭证」；环境变量引用不含明文，保留原样。
+                            if not (v.startswith("${") and v.endswith("}")):
+                                obj[k] = REDACTED
+                                changed = True
+                        else:
+                            _scrub(v)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        _scrub(item)
+
+            _scrub(data)
+            if not changed:
+                return source
+            # 尽量保留原缩进风格；ensure_ascii=False 保留中文模型名
+            return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+        return _transform
 
     @staticmethod
     def _scan_source_uids(entries: "Sequence[str]") -> "list[str]":

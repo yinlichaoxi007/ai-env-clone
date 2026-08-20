@@ -123,6 +123,8 @@ class BaseAdapter(ABC):
             progress=progress,
             max_file_mb=max_file_mb,
             compresslevel=compresslevel,
+            export_transform=self.export_transform(),
+            export_transform_paths=self.export_transform_paths(),
         )
 
     def inspect(self, zip_path: str) -> dict:
@@ -193,6 +195,36 @@ class BaseAdapter(ABC):
         仅当 ``relpath`` 出现在 :meth:`restore_index_merge_paths` 中时由 core 调用。
         适配器应在此把源索引与本机已有索引**合并**（保留本机原有的全部工作区 /
         会话），而非简单覆盖。默认返回 ``None``（不做合并）。
+        """
+        return None
+
+    def export_transform_paths(self) -> "Sequence[str] | None":
+        """
+        返回导出时需「脱敏变换而非原样入库」的归档内相对路径**后缀**集合。
+
+        典型场景：某配置文件可能含明文敏感凭证（如 CodeBuddy 的 ``models.json`` 里
+        每个自定义模型可能带 ``apiKey``、``token`` 或其他私有凭证）。直接把明文凭证
+        打包进备份 zip 存在泄露风险（zip 可能同步到外部/被他人获取），故在导出阶段把
+        敏感字段替换为占位符，
+        存档不含明文。匹配采用**后缀判定**（与 :meth:`restore_index_merge_paths` 一致）：
+        归档内成员名相对公共根带根占位前缀（如 ``C__Users_x/.codebuddy/models.json``），
+        只要成员名以 ``/`` + 声明片段结尾即命中，避免写死根前缀。
+
+        默认返回 ``None``（不做变换，原样入库）。
+        """
+        return None
+
+    def export_transform(self) -> "Callable[[str, bytes], bytes] | None":
+        """
+        返回「导出脱敏」回调 ``callback(relpath, source_bytes) -> transformed_bytes``：
+
+        - ``relpath``：归档内相对路径（已规范化正斜杠）；
+        - ``source_bytes``：待入库文件的原始字节；
+        - 返回：应写入备份包的改写后字节（如把敏感凭证字段替换为占位符）。
+
+        仅当 ``relpath`` 出现在 :meth:`export_transform_paths` 中时由 core 调用。
+        适配器应在此抹掉明文敏感字段而非简单跳过（跳过会导致恢复后配置缺失、模型不可用）。
+        默认返回 ``None``（不做变换）。
         """
         return None
 

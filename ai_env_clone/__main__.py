@@ -17,6 +17,8 @@ import sys
 import json
 import queue
 import re
+import shutil
+import subprocess
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
@@ -99,8 +101,8 @@ class QoderBackupApp:
         self.root = root
         # 宽度固定、高度动态：初始仅给个合理高度，构建完成后由 _fit_layout()
         # 按实际内容自适应（保证状态栏等完整区域始终可见，不写死过大/过小）。
-        root.geometry("738x560")
-        root.minsize(700, 460)
+        root.geometry("960x560")
+        root.minsize(940, 460)
 
         # 工具切换下拉列出所有已注册适配器（新增适配器后自动出现）。
         # 默认工具：优先沿用用户上次选择（缓存），无缓存/失效时按注册顺序取第一个。
@@ -437,6 +439,23 @@ class QoderBackupApp:
             "勾选后，即使压缩包带有声明文件，也会强制扫描内部数据结构指纹并"
             "校验，用于防止伪造声明文件的恶意备份。\n未勾选时仅在缺少声明文件"
             "时才做结构指纹回退识别。",
+        )
+        # 备份后定位敏感文件：勾选且本次含脱敏项时，自动打开文件夹并打开相关文件，
+        # 并尝试定位到敏感字段（如 apiKey / 令牌等）行，方便用户手动记录凭证。默认勾选。
+        self.locate_sensitive_var = tk.BooleanVar(value=True)
+        locate_cb = ttk.Checkbutton(
+            orow, text="备份后定位敏感文件", variable=self.locate_sensitive_var
+        )
+        locate_cb.pack(side=tk.LEFT, padx=8)
+        _Tooltip(
+            locate_cb,
+            "勾选后（默认），若本次备份包含「含敏感凭证的项」（如 CodeBuddy 的"
+            "自定义模型配置，其中的 apiKey/令牌等已被脱敏为占位符），备份完成时本工具会"
+            "自动打开该文件所在文件夹、用可跳行的编辑器（自动探测 VS Code / Notepad++ /"
+            "Notepad--，优先使用）打开文件并定位光标到敏感字段（如 apiKey/令牌）所在行，"
+            "方便你手动记下这些凭证；若都没装则退化为系统默认程序（如记事本）仅打开文件、"
+            "不跳行。\n不勾选则只弹出文字提醒，不自动打开文件。\n注意：备份包本身不含明文"
+            "凭证，请务必在源机器记下、并在目标机器手动补填。",
         )
         # 压缩方式：置于选项区域，与导出行为相关
         ttk.Label(orow, text="压缩方式：").pack(side=tk.LEFT, padx=(8, 2))
@@ -1058,9 +1077,13 @@ class QoderBackupApp:
                     elif kind == "done":
                         self.busy = False
                         self.pbar["value"] = 0
-                        title, text = payload
+                        title, text = payload[0], payload[1]
+                        reveal = payload[2] if len(payload) > 2 else []
                         self._set_status(title)
                         messagebox.showinfo(title, text)
+                        # 备份完成后若勾选了定位敏感文件，自动打开文件夹并定位脱敏字段
+                        if reveal:
+                            self._reveal_sensitive_files(reveal)
                     elif kind == "error":
                         self.busy = False
                         self.pbar["value"] = 0
@@ -1225,6 +1248,11 @@ class QoderBackupApp:
         root_dir = self.root_dir
         compresslevel = self._compress_levels.get(self.compress_var.get(), DEFAULT_COMPRESS_LEVEL)
         sel_items = self._selected_items()
+        # 敏感项相关：勾选了「定位敏感文件」且存在含敏感凭证的项时，备份后自动打开定位
+        locate_sensitive = self.locate_sensitive_var.get()
+        sensitive_paths = [
+            i.path for i in sel_items if getattr(i, "sensitive", False) and getattr(i, "path", None)
+        ]
 
         def work():
             mf = self.adapter.export(
@@ -1235,19 +1263,32 @@ class QoderBackupApp:
                 max_file_mb=max_mb,
                 compresslevel=compresslevel,
             )
+            sensitive_labels = [i.label for i in sel_items if getattr(i, "sensitive", False)]
+            base_msg = (
+                "备份完成！\n\n文件：%s\n包含：%d 个文件\n原始大小：%s\n压缩后：%s"
+                % (
+                    mf["zip_path"],
+                    mf["file_count"],
+                    human_size(mf["total_bytes"]),
+                    human_size(mf["zip_bytes"]),
+                )
+            )
+            if sensitive_labels:
+                base_msg += (
+                    "\n\n⚠ 安全提醒：本次勾选了含敏感凭证的项（%s）。"
+                    "其中的敏感凭证（apiKey、令牌等）已在备份中脱敏（替换为占位符），"
+                    "备份包不含明文凭证。请在源机器单独记下这些凭证，"
+                    "还原到目标机器后需手动补填，否则对应功能虽可见但无法使用。"
+                    % "、".join(sensitive_labels)
+                )
+                if locate_sensitive:
+                    base_msg += "\n\n已自动打开相关文件并定位到敏感字段，请手动记录后关闭。"
+            # done payload 扩展为三元组：(title, text, reveal_paths)；reveal_paths 为空列表时主线程不定位
+            reveal = sensitive_paths if (locate_sensitive and sensitive_paths) else []
             self.msg_queue.put(
                 (
                     "done",
-                    (
-                        "导出成功",
-                        "备份完成！\n\n文件：%s\n包含：%d 个文件\n原始大小：%s\n压缩后：%s"
-                        % (
-                            mf["zip_path"],
-                            mf["file_count"],
-                            human_size(mf["total_bytes"]),
-                            human_size(mf["zip_bytes"]),
-                        ),
-                    ),
+                    ("导出成功", base_msg, reveal),
                 )
             )
             # 记录本次备份按类别反算的实测压缩率，供后续估算按勾选组成校准
@@ -1257,6 +1298,134 @@ class QoderBackupApp:
                 )
 
         self._run_bg(work)
+
+    # ------------------------------------------------------------------ #
+    # 定位敏感文件：自动探测可用编辑器（VS Code / Notepad++ / Notepad--），
+    # 优先用支持「命令行跳到指定行」的编辑器精确跳转；都不支持时退化为
+    # 用系统默认关联程序（如记事本）仅打开文件、不跳行。
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _find_editor() -> "tuple[str | None, str]":
+        """
+        探测系统可用的、能命令行跳到指定行的编辑器。
+
+        返回 ``(editor_path, kind)``：``kind`` 为 ``"vscode"`` / ``"npp"``（含 Notepad--）
+        / ``"none"``（无可用跳行编辑器，退化为默认程序打开）。
+
+        探测顺序：``code`` → ``notepad++.exe`` → ``notepad--.exe`` / ``np--.exe``，先查
+        ``PATH`` 再查常见安装目录（很多编辑器装了但不在 PATH 里）。
+        """
+        candidates = [
+            ("code", "vscode"),
+            ("notepad++.exe", "npp"),
+            ("notepad--.exe", "npp"),
+            ("np--.exe", "npp"),
+        ]
+        extra_dirs = []
+        if sys.platform.startswith("win"):
+            pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+            pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+            extra_dirs = [
+                os.path.join(pf, "Notepad++"),
+                os.path.join(pf86, "Notepad++"),
+                os.path.join(pf, "Notepad--"),
+                os.path.join(pf86, "Notepad--"),
+                os.path.join(pf, "np--"),
+                os.path.join(pf86, "np--"),
+            ]
+        for name, kind in candidates:
+            path = shutil.which(name)
+            if path:
+                return path, kind
+            for d in extra_dirs:
+                cand = os.path.join(d, name)
+                if os.path.isfile(cand):
+                    return cand, kind
+        return None, "none"
+
+    @staticmethod
+    def _open_editor_at_line(editor: "str | None", kind: str, path: str,
+                             line: "int | None") -> None:
+        """
+        用指定编辑器打开 ``path`` 并尽量跳到 ``line`` 行。
+
+        - ``vscode``：``code -g "<path>:<line>"``
+        - ``npp``（Notepad++ / Notepad--）：``<exe> -n<line> "<path>"``
+        - ``none`` / 无行号：``os.startfile(path)``（系统默认程序，记事本不支持跳行）
+        """
+        if editor and kind == "vscode" and line:
+            subprocess.run([editor, "-g", "%s:%d" % (path, line)], check=False)
+        elif editor and kind == "npp" and line:
+            subprocess.run([editor, "-n%d" % line, path], check=False)
+        else:
+            os.startfile(path)  # type: ignore[attr-defined]
+
+    def _reveal_sensitive_files(self, paths: "list[str]") -> None:
+        """
+        备份完成后自动打开含敏感凭证的原始文件，并尽量定位到敏感字段行。
+
+        - Windows：用 ``explorer /select,"<path>"`` 在资源管理器打开所在文件夹并**高亮该文件**；
+          再用能跳行的编辑器（VS Code / Notepad++ / Notepad--，按可用性自动探测）以
+          ``-g`` / ``-n`` 参数打开并定位到该文件内首个敏感字段（如 apiKey/令牌）所在行；
+          若未装这些编辑器，则退化为 ``os.startfile`` 用系统默认程序（如记事本）仅打开文件、
+          不跳行（记事本不支持命令行跳行）。
+        - 其他平台：``os.startfile`` 打开文件并打开所在文件夹。
+        任何一步失败（找不到字段 / 无编辑器 / 异常）不抛错，只弹一次提示，不影响主流程。
+        """
+        editor, kind = self._find_editor()
+        for p in paths:
+            if not p or not os.path.isfile(p):
+                continue
+            folder = os.path.dirname(p)
+            # 1) 打开所在文件夹并高亮该文件（Windows 用 /select；其他平台退化为打开文件夹）
+            #    注意：explorer 的 /select 必须整体一个参数、路径不再额外加引号，
+            #    且不要 shell=True（否则参数被二次拆分导致只打开文档库而非目标文件夹）。
+            if sys.platform.startswith("win"):
+                try:
+                    subprocess.run(
+                        ["explorer", "/select,", p], check=False, shell=False
+                    )
+                except Exception:  # noqa: BLE001
+                    try:
+                        os.startfile(folder)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+            else:
+                try:
+                    os.startfile(folder)  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001
+                    pass
+            # 2) 打开文件并定位到敏感字段行
+            line = self._first_sensitive_line(p)
+            try:
+                self._open_editor_at_line(editor, kind, p, line)
+            except Exception:  # noqa: BLE001
+                try:
+                    os.startfile(p)  # type: ignore[attr-defined]
+                except Exception:
+                    messagebox.showinfo("打开文件", p)
+
+    # 字段名出现这些片段即视为「敏感凭证」行（与适配器脱敏判定保持一致）
+    _SENSITIVE_HINTS = (
+        "apikey", "api_key", "token", "secret", "password", "passwd",
+        "accesskey", "access_key", "privatekey", "private_key",
+        "credential", "auth",
+    )
+
+    @staticmethod
+    def _first_sensitive_line(path: str) -> "int | None":
+        """返回文件首个敏感字段（apiKey/令牌等明文凭证）所在行号（1-based），找不到返回 None。"""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for n, line in enumerate(f, 1):
+                    low = line.lower()
+                    if "***redacted***" in low:
+                        continue  # 已脱敏占位符，不视为需定位的明文凭证
+                    if any(hint in low for hint in QoderBackupApp._SENSITIVE_HINTS):
+                        return n
+        except OSError:
+            return None
+        return None
 
     def on_import(self) -> None:
         """打开备份浏览器，由用户浏览后选择还原备份或回滚快照。"""
