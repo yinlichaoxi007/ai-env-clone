@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +40,21 @@ HERE = Path(__file__).resolve().parent
 ENTRY = HERE / "ai_env_clone" / "__main__.py"
 DIST = HERE / "dist"
 BUILD = HERE / "build"
+
+
+def cleanup_build_dir() -> None:
+    """清理 PyInstaller 打包产生的中间产物目录 build/（纯缓存，下次打包自动重建）。
+
+    打包成功后删除，避免把临时构建文件留在项目根。删除失败不影响产物，
+    仅提示，可稍后手动清理。
+    """
+    if not BUILD.exists():
+        return
+    try:
+        shutil.rmtree(BUILD)
+        print("已清理打包中间产物目录：%s" % BUILD)
+    except OSError as exc:
+        print("清理 build 目录失败（不影响产物，可稍后手动删除）：%s" % exc, file=sys.stderr)
 
 
 def main() -> int:
@@ -68,6 +84,7 @@ def main() -> int:
 
     if rc == 0:
         print("\n打包完成，产物目录：%s" % DIST)
+        cleanup_build_dir()
     else:
         print("\n打包失败，返回码 %d" % rc)
     return rc
