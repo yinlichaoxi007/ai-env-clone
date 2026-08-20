@@ -157,13 +157,24 @@ jobs:
             echo "no existing release $TAG"
           fi
 
+      # softprops/action-gh-release@v2 是 Node20 action，2025-09 起 GitHub
+      # 强制其在 Node24 上运行，实测上传资产报 "Too many retries" 掩盖真实错误。
+      # 改用 gh CLI 原生创建 + 上传（runner 预装，日志直出具体错误）。
       - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          files: assets/*
-          body_path: notes.md
-          prerelease: ${{ steps.meta.outputs.prerelease }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        shell: bash
+        run: |
+          set -e
+          ls -la assets
+          if [ "${{ steps.meta.outputs.prerelease }}" = "true" ]; then
+            gh release create "$TAG" assets/* \
+              --title "$TAG" --notes-file notes.md --prerelease
+          else
+            gh release create "$TAG" assets/* \
+              --title "$TAG" --notes-file notes.md
+          fi
 
       # 镜像 Release 到 Gitee（需仓库配置 GITEE_TOKEN secret）。
       # 需要 Gitee 上已存在同 tag（mirror-to-gitee.yml 已同步 git 与 tag）。
