@@ -25,6 +25,7 @@ from unittest import mock
 
 from ai_env_clone.adapters import get_adapter, list_adapters
 from ai_env_clone.adapters import codebuddy as cb_mod
+from ai_env_clone.core import BackupItem
 from ai_env_clone.adapters.codebuddy import (
     CodeBuddyAdapter,
     _codebuddy_extension_data_root,
@@ -176,6 +177,7 @@ class TestBuildItems(TempEnv):
             "user_inspiration",
             "user_expert_history",
             "user_plugins",
+            "user_models",
         }
         self.assertEqual(self.prefixes, expected)
 
@@ -197,6 +199,9 @@ class TestBuildItems(TempEnv):
         self.assertFalse(self.by_key["user_inspiration"].recommended)
         self.assertFalse(self.by_key["user_expert_history"].recommended)
         self.assertFalse(self.by_key["user_plugins"].recommended)
+        # 自定义模型配置：默认不勾（含明文 apiKey，属敏感设置类）
+        self.assertFalse(self.by_key["user_models"].recommended)
+        self.assertTrue(self.by_key["user_models"].sensitive)
 
     def test_user_skill_merged(self) -> None:
         # settings.json 与 skills-marketplace/ 共享聚合前缀 user_skill（GUI 合成一行）
@@ -242,6 +247,122 @@ class TestBuildItems(TempEnv):
         # 集中会话各项指向 session_root 下的子目录
         self.assertEqual(self.by_key["user_sessions:history"].path,
                          os.path.join(self.session_root, "history"))
+
+
+class TestModelsJsonRedaction(unittest.TestCase):
+    """
+    CodeBuddy 自定义模型配置（models.json）可能含明文敏感凭证（apiKey、token、私人令牌等）。
+    备份时须脱敏：敏感字段替换为占位符，且配置结构（模型条目/url 等）保留，
+    使恢复后模型仍可见、仅凭证失效需用户手动补填。覆盖两种取值形态：
+    明文凭证 与 环境变量引用（${ENV}），后者不应被改写。
+    """
+
+    SAMPLE = {
+        "models": [
+            {
+                "name": "my-deepseek",
+                "url": "https://api.deepseek.com/v1",
+                "apiKey": "sk-real-secret-0123456789abcdef",
+                "enabled": True,
+            },
+            {
+                "name": "token-model",
+                "url": "https://api.example.com/v1",
+                "token": "tk-real-secret-abcdef123456",
+                "enabled": True,
+            },
+            {
+                "name": "env-model",
+                "url": "https://api.example.com/v1",
+                "apiKey": "${MY_API_KEY}",
+                "enabled": False,
+            },
+        ],
+        "version": 1,
+    }
+
+    def setUp(self) -> None:
+        self.adp = CodeBuddyAdapter()
+
+    def test_export_transform_paths_declares_models_json(self) -> None:
+        paths = self.adp.export_transform_paths()
+        self.assertIsNotNone(paths)
+        self.assertIn("models.json", paths)
+
+    def test_transform_redacts_plaintext_apikey(self) -> None:
+        cb = self.adp.export_transform()
+        self.assertIsNotNone(cb)
+        raw = json.dumps(self.SAMPLE, ensure_ascii=False).encode("utf-8")
+        out = cb("C__Users_x/.codebuddy/models.json", raw)
+        data = json.loads(out.decode("utf-8"))
+        # 明文 apiKey 被脱敏
+        self.assertEqual(data["models"][0]["apiKey"], "***REDACTED***")
+        # 其余字段保留
+        self.assertEqual(data["models"][0]["url"], "https://api.deepseek.com/v1")
+        self.assertEqual(data["models"][0]["name"], "my-deepseek")
+        self.assertEqual(data["version"], 1)
+
+    def test_transform_redacts_other_sensitive_field(self) -> None:
+        # 非 apiKey 的敏感字段（token / 私人令牌等）同样脱敏，不写死 apiKey
+        cb = self.adp.export_transform()
+        raw = json.dumps(self.SAMPLE, ensure_ascii=False).encode("utf-8")
+        out = cb("C__Users_x/.codebuddy/models.json", raw)
+        data = json.loads(out.decode("utf-8"))
+        self.assertEqual(data["models"][1]["token"], "***REDACTED***")
+        self.assertEqual(data["models"][1]["url"], "https://api.example.com/v1")
+
+    def test_transform_keeps_env_reference(self) -> None:
+        # 环境变量引用形式（${...}）不属于明文凭证，不应被改写
+        cb = self.adp.export_transform()
+        raw = json.dumps(self.SAMPLE, ensure_ascii=False).encode("utf-8")
+        out = cb("C__Users_x/.codebuddy/models.json", raw)
+        data = json.loads(out.decode("utf-8"))
+        self.assertEqual(data["models"][2]["apiKey"], "${MY_API_KEY}")
+
+    def test_transform_no_apikey_returns_original(self) -> None:
+        # 无 apiKey 字段时原样返回（字节一致）
+        cb = self.adp.export_transform()
+        sample = {"models": [{"name": "x", "url": "https://u"}]}
+        raw = json.dumps(sample, ensure_ascii=False).encode("utf-8")
+        out = cb("a/b/models.json", raw)
+        self.assertEqual(out, raw)
+
+    def test_transform_non_json_returns_original(self) -> None:
+        cb = self.adp.export_transform()
+        raw = b"this is not json"
+        self.assertEqual(cb("a/b/models.json", raw), raw)
+
+    def test_export_round_trip_redacts_in_zip(self) -> None:
+        # 端到端：导出后 zip 内 models.json 应为脱敏版，明文密钥不落盘
+        tmp = tempfile.mkdtemp(prefix="cb_models_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        cb_home = os.path.join(tmp, "cb_home")
+        os.makedirs(cb_home, exist_ok=True)
+        models_path = os.path.join(cb_home, "models.json")
+        with open(models_path, "w", encoding="utf-8") as f:
+            json.dump(self.SAMPLE, f, ensure_ascii=False)
+
+        # 构造仅含 user_models 的条目并导出
+        items = [
+            BackupItem(
+                key="user_models",
+                label="自定义模型配置",
+                path=models_path,
+                description="",
+                recommended=False,
+                sensitive=True,
+            )
+        ]
+        zip_path = os.path.join(tmp, "out.zip")
+        self.adp.export(zip_path, tmp, items, progress=lambda *a: None)
+
+        import zipfile
+        with zipfile.ZipFile(zip_path) as zf:
+            arc = [n for n in zf.namelist() if n.endswith("models.json")][0]
+            content = zf.read(arc).decode("utf-8")
+        self.assertNotIn("sk-real-secret-0123456789abcdef", content)
+        self.assertIn("***REDACTED***", content)
+        self.assertIn("${MY_API_KEY}", content)
 
 
 class TestMultiUser(unittest.TestCase):

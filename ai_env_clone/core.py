@@ -102,6 +102,7 @@ class BackupItem:
     description: str
     recommended: bool = True
     uid: str | None = None  # 记忆区按 UID 拆分时的用户标识，非记忆项为 None
+    sensitive: bool = False  # 含 apiKey 等敏感凭证，备份时需脱敏、恢复需用户手动补填
 
     @property
     def exists(self) -> bool:
@@ -327,6 +328,8 @@ def export_backup(
     tool_name: str = "unknown",
     extra_meta: dict | None = None,
     kind: str = KIND_BACKUP,
+    export_transform: "Callable[[str, bytes], bytes] | None" = None,
+    export_transform_paths: "Sequence[str] | None" = None,
 ) -> dict:
     """
     导出备份到 zip。
@@ -369,6 +372,11 @@ def export_backup(
         manifest["extra"] = extra_meta
 
     total = scan.file_count
+    transform_paths_norm = (
+        {("/" + p.replace("\\", "/").lstrip("/")) for p in export_transform_paths}
+        if export_transform_paths is not None
+        else None
+    )
     tmp_dir = tempfile.mkdtemp(prefix="aienv_snap_")
     try:
         with zipfile.ZipFile(
@@ -385,16 +393,29 @@ def export_backup(
                         write_from = snap
                     else:
                         snap = None
+                # 命中「需脱敏变换的文件」（按归档内相对路径后缀匹配）：
+                # 读源字节 → 适配器改写 → 以改写后字节写入，避免明文敏感信息入库。
+                rel_norm = rel.replace("\\", "/")
+                hit_transform = (
+                    export_transform is not None
+                    and transform_paths_norm is not None
+                    and any(rel_norm.endswith(suffix) for suffix in transform_paths_norm)
+                )
                 try:
-                    zf.write(_longpath(write_from), arcname=rel)
+                    if hit_transform:
+                        with open(_longpath(write_from), "rb") as fh:
+                            data = export_transform(rel_norm, fh.read())
+                        zf.writestr(rel, data)
+                    else:
+                        zf.write(_longpath(write_from), arcname=rel)
                 except (OSError, PermissionError) as exc:
                     manifest.setdefault("failed", []).append(
                         {"path": rel, "error": str(exc)}
                     )
                 else:
                     # 成功写入才统计；按归档内扩展名归类（SQLite 快照仍记为 .db）
-                    ext = os.path.splitext(rel)[1].lower()
                     info = zf.getinfo(rel)
+                    ext = os.path.splitext(rel)[1].lower()
                     manifest["bytes_by_ext"][ext] = (
                         manifest["bytes_by_ext"].get(ext, 0) + info.file_size
                     )

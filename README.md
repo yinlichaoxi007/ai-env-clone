@@ -37,7 +37,7 @@
 本工具统一按以下原则划分「备份内容」的默认勾选状态（各适配器一致，适用于所有已支持的工具）：
 
 - ✅ **默认勾选（推荐项）**：**会话历史、记忆、规则** —— 这些是无法从零重复创建的用户核心数据，丢失即不可逆，故默认勾选，建议连同一起备份。
-- ⬜ **默认不勾选（可选）**：**插件、扩展、MCP、skill、灵感、索引、设置** —— 这些属于程序配置或可由工具自身从零重建的内容，默认不勾，按需自行勾选。
+- ⬜ **默认不勾选（可选）**：**插件、扩展、MCP、skill、灵感、索引、设置、自定义模型配置** —— 这些属于程序配置或可由工具自身从零重建的内容，默认不勾，按需自行勾选。
 - 🚫 **不列入备份选项**：**本地缓存、运行态记录、日志** —— 这些纯属程序自身的临时/运行数据，与用户数据无关，不生成备份条目，无论是否勾选都不会备份。
 
 > 注：不同工具内部目录命名不同（如「设置」可能是 `argv.json`/`config.toml`/项目级 `settings.json`），但均按上述类别归入对应勾选状态。
@@ -145,6 +145,18 @@ python -m ai_env_clone --restore --in ./my-backup.zip
 
 还原时本工具对这类**纯 JSON、结构可完整解析且合并语义明确的全局索引文件**走**合并而非覆盖**：以目标机器还原前的索引为基底，并入备份里带来的源条目，列表类字段去重合并，**绝不删除本机原有的条目**。其中每个条目的 `path` / `title` 等定位字段始终采用**本机真实路径**（备份里固化的是源机器绝对路径，跨电脑无效，故不采用），其余可合并字段并入。这样源机器迁移来的条目、与目标机器原本的条目可共存，都不会变成「未分组」。具体哪些索引文件参与合并由各工具适配器声明（见 `restore_index_merge_paths` / `restore_index_merge`）。
 
+### 敏感凭证脱敏（自定义模型配置）
+
+部分工具的配置文件内**可能直接含明文敏感凭证**，典型即 CodeBuddy 的自定义模型配置 `~/.codebuddy/models.json`——每个自定义模型条目可能带明文 `apiKey`、令牌或其他私有凭证。把明文凭证打包进备份 zip 存在泄露风险（备份可能被同步到外部、或落到他人手中）。
+
+为此，本工具在**导出阶段即脱敏**：命中该类文件时，把任何「名称像敏感凭证」的字段（`apiKey`、`token`、`secret`、`password` 等）替换为占位符 `***REDACTED***`，**备份包不含任何明文凭证**；同时保留其余配置（模型名、url 等），还原后该模型在工具里仍可见，仅凭证失效。
+
+> - **明文凭证**（`apiKey: "sk-..."`、`token: "tk-..."` 等）：脱敏为占位符。
+> - **环境变量引用**（`apiKey: "${MY_API_KEY}"` 形式）：**原样保留**——它本身不在配置文件里存明文，跨电脑只需保证目标机存在同名环境变量即可，无需改动配置。
+> - 勾选了含敏感凭证的备份项时，备份完成界面会**额外弹出安全提醒**，提示你需在源机器单独记下这些凭证、并在目标机手动补填，否则还原后对应功能虽可见却无法使用。
+
+需注意：本工具**不备份环境变量本身**（它存在于系统/Shell 配置中，不属任何工具数据目录），因此即便凭证用了环境变量引用，目标机若没有对应环境变量，仍需你手动在目标机配置一次。这是「安全（备份包不含凭证）」与「方便（跨电脑即取即用）」之间必要的权衡：凭证始终只存在于你掌控的环境里。
+
 ### 深层会话消息长路径修复（Windows）
 
 部分工具的会话消息文件层级很深（例如 CodeBuddy 的 `history/<ws>/<sid>/messages/<id>.json`），其绝对路径常超过 Windows 的 **260 字符 MAX_PATH** 限制。旧版在扫描/`getsize`/`open` 时因 `WinError 3`（系统找不到指定的路径）**静默丢弃全部 `messages/` 文件**——表现为「历史会话列表看得到、点开却没内容」。**当前版本已对所有文件操作加 `\\?\` 长路径前缀**（`scan_items` 的 `os.walk` 入口目录与 `getsize`、`export_backup` 的 `zf.write`、`import_backup` 全程），深层会话消息可完整备份与还原。其中 `os.walk` 入口目录加前缀尤为关键：未加时超 260 的会话目录根本扫不进去、`scan_items` 直接返回空、导出报"没扫到文件"，比单文件 `getsize` 失败更彻底。
@@ -248,7 +260,7 @@ build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 /
 All adapters follow the same policy for which backup items are checked by default:
 
 - ✅ **Checked by default (recommended)**: **chat history, memory, rules** — user core data that cannot be recreated from scratch; losing it is irreversible, so these are checked and recommended for backup.
-- ⬜ **Unchecked by default (optional)**: **plugins, extensions, MCP, skills, inspiration, index, settings** — program configuration or content that the tool can rebuild from scratch; unchecked by default, tick as needed.
+- ⬜ **Unchecked by default (optional)**: **plugins, extensions, MCP, skills, inspiration, index, settings, custom model config** — program configuration or content that the tool can rebuild from scratch; unchecked by default, tick as needed.
 - 🚫 **Not listed as a backup item**: **local cache, runtime/state records, logs** — purely the program's own temporary/runtime data, unrelated to user data; no item is generated and it is never backed up regardless of selection.
 
 > Note: different tools name their directories differently (e.g. "settings" may be `argv.json` / `config.toml` / project-level `settings.json`), but each is mapped to the appropriate selection state by category above.
@@ -360,6 +372,18 @@ On restore, the tool auto-remaps the old UUID to the **current logged-in user UU
 For some tools, workspace / session names are **not derived purely from directory traversal** — they also rely on a global index file (for example DSH uses `~/.dsh/storages/workspace.json`, mapping workspace name → session ID list; the workspace name comes from the index, not the directory name). Overwriting such an index file verbatim with the one from the backup would **erase the target machine's other workspaces / sessions**, making them appear as "ungrouped / not found" in the UI (the disk content is all there, only the index no longer knows the local entries).
 
 On restore, the tool **merges rather than overwrites** this kind of **plain-JSON global index with a fully parseable structure and unambiguous merge semantics**: it keeps the target machine's pre-restore index as the base, then folds in the source entries brought by the backup, de-duplicating list fields and **never deleting the target's existing entries**. Each entry's `path` / `title` (and similar locator fields) always uses the **local machine's real path** (the backup hard-codes the source machine's absolute path, which is invalid across machines and is therefore not adopted), while other mergeable fields are folded in. Thus entries migrated from the source machine and entries originally on the target machine can coexist, and neither becomes "ungrouped". Which index files participate in this merge is declared by each tool's adapter (see `restore_index_merge_paths` / `restore_index_merge`).
+
+### Sensitive credential redaction (custom model config)
+
+Some tools may store **plaintext sensitive credentials directly inside a config file** — the typical case being CodeBuddy's custom model config `~/.codebuddy/models.json`, where each custom model entry may carry a plaintext `apiKey`, token, or other private credential. Packing a plaintext credential into the backup zip is a leakage risk (backups may be synced externally or fall into other hands).
+
+To address this, the tool **redacts at export time**: for such a file, any field whose name looks like a sensitive credential (`apiKey`, `token`, `secret`, `password`, etc.) is replaced with the placeholder `***REDACTED***`, so **the backup contains no plaintext credential**; the rest of the config (model name, url, etc.) is preserved, so the model stays visible in the tool after restore, only its credential is invalid.
+
+> - **Plaintext credential** (`apiKey: "sk-..."`, `token: "tk-..."`, etc.): redacted to the placeholder.
+> - **Environment-variable reference** (`apiKey: "${MY_API_KEY}"` form): **kept as-is** — it does not store the plaintext in the config file itself; across machines you only need the same-named env var present on the target, no config change needed.
+> - When you tick a backup item containing sensitive credentials, the backup-complete screen **shows an extra security notice** reminding you to note these credentials down separately on the source machine and refill them manually on the target, otherwise the feature will appear but not work after restore.
+
+Note: this tool **does not back up environment variables themselves** (they live in system/Shell config, outside any tool's data directory). So even with the env-var form, if the target lacks that variable, you must still configure it once on the target. This is the necessary trade-off between **security (no keys in the backup)** and **convenience (plug-and-play across machines)**: keys always remain only in an environment you control.
 
 ### Deep session message long-path fix (Windows)
 
