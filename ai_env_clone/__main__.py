@@ -158,6 +158,8 @@ class QoderBackupApp:
         # 记住用户本次选择，下次启动默认沿用
         _save_last_tool(self.adapter.name)
         self.status.configure(text="已切换到 %s" % self.adapter.display_name)
+        # dsh 工具显示「会话健康」行，其他工具隐藏
+        self._update_dsh_health_visibility()
 
     def _build_ui(self) -> None:
         pad = {"padx": 12, "pady": 6}
@@ -306,6 +308,41 @@ class QoderBackupApp:
             text="（自动检测最近活动用户，可下拉切换）",
             foreground="#666",
         ).pack(side=tk.LEFT, padx=(6, 0))
+
+        # DSH 会话健康（仅「DeepSeek Harness」适配器显示，其他工具 pack_forget 隐藏，
+        # 不占用空间、不影响各区域自适应逻辑；dsh 选中时该行按内容自适应抬高窗口）。
+        self.dsh_health_frame = ttk.Frame(self.dir_frame)
+        self.dsh_health_label = ttk.Label(
+            self.dsh_health_frame, text="", foreground="#333",
+            anchor="w", justify="left", wraplength=760,
+        )
+        self.dsh_health_label.pack(fill=tk.X)
+        health_row = ttk.Frame(self.dsh_health_frame)
+        health_row.pack(fill=tk.X, pady=(2, 0))
+        self.dsh_check_btn = ttk.Button(
+            health_row, text="检测会话健康", command=self._dsh_check, width=14
+        )
+        self.dsh_check_btn.pack(side=tk.LEFT)
+        self.dsh_fix_btn = ttk.Button(
+            health_row, text="修复未分组会话", command=self._dsh_fix, width=16
+        )
+        self.dsh_fix_btn.pack(side=tk.LEFT, padx=(6, 0))
+        # 「修复重复调用 ID」与检测/修复按钮平级，但默认不勾选：它是有语义改动的
+        # 修复（tool-call id 会被加 #n 后缀），只有勾选时才随「修复」一并处理。
+        self.dsh_fix_dup_var = tk.BooleanVar(value=False)
+        self.dsh_fix_dup_check = ttk.Checkbutton(
+            health_row, text="同时修复重复调用 ID（会改写数据）",
+            variable=self.dsh_fix_dup_var,
+        )
+        self.dsh_fix_dup_check.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(
+            health_row,
+            text="检测 DSH 会话是否「未分组」（磁盘存在但索引未登记）或属旧格式无法加载"
+            "（扁平 replayState / 同一步重复调用 ID）",
+            foreground="#666",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        # 默认隐藏；选中 dsh 工具时由 _update_dsh_health_visibility 显示
+        self.dsh_health_frame.pack_forget()
 
         # 备份内容
         # mid 不 expand：高度由内部（bar + 锁高 inner 285）自然决定，不吸收主窗
@@ -484,6 +521,8 @@ class QoderBackupApp:
 
         # 构建完成后按实际内容自适应窗口高度（保证状态栏等完整区域默认可见）
         self._fit_layout()
+        # dsh 工具显示「会话健康」行；其他工具隐藏
+        self._update_dsh_health_visibility()
 
     # ------------------------------------------------------------- helpers --
     def _fit_layout(self) -> None:
@@ -992,6 +1031,7 @@ class QoderBackupApp:
                 # 保留勾选（_refresh_items 内 prev_sel 沿用当前勾选），仅标红未找到项
                 self._refresh_items()
                 self._set_status("未找到数据目录，请手动指定")
+                self._update_dsh_health_visibility()
                 return
             # 从未成功识别过：仍重建一次，生成稳定的占位清单（各项未找到）
         self.items = self.adapter.build_items(self.root_dir)
@@ -999,6 +1039,177 @@ class QoderBackupApp:
         self._refresh_items()
         self._refresh_uid_combo()
         self._set_status("已重新检测数据目录")
+        self._update_dsh_health_visibility()
+
+    # -------------------------------------------------- DSH 会话健康检测/修复 --
+    def _dsh_home_for_check(self) -> str:
+        """当前 DSH 数据根（与备份条目一致：适配器探测，含 $DSH_HOME 覆盖）。"""
+        from ai_env_clone.adapters import dsh as dsh_adapter
+
+        return dsh_adapter._dsh_home()
+
+    def _update_dsh_health_visibility(self) -> None:
+        """dsh 适配器选中时显示「会话健康」行，其他工具隐藏（不破坏布局）。
+
+        用幂等 ``pack`` / ``pack_forget`` 而非 ``winfo_ismapped`` 判断：
+        headless（withdraw）下 winfo_ismapped 恒为 False，会导致切换工具时
+        该行无法隐藏（见 tests/test_detect_rows.py 的同类说明）。
+        """
+        frame = getattr(self, "dsh_health_frame", None)
+        if frame is None:
+            return
+        if self.adapter.name == "dsh":
+            frame.pack(fill=tk.X, padx=10, pady=(0, 8))
+            self._set_dsh_buttons_state()
+        else:
+            frame.pack_forget()
+
+    def _set_dsh_buttons_state(self) -> None:
+        """数据目录有效时启用检测/修复按钮，否则禁用。"""
+        ok = os.path.isdir(self.root_dir)
+        for btn in ("dsh_check_btn", "dsh_fix_btn"):
+            w = getattr(self, btn, None)
+            if w is not None:
+                try:
+                    w.configure(state="normal" if ok else "disabled")
+                except tk.TclError:
+                    pass
+
+    def _dsh_check(self) -> None:
+        """检测 DSH 会话健康：未分组会话 / 索引问题 / 旧格式 replayState / 重复调用 ID。"""
+        if self.busy:
+            messagebox.showwarning("请稍候", "当前有任务正在执行。")
+            return
+        from ai_env_clone.dsh_repair import detect_ungrouped, zstd_backend
+
+        dsh_home = self._dsh_home_for_check()
+        decompress, _compress, zstd_name = zstd_backend()
+        self._set_status("正在检测 DSH 会话健康…")
+
+        def work():
+            result = detect_ungrouped(dsh_home, decompress=decompress)
+            self.msg_queue.put(("dsh_report", (result, zstd_name)))
+
+        self._run_bg(work)
+
+    def _dsh_fix(self) -> None:
+        """修复：workspace 索引归属 + 会话文件内容（勾选时含重复调用 ID 去重）。
+
+        流程：后台生成联合修复计划（dry-run）→ 主线程确认 → 备份并写盘 → 复检。
+        """
+        if self.busy:
+            messagebox.showwarning("请稍候", "当前有任务正在执行。")
+            return
+        from ai_env_clone.dsh_repair import plan_dsh_repair
+
+        dsh_home = self._dsh_home_for_check()
+        fix_dup_ids = bool(self.dsh_fix_dup_var.get())
+        self._set_status("正在生成修复计划（dry-run）…")
+
+        def work():
+            plan = plan_dsh_repair(dsh_home, fix_dup_ids=fix_dup_ids)
+            self.msg_queue.put(("dsh_fix_plan", plan))
+
+        self._run_bg(work)
+
+    def _render_dsh_report(self, result, zstd_name: str) -> None:
+        """主线程渲染检测结果：更新健康标签 + 弹窗摘要。"""
+        lines = result.summary_lines()
+        text = "\n".join(lines)
+        self.dsh_health_label.configure(
+            text=text,
+            foreground="#0a6" if result.healthy else "#c60",
+        )
+        self._set_status("DSH 会话健康检测完成")
+        if result.healthy:
+            title = "DSH 会话健康：正常"
+        else:
+            title = "DSH 会话健康：发现 %d 项需注意" % (
+                len(result.ungrouped)
+                + len(result.index_problems)
+                + len(result.legacy_replay_sessions)
+                + len(result.dup_id_sessions)
+            )
+        messagebox.showinfo(title, text)
+
+    def _confirm_dsh_fix(self, plan) -> None:
+        """主线程确认联合修复计划，确认后后台备份 + 写盘。"""
+        from ai_env_clone.dsh_repair import apply_dsh_repair
+
+        fix_dup_ids = bool(self.dsh_fix_dup_var.get())
+        if plan.empty:
+            lines = []
+            if not plan.index_plan.mutations:
+                lines.append("未发现可自动归属的未分组会话。")
+            lines.extend("- 跳过 %s：%s" % (sid, reason) for sid, reason in plan.index_plan.skipped)
+            if not plan.data_reports:
+                lines.append("会话文件内容无需修复。")
+            if plan.zstd_note:
+                lines.append(plan.zstd_note)
+            self._set_status("无需修复")
+            messagebox.showinfo("修复 DSH 会话数据", "\n".join(lines) or "无需修复")
+            return
+
+        parts = []
+        if plan.index_plan.mutations:
+            parts.append(
+                "① 索引归属修复（仅增量登记，绝不删除任何条目）：\n"
+                + "\n".join("   - " + line for line in plan.index_plan.describe())
+            )
+        if plan.data_reports:
+            rows = []
+            for report in plan.data_reports:
+                rules = "、".join("%s×%d" % (a["rule"], a["count"]) for a in report["actions"])
+                rows.append("   - %s：%s" % (os.path.basename(report["file"]), rules))
+            parts.append(
+                "② 会话文件内容修复（写盘前逐个备份 <文件>.bak.<UTC>）：\n"
+                + "\n".join(rows)
+            )
+        note = ""
+        if not fix_dup_ids:
+            note = "\n\n注：未勾选「同时修复重复调用 ID」，其内容将保持原样（需要时可勾选后重跑）。"
+        elif plan.zstd_note:
+            note = "\n\n注：%s" % plan.zstd_note
+        total = len(plan.index_plan.mutations) + len(plan.data_reports)
+        text = "将执行以下修复：\n\n" + "\n\n".join(parts) + "\n\n共 %d 项。是否继续？" % total + note
+        if not messagebox.askyesno("确认修复 DSH 会话数据", text):
+            self._set_status("已取消修复")
+            return
+
+        dsh_home = self._dsh_home_for_check()
+        self._set_status("正在修复 DSH 会话数据…")
+
+        def work():
+            outcome = apply_dsh_repair(dsh_home, plan, fix_dup_ids=fix_dup_ids, backup=True)
+            index_res = outcome["index"]
+            file_reports = outcome["files"]
+            backups = [r["backup"] for r in file_reports if r["backup"]]
+            ok = index_res.ok and all(r["status"] != "拒绝" for r in file_reports)
+            lines = []
+            if index_res.applied:
+                lines.append(
+                    "索引归属修复 %d 处%s。"
+                    % (index_res.applied, "；备份：%s" % index_res.backup_path if index_res.backup_path else "")
+                )
+            if file_reports:
+                fixed = [r for r in file_reports if r["status"] == "已修复"]
+                lines.append(
+                    "会话文件修复 %d 个，备份：%s"
+                    % (len(fixed), "、".join(os.path.basename(b) for b in backups) or "（未生成）")
+                )
+                for report in file_reports:
+                    for action in report["actions"]:
+                        lines.append("  · %s（%d 处）" % (action["rule"], action["count"]))
+            if not ok:
+                detail = index_res.error or "、".join(
+                    r["problems"][0]["detail"] for r in file_reports
+                    if r["status"] == "拒绝" and r["problems"]
+                )
+                self.msg_queue.put(("dsh_fix_done", ("修复失败", detail, False)))
+                return
+            self.msg_queue.put(("dsh_fix_done", ("修复完成", "\n".join(lines) or "修复完成", True)))
+
+        self._run_bg(work)
 
     def _on_uid_selected(self) -> None:
         """下拉切换当前用户 UID 后，重建记忆区条目（保留其他用户的勾选状态）。"""
@@ -1067,7 +1278,12 @@ class QoderBackupApp:
         try:
             try:
                 while True:
-                    kind, payload = self.msg_queue.get_nowait()
+                    # 队列约定恒为 (kind, payload)；形状不符的消息直接丢弃，
+                    # 避免一次解包异常中断 after 重排导致界面卡死。
+                    item = self.msg_queue.get_nowait()
+                    if not isinstance(item, tuple) or len(item) != 2:
+                        continue
+                    kind, payload = item
                     if kind == "progress":
                         self.pbar["value"] = payload.percent
                         msg = payload.message
@@ -1091,6 +1307,25 @@ class QoderBackupApp:
                         messagebox.showerror("失败", str(payload))
                     elif kind == "status":
                         self._set_status(payload)
+                    elif kind == "dsh_report":
+                        # DSH 会话健康检测结果（后台线程产出，主线程渲染）
+                        self.pbar["value"] = 0
+                        result, zstd_name = payload
+                        self._render_dsh_report(result, zstd_name)
+                    elif kind == "dsh_fix_plan":
+                        # 联合修复计划已生成：主线程确认后执行
+                        self.pbar["value"] = 0
+                        self._confirm_dsh_fix(payload)
+                    elif kind == "dsh_fix_done":
+                        # 修复写盘完成：提示并自动复检
+                        self.pbar["value"] = 0
+                        title, text, ok = payload
+                        self._set_status(title)
+                        if ok:
+                            messagebox.showinfo(title, text)
+                        else:
+                            messagebox.showerror("修复失败", text)
+                        self.root.after(50, self._dsh_check)
             except queue.Empty:
                 pass
             if not self._closing:
