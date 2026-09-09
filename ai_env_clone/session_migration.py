@@ -124,7 +124,10 @@ class SessionParser:
 
         msgs: list = []
         raw = _read_text(session_jsonl)
-        for line in raw.splitlines():
+        # 只按 "\n" 切行：JSONL 的行边界是 \n；str.splitlines() 还会在
+        # U+2028/U+2029/U+0085 等处断行，这些字符会原样出现在正文里，
+        # 用 splitlines() 会把整行 JSON 切碎而静默丢弃该条消息。
+        for line in raw.split("\n"):
             line = line.strip()
             if not line:
                 continue
