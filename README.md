@@ -145,6 +145,52 @@ python -m ai_env_clone --restore --in ./my-backup.zip
 
 还原时本工具对这类**纯 JSON、结构可完整解析且合并语义明确的全局索引文件**走**合并而非覆盖**：以目标机器还原前的索引为基底，并入备份里带来的源条目，列表类字段去重合并，**绝不删除本机原有的条目**。其中每个条目的 `path` / `title` 等定位字段始终采用**本机真实路径**（备份里固化的是源机器绝对路径，跨电脑无效，故不采用），其余可合并字段并入。这样源机器迁移来的条目、与目标机器原本的条目可共存，都不会变成「未分组」。具体哪些索引文件参与合并由各工具适配器声明（见 `restore_index_merge_paths` / `restore_index_merge`）。
 
+### DSH 旧会话「未分组 / 无法加载」检测与修复
+
+上面「合并」解决的是**还原时**防止未分组；但历史遗留的**已存在**问题仍需单独处理：磁盘上明明有会话目录（`~/.dsh/sessions/--...--/<session-id>/`），`workspace.json` 索引却查不到——DSH 界面就把这些会话归到「未分组」（磁盘内容都在，只是索引缺登记）。成因包括旧版本、崩溃、手工拷贝、或此前还原时索引被整体覆盖过。
+
+会话文件内容也可能处于新版本**拒读**的形态，升级后历史会话直接打不开：
+
+- **扁平 `replayState`**：旧构建（`0.1.0-rc.x`）写成 `{kind:'pi-ai', version:1, ...}`，新版本迁移校验只接受包络 `{response, blocks}`，报错 `chunk replayState has unexpected member "kind"`；
+- **同一步内重复宣告的 tool-call id**：`assistant/message` 里两次宣告同一个 `callId` 时，迁移会报 `repeats advertised tool call`。
+
+这两类都能**无损修数据**解决：前者把字段挪进 `response` 半区（不新增、不改写内容）；后者给后续重复项加 `#n` 后缀并同步重映射 `tool/call` / `tool/result` 里的 id（**会改写数据内容**）。修复逻辑对照 `deepseekharnessfix` 的 `tools/会话数据修复.mjs` 移植，与 `dsh-session-surgeon` 的 wrap / disambiguate 语义一致。
+
+另外，DSH 一个会话目录内可能存在**多个格式代际**（`session.jsonl.zstd` = v0、`session.v1.jsonl.zstd` … `session.v2.jsonl.zstd`），加载器只读**版本号最高**的那个；本工具按同一规则定位生效文件，因此「只有 `session.v2.jsonl.zstd`」的会话也能被发现（只看 `session.jsonl.zstd` 会漏掉这类会话，本机实测曾漏 5 个）。
+
+在主界面下拉选择 **DeepSeek Harness** 后，数据目录区域会出现两个按钮和一个复选框（仅 dsh 显示，切换其他工具自动隐藏，不影响各区域自适应布局）：
+
+- **「检测会话健康」**：扫描全部会话目录并与 `storages/workspace.json` 交叉核对，报告：
+  - 未分组会话数量（及其中多少可自动归属、多少需人工确认）；
+  - 索引结构问题（如 `workspaceIds` 引用不存在的记录）；
+  - 旧格式（扁平 `replayState`）会话数量；
+  - 含同一步重复 tool-call id 的会话数量。
+- **「同时修复重复调用 ID（会改写数据）」**：复选框，**默认不勾选**。勾选后修复流程才会处理重复 tool-call id（有语义改动，id 会被加 `#2`/`#3` 后缀）；不勾选则只修扁平 `replayState` 与索引归属（无损）。
+- **「修复未分组会话」**：先展示将执行的修改清单（dry-run）并请你确认，确认后**逐个自动备份**再增量写盘：
+  - 索引：按会话 header 的 `cwd`（无 zstd 时按项目目录名 `projectKey` 匹配）把会话 id 补进对应工作区记录的 `sessionIds`（置顶，与 DSH 官方 `attachSession` 语义一致）；目录存在但没有工作区记录的，**补建工作区记录**并登记进 `global.workspaceIds`（等价 DSH 官方 `workspaceRegistry.bootstrap` 的离线版）；`workspace.json` 备份为 `workspace.json.bak-<utc>`；
+  - 会话文件：把扁平 `replayState` 包成 `{response, blocks}` 后写回，文件备份为 `<原文件>.bak.<UTC>`；**只重压缩命中的帧，其余帧保持原字节**，尾部不完整的帧（torn tail）原样保留；勾选复选框时一并去重重复的 tool-call id；
+  - **绝不删除任何条目**，`archivedSessionIds` 不动；修复幂等（重复执行不产生新命中）；修改后自动复检。
+
+同一功能也可作为**自动化脚本**在命令行使用（默认 dry-run，`--apply` 才写盘）：
+
+```bash
+python -m ai_env_clone.dsh_repair scan            # 检测未分组 / 索引 / 内容问题（只读）
+python -m ai_env_clone.dsh_repair plan            # 查看将执行的修复
+python -m ai_env_clone.dsh_repair fix --apply     # 备份后执行（索引 + 会话文件内容）
+python -m ai_env_clone.dsh_repair scan --json     # 结构化输出
+
+python -m ai_env_clone.dsh_repair repair-data <文件或目录>                # 只检测会话文件内容（递归深度 ≤ 4）
+python -m ai_env_clone.dsh_repair repair-data <文件或目录> --apply        # 备份后修复（默认只修扁平 replayState）
+python -m ai_env_clone.dsh_repair repair-data <文件或目录> --apply --fix-dup-call-ids   # 一并去重重复 tool-call id
+```
+
+退出码：`0` 正常，`1` 存在无法处理的损坏文件，`2` 参数错误（`repair-data` 未给路径）。
+
+> **zstd 说明**：会话日志是 Zstandard 压缩的 JSONL，Python 标准库没有 zstd。本工具按需探测 `zstandard` / `pyzstd` 模块或系统 `zstd` 命令，缺失时自动降级：
+> - 未分组检测、「按目录名匹配已有工作区」的索引修复仍可用；
+> - 「读取 header 精确匹配 / 补建未知工作区 / 会话文件内容检测与修复」受限——`.jsonl.zstd` 文件会被明确标记为「因缺少 zstd 后端无法处理」（区别于真正的数据损坏），明文 `.jsonl` 仍可正常处理；
+> - 需要完整能力可在本机安装任一 zstd 支持（如 `pip install zstandard`），无需改动代码。
+
 ### 敏感凭证脱敏（自定义模型配置）
 
 部分工具的配置文件内**可能直接含明文敏感凭证**，典型即 CodeBuddy 的自定义模型配置 `~/.codebuddy/models.json`——每个自定义模型条目可能带明文 `apiKey`、令牌或其他私有凭证。把明文凭证打包进备份 zip 存在泄露风险（备份可能被同步到外部、或落到他人手中）。
@@ -169,6 +215,7 @@ ai_env_clone/                包（import 名 ai_env_clone，产品名 AiEnvClon
 ├── __main__.py        图形界面层（tkinter），统一入口，负责交互与进度展示
 ├── core.py            通用核心层（扫描/打包/校验/恢复/SQLite快照/ZipSlip防护），与具体工具解耦
 ├── compress_estimate.py  压缩体积预估（经验系数 + 可校准缓存）
+├── dsh_repair.py      DSH 旧会话「未分组/无法加载」检测与修复（纯标准库，CLI 可用；含会话文件内容修复）
 ├── adapters/
 │   ├── base.py        BaseAdapter 抽象接口 + 适配器注册表
 │   ├── qoder.py       Qoder 适配器（参考实现，自包含）
@@ -373,6 +420,52 @@ For some tools, workspace / session names are **not derived purely from director
 
 On restore, the tool **merges rather than overwrites** this kind of **plain-JSON global index with a fully parseable structure and unambiguous merge semantics**: it keeps the target machine's pre-restore index as the base, then folds in the source entries brought by the backup, de-duplicating list fields and **never deleting the target's existing entries**. Each entry's `path` / `title` (and similar locator fields) always uses the **local machine's real path** (the backup hard-codes the source machine's absolute path, which is invalid across machines and is therefore not adopted), while other mergeable fields are folded in. Thus entries migrated from the source machine and entries originally on the target machine can coexist, and neither becomes "ungrouped". Which index files participate in this merge is declared by each tool's adapter (see `restore_index_merge_paths` / `restore_index_merge`).
 
+### DSH legacy sessions: detect & repair "ungrouped / unloadable" data
+
+The merge above prevents ungrouped sessions **at restore time**; pre-existing problems still need separate handling. A session directory may exist on disk (`~/.dsh/sessions/--...--/<session-id>/`) while `workspace.json` has no record of it — the DSH UI then buckets those sessions under "ungrouped" (data is intact on disk, the index just lacks the entry). Causes: older versions, crashes, manual copies, or an index overwritten by an earlier restore.
+
+Session file *content* can also be in a shape the newer version **refuses to read**, so historical sessions fail to open after an upgrade:
+
+- **flat `replayState`**: old builds (`0.1.0-rc.x`) wrote `{kind:'pi-ai', version:1, ...}`; the released-format migration only accepts the envelope `{response, blocks}` and errors with `chunk replayState has unexpected member "kind"`;
+- **duplicate tool-call ids inside one step**: when `assistant/message` advertises the same `callId` twice, migration fails with `repeats advertised tool call`.
+
+Both are fixable **by repairing the data**: the former moves the fields into the `response` half (no field is added or rewritten); the latter suffixes the later duplicates with `#n` and remaps the ids in `tool/call` / `tool/result` accordingly (**this does rewrite data content**). The logic is a port of `deepseekharnessfix/tools/会话数据修复.mjs` and matches `dsh-session-surgeon`'s wrap / disambiguate semantics.
+
+A session directory may also hold **several format generations** (`session.jsonl.zstd` = v0, `session.v1.jsonl.zstd`, … `session.v2.jsonl.zstd`); the loader reads only the **highest-numbered** one. This tool locates the effective file by the same rule, so a session that only has `session.v2.jsonl.zstd` is still discovered (looking for `session.jsonl.zstd` alone used to miss 5 such sessions on this machine).
+
+When **DeepSeek Harness** is selected in the dropdown, the data-directory area shows two buttons and one checkbox (dsh-only; hidden for other tools, so the adaptive layout of every section is untouched):
+
+- **「检测会话健康」(check session health)**: cross-checks every session directory against `storages/workspace.json` and reports:
+  - number of ungrouped sessions (and how many can be auto-attached vs. need manual confirmation);
+  - index structure problems (e.g. `workspaceIds` referencing missing records);
+  - number of legacy flat-`replayState` sessions;
+  - number of sessions with duplicate tool-call ids inside one step.
+- **「同时修复重复调用 ID（会改写数据）」(also fix duplicate call ids)**: a checkbox, **unchecked by default**. Only when checked does the repair flow touch duplicate tool-call ids (a semantic change — ids get `#2` / `#3` suffixes); unchecked, only the lossless replayState envelope and the index are repaired.
+- **「修复未分组会话」(fix ungrouped sessions)**: first shows the exact changes as a dry-run for confirmation, then **backs up each file individually** and writes incrementally:
+  - index: matches each session's header `cwd` (or, without zstd, its `projectKey` directory name) and prepends the session id to that workspace record's `sessionIds` (same semantics as DSH's official `attachSession`); when a directory exists but no workspace record does, **creates the record** and registers it in `global.workspaceIds` (an offline equivalent of DSH's `workspaceRegistry.bootstrap`); `workspace.json` is backed up as `workspace.json.bak-<utc>`;
+  - session files: wraps flat `replayState` into `{response, blocks}` in place, backing up the file as `<file>.bak.<UTC>`; **only the frames that changed are recompressed, all other frames keep their original bytes**, and an incomplete trailing frame (torn tail) is preserved verbatim; with the checkbox ticked, duplicate tool-call ids are de-duplicated too;
+  - **never deletes any entry**, leaves `archivedSessionIds` untouched, the fix is idempotent, then re-checks automatically.
+
+The same feature works as an **automated script** (dry-run by default; `--apply` writes):
+
+```bash
+python -m ai_env_clone.dsh_repair scan            # detect index + content issues (read-only)
+python -m ai_env_clone.dsh_repair plan            # preview the repair
+python -m ai_env_clone.dsh_repair fix --apply     # backup then repair (index + session files)
+python -m ai_env_clone.dsh_repair scan --json     # structured output
+
+python -m ai_env_clone.dsh_repair repair-data <file-or-dir>               # inspect session file content only (depth ≤ 4)
+python -m ai_env_clone.dsh_repair repair-data <file-or-dir> --apply       # repair with backup (flat replayState by default)
+python -m ai_env_clone.dsh_repair repair-data <file-or-dir> --apply --fix-dup-call-ids   # also de-duplicate call ids
+```
+
+Exit codes: `0` ok, `1` some file is corrupt/unprocessable, `2` bad arguments (`repair-data` without a target).
+
+> **zstd note**: session logs are Zstandard-compressed JSONL, and Python's stdlib has no zstd. The tool probes the `zstandard` / `pyzstd` modules or a system `zstd` command; when none is available it degrades gracefully:
+> - ungrouped detection and "attach to an existing workspace matched by directory name" still work;
+> - exact header matching, creating workspaces for unknown cwds, and session-file content detection/repair are limited — `.jsonl.zstd` files are explicitly marked as "unreadable without a zstd backend" (distinct from genuine corruption), while plaintext `.jsonl` files still work;
+> - for full capability, install any zstd support (e.g. `pip install zstandard`) — no code changes needed.
+
 ### Sensitive credential redaction (custom model config)
 
 Some tools may store **plaintext sensitive credentials directly inside a config file** — the typical case being CodeBuddy's custom model config `~/.codebuddy/models.json`, where each custom model entry may carry a plaintext `apiKey`, token, or other private credential. Packing a plaintext credential into the backup zip is a leakage risk (backups may be synced externally or fall into other hands).
@@ -397,6 +490,7 @@ ai_env_clone/                package (import name ai_env_clone, product name AiE
 ├── __main__.py        GUI layer (tkinter), unified entry point, interaction & progress
 ├── core.py            generic core (scan / pack / verify / restore / SQLite snapshot / Zip Slip guard), tool-agnostic
 ├── compress_estimate.py  compressed-size estimation (empirical ratios + calibratable cache)
+├── dsh_repair.py         DSH legacy-session "ungrouped/unloadable" detect & repair (stdlib-only, CLI-capable; includes session-file content repair)
 ├── adapters/
 │   ├── base.py        BaseAdapter interface + adapter registry
 │   ├── qoder.py       Qoder adapter (reference implementation, self-contained)

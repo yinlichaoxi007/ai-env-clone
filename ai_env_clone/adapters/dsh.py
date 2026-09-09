@@ -200,19 +200,26 @@ def _merge_workspace_index_bytes(
 
 def _count_session_files(sessions_root: str) -> int:
     """
-    统计指定工作区目录下的会话文件数。
+    统计指定工作区目录下的会话数。
 
-    每个会话子目录含 ``session.jsonl.zstd`` 文件，以此计数。
+    会话目录下存在**任意一个** canonical 会话日志即算一个会话：
+    ``session.jsonl.zstd``（v0）或更高代际 ``session.vN.jsonl.zstd`` / 明文
+    ``session.jsonl``。DSH 加载器按代际取最高者，但计数只关心是否存在——
+    只看 ``session.jsonl.zstd`` 会漏掉「仅有 session.v2.jsonl.zstd」的会话
+    （本机实测有 5 个），导致标签上的会话数偏少（实际归档不受影响，
+    归档按目录整体 os.walk）。
     """
+    from ..dsh_repair import find_generation_log
+
     count = 0
     if not os.path.isdir(sessions_root):
         return 0
     for name in os.listdir(sessions_root):
         full = os.path.join(sessions_root, name)
-        if os.path.isdir(full) and name.startswith("session-"):
-            session_file = os.path.join(full, "session.jsonl.zstd")
-            if os.path.isfile(session_file):
-                count += 1
+        if not os.path.isdir(full):
+            continue
+        if find_generation_log(full)[0] is not None:
+            count += 1
     return count
 
 
