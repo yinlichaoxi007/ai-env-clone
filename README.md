@@ -149,26 +149,28 @@ python -m ai_env_clone --restore --in ./my-backup.zip
 
 上面「合并」解决的是**还原时**防止未分组；但历史遗留的**已存在**问题仍需单独处理：磁盘上明明有会话目录（`~/.dsh/sessions/--...--/<session-id>/`），`workspace.json` 索引却查不到——DSH 界面就把这些会话归到「未分组」（磁盘内容都在，只是索引缺登记）。成因包括旧版本、崩溃、手工拷贝、或此前还原时索引被整体覆盖过。
 
-会话文件内容也可能处于新版本**拒读**的形态，升级后历史会话直接打不开：
+会话文件内容也可能处于新版本**拒读**的形态，升级后历史会话直接打不开。DSH 对 `replayState` 有两道独立校验，旧数据可能倒在任意一道上：
 
-- **扁平 `replayState`**：旧构建（`0.1.0-rc.x`）写成 `{kind:'pi-ai', version:1, ...}`，新版本迁移校验只接受包络 `{response, blocks}`，报错 `chunk replayState has unexpected member "kind"`；
+- **扁平 `replayState`（格式校验）**：旧构建（`0.1.0-rc.x`）写成 `{kind:'pi-ai', version:1, ..., blocks:[...]}`（包络拆分前形态、无 `response` 成员），官方校验只接受 `{response, blocks}` 信封，报 `replayState has unexpected member "kind"`；
+- **镜像不一致（加载校验）**：`message.source.replayState` 必须与「从内嵌 stream 重组出来的 replayState」完全相等（后者就是 finish 块里那份的原样回显）。**只改一侧必然报** `replay state disagrees with its embedded stream`——本工具旧版只升级 source 一侧、漏掉内嵌 stream 的 finish 块，正是这个报错的成因；
 - **同一步内重复宣告的 tool-call id**：`assistant/message` 里两次宣告同一个 `callId` 时，迁移会报 `repeats advertised tool call`。
 
-这两类都能**无损修数据**解决：前者把字段挪进 `response` 半区（不新增、不改写内容）；后者给后续重复项加 `#n` 后缀并同步重映射 `tool/call` / `tool/result` 里的 id（**会改写数据内容**）。修复逻辑对照 `deepseekharnessfix` 的 `tools/会话数据修复.mjs` 移植，与 `dsh-session-surgeon` 的 wrap / disambiguate 语义一致。
+前两类都能**修数据**解决：把同一事件里出现的每一处扁平 `replayState`（`message.source`、内嵌 stream 的 finish 块、v0 的 chunk）用同一纯函数升级成**同一个** `{response, blocks}` 信封——除 `blocks` 外的字段整体挪进 `response` 半区，不新增、不改写内容；v0 形态无内嵌 stream，单侧升级即可（迁移器会自动把它复制进合成 stream 的 finish 块）。max-tokens 剪枝场景需要两侧取**不同**的值（stream 侧保留全量、source 侧随内容剪枝），本工具**跳过并上报**，绝不猜测改写。第三类给后续重复项加 `#n` 后缀并同步重映射 `tool/call` / `tool/result` 里的 id（**会改写数据内容**，故默认关闭）。升级语义以**未打补丁的官方构建真实加载**为验收标准（沙箱 `DSH_HOME` + 真实 Web API 逐会话验证通过、无回归），不再以 `deepseekharnessfix` 的 `tools/会话数据修复.mjs` 行为为准——该脚本只升级 source 一侧，正是把会话改坏的来源。
 
 另外，DSH 一个会话目录内可能存在**多个格式代际**（`session.jsonl.zstd` = v0、`session.v1.jsonl.zstd` … `session.v2.jsonl.zstd`），加载器只读**版本号最高**的那个；本工具按同一规则定位生效文件，因此「只有 `session.v2.jsonl.zstd`」的会话也能被发现（只看 `session.jsonl.zstd` 会漏掉这类会话，本机实测曾漏 5 个）。
 
 在主界面下拉选择 **DeepSeek Harness** 后，数据目录区域会出现两个按钮和一个复选框（仅 dsh 显示，切换其他工具自动隐藏，不影响各区域自适应布局）：
 
-- **「检测会话健康」**：扫描全部会话目录并与 `storages/workspace.json` 交叉核对，报告：
+- **「检测会话健康」**：扫描全部会话目录并与 `storages/workspace.json` 交叉核对（**内容扫描覆盖全部会话，不只未分组**），报告：
   - 未分组会话数量（及其中多少可自动归属、多少需人工确认）；
   - 索引结构问题（如 `workspaceIds` 引用不存在的记录）；
   - 旧格式（扁平 `replayState`）会话数量；
-  - 含同一步重复 tool-call id 的会话数量。
-- **「同时修复重复调用 ID（会改写数据）」**：复选框，**默认不勾选**。勾选后修复流程才会处理重复 tool-call id（有语义改动，id 会被加 `#2`/`#3` 后缀）；不勾选则只修扁平 `replayState` 与索引归属（无损）。
+  - 含同一步重复 tool-call id 的会话数量；
+  - 子代理描述符不兼容会话数量（`subagent/descriptor` 的 `version` 不是官方迁移要求的 3，会话无法加载）——**只检测标记，暂不自动修复**。
+- **「同时修复重复调用 ID（会改写数据）」**：复选框，**默认不勾选**。勾选后修复流程才会处理重复 tool-call id（有语义改动，id 会被加 `#2`/`#3` 后缀）；不勾选则只做 replayState 信封升级与索引归属。
 - **「修复未分组会话」**：先展示将执行的修改清单（dry-run）并请你确认，确认后**逐个自动备份**再增量写盘：
   - 索引：按会话 header 的 `cwd`（无 zstd 时按项目目录名 `projectKey` 匹配）把会话 id 补进对应工作区记录的 `sessionIds`（置顶，与 DSH 官方 `attachSession` 语义一致）；目录存在但没有工作区记录的，**补建工作区记录**并登记进 `global.workspaceIds`（等价 DSH 官方 `workspaceRegistry.bootstrap` 的离线版）；`workspace.json` 备份为 `workspace.json.bak-<utc>`；
-  - 会话文件：把扁平 `replayState` 包成 `{response, blocks}` 后写回，文件备份为 `<原文件>.bak.<UTC>`；**只重压缩命中的帧，其余帧保持原字节**，尾部不完整的帧（torn tail）原样保留；勾选复选框时一并去重重复的 tool-call id；
+  - 会话文件：把扁平 `replayState` **双侧同值**升级为 `{response, blocks}` 信封后写回（同一事件的 `message.source` 与内嵌 stream finish 块升级为同一个信封，保证镜像一致；max-tokens 剪枝场景跳过并上报），文件备份为 `<原文件>.bak.<UTC>`；**只重压缩命中的帧，其余帧保持原字节**，尾部不完整的帧（torn tail）原样保留；勾选复选框时一并去重重复的 tool-call id；
   - **绝不删除任何条目**，`archivedSessionIds` 不动；修复幂等（重复执行不产生新命中）；修改后自动复检。
 
 同一功能也可作为**自动化脚本**在命令行使用（默认 dry-run，`--apply` 才写盘）：
@@ -424,26 +426,28 @@ On restore, the tool **merges rather than overwrites** this kind of **plain-JSON
 
 The merge above prevents ungrouped sessions **at restore time**; pre-existing problems still need separate handling. A session directory may exist on disk (`~/.dsh/sessions/--...--/<session-id>/`) while `workspace.json` has no record of it — the DSH UI then buckets those sessions under "ungrouped" (data is intact on disk, the index just lacks the entry). Causes: older versions, crashes, manual copies, or an index overwritten by an earlier restore.
 
-Session file *content* can also be in a shape the newer version **refuses to read**, so historical sessions fail to open after an upgrade:
+Session file *content* can also be in a shape the newer version **refuses to read**, so historical sessions fail to open after an upgrade. DSH enforces two independent checks on `replayState`, and old data may trip either:
 
-- **flat `replayState`**: old builds (`0.1.0-rc.x`) wrote `{kind:'pi-ai', version:1, ...}`; the released-format migration only accepts the envelope `{response, blocks}` and errors with `chunk replayState has unexpected member "kind"`;
+- **flat `replayState` (format check)**: old builds (`0.1.0-rc.x`) wrote `{kind:'pi-ai', version:1, ..., blocks:[...]}` (the pre-envelope shape, no `response` member); the official validation only accepts the `{response, blocks}` envelope and errors with `replayState has unexpected member "kind"`;
+- **mirror mismatch (load check)**: `message.source.replayState` must exactly equal "the replayState reassembled from the embedded stream" (which is the finish chunk's value echoed verbatim). **Upgrading only one side always fails** with `replay state disagrees with its embedded stream` — an earlier version of this tool upgraded only the source side and missed the embedded stream's finish chunk, which is exactly how that error was produced;
 - **duplicate tool-call ids inside one step**: when `assistant/message` advertises the same `callId` twice, migration fails with `repeats advertised tool call`.
 
-Both are fixable **by repairing the data**: the former moves the fields into the `response` half (no field is added or rewritten); the latter suffixes the later duplicates with `#n` and remaps the ids in `tool/call` / `tool/result` accordingly (**this does rewrite data content**). The logic is a port of `deepseekharnessfix/tools/会话数据修复.mjs` and matches `dsh-session-surgeon`'s wrap / disambiguate semantics.
+The first two are fixable **by repairing the data**: every flat `replayState` occurrence within the same event (`message.source`, the embedded stream's finish chunk, and v0 chunks) is upgraded with one pure function into **the same** `{response, blocks}` envelope — all fields except `blocks` move into the `response` half, nothing is added or rewritten; v0-shaped data has no embedded stream, so a single side suffices (the migrator copies it into the synthesized stream's finish chunk). The max-tokens pruning case needs **different** values on the two sides (stream keeps everything, source is pruned with the content), so this tool **skips and reports** it rather than guessing. The third one suffixes the later duplicates with `#n` and remaps the ids in `tool/call` / `tool/result` accordingly (**this does rewrite data content**, hence unchecked by default). The upgrade semantics are accepted against **a real unpatched official build loading the data** (verified session-by-session through a sandboxed `DSH_HOME` + the real Web API, with no regression), no longer against the behavior of `deepseekharnessfix/tools/会话数据修复.mjs` — that script upgrades only the source side and is exactly what broke the sessions.
 
 A session directory may also hold **several format generations** (`session.jsonl.zstd` = v0, `session.v1.jsonl.zstd`, … `session.v2.jsonl.zstd`); the loader reads only the **highest-numbered** one. This tool locates the effective file by the same rule, so a session that only has `session.v2.jsonl.zstd` is still discovered (looking for `session.jsonl.zstd` alone used to miss 5 such sessions on this machine).
 
 When **DeepSeek Harness** is selected in the dropdown, the data-directory area shows two buttons and one checkbox (dsh-only; hidden for other tools, so the adaptive layout of every section is untouched):
 
-- **「检测会话健康」(check session health)**: cross-checks every session directory against `storages/workspace.json` and reports:
+- **「检测会话健康」(check session health)**: cross-checks every session directory against `storages/workspace.json` and reports (the **content scan covers all sessions, not just ungrouped ones**):
   - number of ungrouped sessions (and how many can be auto-attached vs. need manual confirmation);
   - index structure problems (e.g. `workspaceIds` referencing missing records);
   - number of legacy flat-`replayState` sessions;
-  - number of sessions with duplicate tool-call ids inside one step.
-- **「同时修复重复调用 ID（会改写数据）」(also fix duplicate call ids)**: a checkbox, **unchecked by default**. Only when checked does the repair flow touch duplicate tool-call ids (a semantic change — ids get `#2` / `#3` suffixes); unchecked, only the lossless replayState envelope and the index are repaired.
+  - number of sessions with duplicate tool-call ids inside one step;
+  - number of sessions with an incompatible subagent descriptor (`subagent/descriptor` whose `version` is not the officially required 3, so the session cannot be loaded) — **detected and flagged only; not auto-repaired**.
+- **「同时修复重复调用 ID（会改写数据）」(also fix duplicate call ids)**: a checkbox, **unchecked by default**. Only when checked does the repair flow touch duplicate tool-call ids (a semantic change — ids get `#2` / `#3` suffixes); unchecked, only the replayState envelope upgrade and the index are repaired.
 - **「修复未分组会话」(fix ungrouped sessions)**: first shows the exact changes as a dry-run for confirmation, then **backs up each file individually** and writes incrementally:
   - index: matches each session's header `cwd` (or, without zstd, its `projectKey` directory name) and prepends the session id to that workspace record's `sessionIds` (same semantics as DSH's official `attachSession`); when a directory exists but no workspace record does, **creates the record** and registers it in `global.workspaceIds` (an offline equivalent of DSH's `workspaceRegistry.bootstrap`); `workspace.json` is backed up as `workspace.json.bak-<utc>`;
-  - session files: wraps flat `replayState` into `{response, blocks}` in place, backing up the file as `<file>.bak.<UTC>`; **only the frames that changed are recompressed, all other frames keep their original bytes**, and an incomplete trailing frame (torn tail) is preserved verbatim; with the checkbox ticked, duplicate tool-call ids are de-duplicated too;
+  - session files: upgrades flat `replayState` into the `{response, blocks}` envelope with **the same value on both sides** (within one event, `message.source` and the embedded stream's finish chunk become the same envelope, keeping the mirror consistent; the max-tokens pruning case is skipped and reported), backing up the file as `<file>.bak.<UTC>`; **only the frames that changed are recompressed, all other frames keep their original bytes**, and an incomplete trailing frame (torn tail) is preserved verbatim; with the checkbox ticked, duplicate tool-call ids are de-duplicated too;
   - **never deletes any entry**, leaves `archivedSessionIds` untouched, the fix is idempotent, then re-checks automatically.
 
 The same feature works as an **automated script** (dry-run by default; `--apply` writes):
