@@ -1129,6 +1129,7 @@ class QoderBackupApp:
                 + len(result.index_problems)
                 + len(result.legacy_replay_sessions)
                 + len(result.dup_id_sessions)
+                + len(result.descriptor_bad_sessions)
             )
         messagebox.showinfo(title, text)
 
