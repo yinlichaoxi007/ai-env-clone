@@ -185,14 +185,14 @@ class TestDshFixCheckbox(unittest.TestCase):
                 self.assertTrue(show.called)
 
                 confirm_text = ask.call_args[0][1]
-                self.assertIn("扁平replayState包装", confirm_text)
+                self.assertIn("replayState升级为信封", confirm_text)
                 self.assertNotIn("重复tool-call", confirm_text)
 
                 # 索引已登记
                 with open(idx_path, "r", encoding="utf-8") as fh:
                     after = json.load(fh)
                 self.assertIn("session-x", after["tables"]["workspaces"]["ws-a"]["sessionIds"])
-                # replayState 已包装；call id 未被改写
+                # replayState 已升级为信封；call id 未被改写
                 with open(session_path, "r", encoding="utf-8") as fh:
                     rows = [json.loads(l) for l in fh.read().splitlines() if l.strip()]
                 replay = rows[-1]["data"]["chunk"]["replayState"]
@@ -220,7 +220,7 @@ class TestDshFixCheckbox(unittest.TestCase):
                 self.assertTrue(show.called)
 
                 confirm_text = ask.call_args[0][1]
-                self.assertIn("扁平replayState包装", confirm_text)
+                self.assertIn("replayState升级为信封", confirm_text)
                 self.assertIn("重复tool-call id去重", confirm_text)
                 # call id 已加后缀区分
                 with open(session_path, "r", encoding="utf-8") as fh:

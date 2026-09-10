@@ -12,13 +12,17 @@ DSH 旧会话数据「未分组 / 无法加载」检测与修复（纯标准库�
    ``workspaceRegistry.bootstrap`` 的行为等价，只是离线执行、无需启动 DSH。
    deepseekharnessfix 的 ``tools/补全工作区索引.mjs`` 正是这一修复的手工版。
 
-2. **无法加载**：0.1.0-rc.x 等旧构建写入的扁平 ``replayState``
-   （``{kind: 'pi-ai', version: 1, ...}``，包络拆分前形态）会被 0.1.2+ 的
-   released-format 迁移校验器拒绝（``replayState has unexpected member "kind"``），
-   导致升级后历史会话打不开。官方修复见 ``fix-released-replay-state-compat.patch``
-   （改 DSH 核心源码）。本工具**不修改 DSH 核心源码**（遵守用户全局工作准则），
-   只做「检测 + 提示」：把受影响会话列出来，提示用户按 DSH 侧方案处理
-   （升级 harness / 应用补丁 / 使用 dsh-session-surgeon 修复）。
+2. **无法加载**：包络拆分前旧构建写入的扁平 ``replayState``
+   （``{kind: 'pi-ai', version: 1, ..., blocks: [...]}``，无 ``response`` 成员）
+   会被官方 released-format 校验器拒绝，机制有两道（见「规则一」注释）：
+   a) finish 块携带的 replayState 必须是 ``{response, blocks}`` 信封
+      （``replayEnvelopeValue`` 的 ``exactRecord``）；
+   b) ``message.source.replayState`` 必须与从内嵌 stream 重组出来的那份
+      完全相等（replayState 是 stream 的镜像，只改一侧必被拒）。
+   修复 = **双侧一致升级**：把同一事件里出现的每处扁平 replayState 都升级成
+   同一个 ``{response, blocks}`` 信封（v0 形态无内嵌 stream，只有 source 一侧，
+   迁移器会自动把它复制进合成 stream 的 finish 块）。max-tokens 剪枝场景
+   （需要两侧取不同值）本工具跳过并上报，绝不猜测改写。
 
 zstd 说明：会话日志是 Zstandard 压缩的 JSONL，Python 标准库**没有** zstd。
 本模块按需探测可用后端（``zstandard`` / ``pyzstd`` / 系统 ``zstd`` 命令），
@@ -518,10 +522,10 @@ def _is_flat_replay_state(value) -> bool:
 def _scan_file_content(log_file: str, decompress: "Callable[[bytes], bytes]") -> "tuple[bool, bool]":
     """扫描整份会话日志：返回 ``(是否含扁平 replayState, 是否含同 step 重复 tool-call id)``。
 
-    对照 ``deepseekharnessfix/tools/会话数据修复.mjs``：扁平 replayState 判定为
-    「有 ``kind``、无 ``response``」（与修复器的无损包装条件完全一致，故检测到的
-    命中数与修复器实际改写的数量一致）；重复 tool-call id 按 ``turn/start`` /
-    ``step/end`` 重置。与格式版本无关（v0/v1 数据都可能带扁平形态）。
+    扁平 replayState 判定为「有 ``kind``、无 ``response``」（与升级器的信封
+    转换条件完全一致，故检测到的命中数与升级器实际改写的数量一致）；
+    重复 tool-call id 按 ``turn/start`` / ``step/end`` 重置。
+    与格式版本无关（v0/v1 数据都可能带扁平形态）。
     """
     try:
         text = _read_log_text(log_file, decompress)
@@ -702,7 +706,7 @@ class DetectResult:
             lines.append("索引问题：%s" % p)
         if self.legacy_replay_sessions:
             lines.append(
-                "旧格式会话（升级后可能无法加载）：%d 个，需包装扁平 replayState 后方可加载"
+                "旧格式会话（官方未打补丁的构建无法加载）：%d 个，需把扁平 replayState 升级为信封后方可加载"
                 % len(self.legacy_replay_sessions)
             )
         if self.dup_id_sessions:
@@ -1060,13 +1064,14 @@ class ApplyResult:
 
 
 # --------------------------------------------------------------------------- #
-# 会话文件内容修复（扁平 replayState 包装 / 重复 tool-call id 去重）
+# 会话文件内容修复（扁平 replayState 升级为信封 / 重复 tool-call id 去重）
 #
-# 移植自 ``deepseekharnessfix/tools/会话数据修复.mjs``：同一脚本的修复语义与
-# ``dsh-session-surgeon`` 的 wrap / disambiguateDuplicateToolCallIds 一致，用于
-# 把 DSH 0.1.3+ 迁移校验会「拒绝加载」的旧会话数据修成可加载形态。
+# replayState 升级依据的是 DSH 官方校验器的两道不变式（见「规则一」注释），
+# 并以「未打补丁的官方 DSH 真实加载」为验收标准（``.verify/`` 验证台），
+# 不再以 ``deepseekharnessfix/tools/会话数据修复.mjs`` 的行为为准——该脚本
+# 只升级 message.source 一侧、漏掉内嵌 stream 的 finish 块，正是它把
+# 3 个会话改坏成「replay state disagrees with its embedded stream」的原因。
 #
-# 默认只修「扁平 replayState」——无损包装，不新增、不改写任何字段内容；
 # 重复 tool-call id 去重会改写数据内容（id 被加 ``#n`` 后缀），因此默认关闭，
 # 需显式传入 ``fix_dup_call_ids=True``（CLI 为 ``--fix-dup-call-ids``）。
 # --------------------------------------------------------------------------- #
@@ -1091,12 +1096,28 @@ def _is_zstd_missing(report: dict) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# 规则一：扁平 replayState 无损包装
+# 规则一：扁平 replayState 升级为信封（双侧一致）
+#
+# DSH 对 replayState 有两道独立校验，升级必须同时满足：
+#   a) 格式校验（session-format 的 replayEnvelopeValue）：finish 块携带的
+#      replayState 若不是「含 response 成员的信封」，未打补丁的官方构建直接
+#      拒绝 —— 这就是旧会话「无法加载」的真正机制；
+#   b) 镜像校验（core/session 与 v1→v2 校验）：message.source.replayState
+#      必须与「从内嵌 stream 重组出来的 replayState」完全相等，而后者就是
+#      finish 块里那份的原样回显（assembler.ts ③ 分支）。
+# 因此同一事件里出现几处，就必须升级成**同一个值**：只改 message.source 一侧、
+# 不改内嵌 stream 的 finish 块，必然触发
+# 「replay state disagrees with its embedded stream」。
+#
+# v0 形态没有内嵌 stream（chunk 是独立事件），只有 source 一侧；迁移器会把
+# source 的值原样复制进合成 stream 的 finish 块，故单侧升级即可。
 # --------------------------------------------------------------------------- #
 def _wrap_flat_replay_state(value) -> "tuple[object, bool]":
-    """无损包装：除 ``blocks`` 外的字段整体挪进 ``response`` 半区。
+    """把包络拆分前的扁平 replayState 升级为 ``{response, blocks}`` 信封。
 
-    不修改入参。已含 ``response`` 的包络直接跳过（幂等）。
+    除 ``blocks`` 外的字段整体挪进 ``response`` 半区（适配器私有值，官方校验
+    不检查其内部形态）；``blocks`` 原样保留在共享半区。不修改入参。
+    已含 ``response`` 的信封直接跳过（幂等）。
     """
     if not _is_flat_replay_state(value):
         return value, False
@@ -1106,8 +1127,26 @@ def _wrap_flat_replay_state(value) -> "tuple[object, bool]":
     return {"response": response}, True
 
 
+def _finish_reason_kind(chunk) -> "str | None":
+    """finish 块的 ``reason.kind``（非 finish 块或缺 reason 返回 None）。"""
+    if not isinstance(chunk, dict) or chunk.get("type") != "finish":
+        return None
+    reason = chunk.get("reason")
+    if isinstance(reason, dict) and isinstance(reason.get("kind"), str):
+        return reason["kind"]
+    return None
+
+
+def _pruning_would_drop_block(value) -> bool:
+    """max-tokens 剪枝是否会真的丢块（replay 元数据里是否有 tool-call 项）。"""
+    blocks = value.get("blocks") if isinstance(value, dict) else None
+    if not isinstance(blocks, list):
+        return False
+    return any(isinstance(b, dict) and b.get("type") == "tool-call" for b in blocks)
+
+
 def _wrap_holder(holder: dict, key: str, hits: list[dict], path: str, rewrite: bool) -> dict:
-    """在持有者对象的某个键上处理 replayState；命中则记录，``rewrite`` 才改。"""
+    """在持有者对象的某个键上升级 replayState；命中则记录，``rewrite`` 才改。"""
     if not isinstance(holder, dict) or key not in holder:
         return holder
     current = holder[key]
@@ -1120,45 +1159,141 @@ def _wrap_holder(holder: dict, key: str, hits: list[dict], path: str, rewrite: b
     return {**holder, key: new_value}
 
 
-def wrap_line_event(event, rewrite: bool) -> "tuple[object, bool, list[dict]]":
-    """处理单个事件行的 replayState（逐行、无跨行状态）。
+def _wrap_stream_record(record, hits: list[dict], skipped: list[dict], rewrite: bool) -> "tuple[object, bool]":
+    """升级内嵌 stream 里单个记录的 finish 块 replayState。
 
-    :return: ``(新事件或原事件, 是否有变更, 命中列表)``。
-    作用位置：``assistant/chunk.data.chunk.replayState``、
-    ``assistant/message.data.message.source.replayState``。
+    :return: ``(新记录或原记录, 是否有变更)``。
+    max-tokens 剪枝场景（reason 为 max-tokens 且元数据含 tool-call 项）需要
+    stream 侧与 source 侧取**不同**的值（前者保留全量、后者随内容剪枝），
+    单靠本工具无法安全判定，跳过并上报，绝不猜测改写。
+    """
+    if not isinstance(record, dict) or not isinstance(record.get("chunk"), dict):
+        return record, False
+    chunk = record["chunk"]
+    current = chunk.get("replayState")
+    if not _is_flat_replay_state(current):
+        return record, False
+    if _finish_reason_kind(chunk) == "max-tokens" and _pruning_would_drop_block(current):
+        skipped.append(
+            {
+                "path": "data.stream[].chunk.replayState",
+                "reason": "max-tokens 剪枝需要 stream 侧与 source 侧取不同值，暂不支持自动升级",
+                "fields": list(current.keys()),
+            }
+        )
+        return record, False
+    new_chunk = _wrap_holder(chunk, "replayState", hits, "data.stream[].chunk.replayState", rewrite)
+    if new_chunk is not chunk:
+        return {**record, "chunk": new_chunk}, True
+    return record, False
+
+
+def wrap_line_event(event, rewrite: bool, finish_kind: "str | None" = None) -> "tuple[object, bool, list[dict], list[dict]]":
+    """处理单个事件行的 replayState 升级（无跨行状态）。
+
+    :param finish_kind: v0 形态（无内嵌 stream）事件对应 step 的 finish 原因，
+        由调用方从相邻的 ``assistant/chunk`` finish 事件追踪而来；仅用于
+        max-tokens 守卫。v2 形态从本行内嵌 stream 自取，无需传入。
+    :return: ``(新事件或原事件, 是否有变更, 命中列表, 跳过列表)``。
+    作用位置（同一事件内有几处就升级成同一个值）：
+      ``data.stream[].chunk.replayState``（v2：assistant/message 与
+      assistant/attempt）、``assistant/chunk.data.chunk.replayState``（v0）、
+      ``assistant/message.data.message.source.replayState``。
     """
     hits: list[dict] = []
+    skipped: list[dict] = []
     if not isinstance(event, dict) or not isinstance(event.get("data"), dict):
-        return event, False, hits
+        return event, False, hits, skipped
     data = event["data"]
     changed = False
-    if event.get("type") == "assistant/chunk" and isinstance(data.get("chunk"), dict):
-        new_chunk = _wrap_holder(
-            data["chunk"], "replayState", hits, "assistant/chunk.data.chunk.replayState", rewrite
-        )
-        if new_chunk is not data["chunk"]:
-            data = {**data, "chunk": new_chunk}
+
+    # ① 内嵌 stream 的 finish 块（v2 形态；assistant/message 与 assistant/attempt 通用）
+    stream = data.get("stream")
+    if isinstance(stream, list):
+        new_stream = []
+        stream_changed = False
+        for record in stream:
+            new_record, record_changed = _wrap_stream_record(record, hits, skipped, rewrite)
+            new_stream.append(new_record)
+            stream_changed = stream_changed or record_changed
+        if stream_changed:
+            data = {**data, "stream": new_stream}
             changed = True
+
+    # ② assistant/chunk 的 finish 块（v0 形态）
+    if event.get("type") == "assistant/chunk" and isinstance(data.get("chunk"), dict):
+        chunk = data["chunk"]
+        current = chunk.get("replayState")
+        if (
+            _finish_reason_kind(chunk) == "max-tokens"
+            and _is_flat_replay_state(current)
+            and _pruning_would_drop_block(current)
+        ):
+            skipped.append(
+                {
+                    "path": "assistant/chunk.data.chunk.replayState",
+                    "reason": "max-tokens 剪枝场景暂不支持自动升级",
+                    "fields": list(current.keys()),
+                }
+            )
+        else:
+            new_chunk = _wrap_holder(
+                data["chunk"], "replayState", hits, "assistant/chunk.data.chunk.replayState", rewrite
+            )
+            if new_chunk is not data["chunk"]:
+                data = {**data, "chunk": new_chunk}
+                changed = True
+
+    # ③ assistant/message 的 message.source.replayState
     if (
         event.get("type") == "assistant/message"
         and isinstance(data.get("message"), dict)
         and isinstance(data["message"].get("source"), dict)
     ):
-        new_source = _wrap_holder(
-            data["message"]["source"],
-            "replayState",
-            hits,
-            "assistant/message.data.message.source.replayState",
-            rewrite,
-        )
-        if new_source is not data["message"]["source"]:
-            data = {**data, "message": {**data["message"], "source": new_source}}
-            changed = True
+        source = data["message"]["source"]
+        current = source.get("replayState")
+        if _is_flat_replay_state(current) and _pruning_would_drop_block(current) and (
+            finish_kind == "max-tokens" or _event_finish_kinds(data) == ["max-tokens"]
+        ):
+            skipped.append(
+                {
+                    "path": "assistant/message.data.message.source.replayState",
+                    "reason": "max-tokens 剪枝需要 source 侧随内容剪枝、stream 侧保留全量，暂不支持自动升级",
+                    "fields": list(current.keys()),
+                }
+            )
+        else:
+            new_source = _wrap_holder(
+                source,
+                "replayState",
+                hits,
+                "assistant/message.data.message.source.replayState",
+                rewrite,
+            )
+            if new_source is not source:
+                data = {**data, "message": {**data["message"], "source": new_source}}
+                changed = True
+
     for hit in hits:
         hit["seq"] = event.get("seq")
+    for item in skipped:
+        item["seq"] = event.get("seq")
     if not changed:
-        return event, False, hits
-    return {**event, "data": data}, True, hits
+        return event, False, hits, skipped
+    return {**event, "data": data}, True, hits, skipped
+
+
+def _event_finish_kinds(data: dict) -> list:
+    """收集本事件内嵌 stream 里全部 finish 块的 reason.kind（v2 形态用）。"""
+    kinds = []
+    stream = data.get("stream")
+    if isinstance(stream, list):
+        for record in stream:
+            if isinstance(record, dict):
+                kind = _finish_reason_kind(record.get("chunk"))
+                if kind is not None:
+                    kinds.append(kind)
+    return kinds
 
 
 # --------------------------------------------------------------------------- #
@@ -1383,7 +1518,8 @@ def _new_session_report() -> dict:
         "torn_tail": False,        # 尾部存在写断的残留字节
         "format_version": None,    # header 的 version
         "session_id": None,        # header 的 id
-        "hits": [],                # replayState 包装命中 [{seq, path, fields}]
+        "hits": [],                # replayState 升级命中 [{seq, path, fields}]
+        "skipped": [],             # 主动跳过未升级的命中 [{seq, path, reason, fields}]
         "actions": [],             # 已识别的修复动作 [{rule, count, detail}]
         "problems": [],            # 其他问题（仅报告）
         "dup_fixes": [],           # 重复调用 id 去重命中 [{seq, callId, new_id}]
@@ -1414,14 +1550,33 @@ def _process_lines(lines: list[str], rewrite: bool, report: dict, all_events: li
         entries.append(None)
 
     changed_rows: dict[int, dict] = {}
-    # ① 扁平 replayState 包装（逐行、无跨行状态）
+    skipped: list[dict] = []
+    # v0 形态没有内嵌 stream，其 finish 原因在相邻的 assistant/chunk 事件里，
+    # 按 (turn, step) 追踪，供其后的 assistant/message 做 max-tokens 守卫。
+    finish_kinds: dict[tuple, str] = {}
+    # ① 扁平 replayState 升级（逐行为主；v0 形态借助跨行 finish 追踪）
     for i, event in enumerate(entries):
         if event is None:
             continue
-        new_event, row_changed, line_hits = wrap_line_event(event, rewrite)
+        event_data = event.get("data") if isinstance(event, dict) else None
+        if event.get("type") == "assistant/chunk" and isinstance(event_data, dict):
+            kind = _finish_reason_kind(event_data.get("chunk"))
+            if kind is not None:
+                finish_kinds[(event_data.get("turn"), event_data.get("step"))] = kind
+        fk = None
+        if (
+            event.get("type") == "assistant/message"
+            and isinstance(event_data, dict)
+            and not isinstance(event_data.get("stream"), list)
+        ):
+            fk = finish_kinds.get((event_data.get("turn"), event_data.get("step")))
+        new_event, row_changed, line_hits, line_skipped = wrap_line_event(event, rewrite, finish_kind=fk)
         report["hits"].extend(line_hits)
+        skipped.extend(line_skipped)
         if rewrite and row_changed:
             changed_rows[i] = new_event
+    if skipped:
+        report["skipped"] = skipped
 
     # ② 重复 tool-call id 去重（需跨行状态机，仅在显式开启时执行）
     if fix_dup_ids:
@@ -1476,10 +1631,22 @@ def _summarize(report: dict, all_events: list, rewrite: bool, changed: bool) -> 
         report["actions"].insert(
             0,
             {
-                "rule": "扁平replayState包装",
+                "rule": "replayState升级为信封",
                 "count": len(report["hits"]),
-                "detail": "把包络拆分前的扁平 replayState 的字段挪进 response 半区（不新增、不改写内容）",
+                "detail": (
+                    "把包络拆分前的扁平 replayState 升级为 {response, blocks} 信封；"
+                    "同一事件的内嵌 stream finish 块与 message.source 同值升级，"
+                    "保证与内嵌 stream 重组结果完全一致"
+                ),
             },
+        )
+    if report["skipped"]:
+        report["actions"].append(
+            {
+                "rule": "max-tokens剪枝场景跳过",
+                "count": len(report["skipped"]),
+                "detail": "该场景需要 stream 侧保留全量、source 侧随内容剪枝，本工具暂不自动升级，已原样保留",
+            }
         )
     dup_fixed = bool(report["dup_fixes"])
     report["problems"].extend(
@@ -1763,8 +1930,8 @@ class DshRepairPlan:
 def plan_dsh_repair(dsh_home: str, fix_dup_ids: bool = False) -> DshRepairPlan:
     """生成联合修复计划（不写盘）。
 
-    范围：① workspace.json 索引归属修复；② 会话文件内容（默认只修扁平
-    ``replayState`` 无损包装；``fix_dup_ids=True`` 才连重复 tool-call id 一起修）。
+    范围：① workspace.json 索引归属修复；② 会话文件内容（默认只把扁平
+    ``replayState`` 升级为信封；``fix_dup_ids=True`` 才连重复 tool-call id 一起修）。
     """
     home = resolve_dsh_home(dsh_home)
     index_plan, index_idx = plan_workspace_index_repair(home)
@@ -1846,7 +2013,7 @@ def main(argv: "list[str] | None" = None) -> int:
     - ``fix``：执行索引修复；默认 dry-run，加 ``--apply`` 才写盘
       （写盘前自动备份原文件，``--no-backup`` 可关）。
     - ``repair-data <文件或目录>``：检测/修复会话文件内容（扁平 replayState
-      包装，可选重复 tool-call id 去重）；默认 dry-run，加 ``--apply`` 写盘
+      升级为信封，可选重复 tool-call id 去重）；默认 dry-run，加 ``--apply`` 写盘
       并自动备份。
     """
     import argparse

@@ -555,27 +555,101 @@ class TestFlatReplayWrap(unittest.TestCase):
                                             "replayState": {"kind": "pi-ai", "version": 1}}}},
         }
         # 检测模式：命中但不改
-        new_event, changed, hits = dr.wrap_line_event(chunk_event, rewrite=False)
+        new_event, changed, hits, skipped = dr.wrap_line_event(chunk_event, rewrite=False)
         self.assertFalse(changed)
         self.assertIs(new_event, chunk_event)
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["path"], "assistant/chunk.data.chunk.replayState")
         self.assertEqual(hits[0]["fields"], ["kind", "version"])
         self.assertEqual(hits[0]["seq"], 1)
+        self.assertEqual(skipped, [])
 
         # 修复模式：只改 replayState 键，其余字段保留
-        new_event, changed, hits = dr.wrap_line_event(message_event, rewrite=True)
+        new_event, changed, hits, skipped = dr.wrap_line_event(message_event, rewrite=True)
         self.assertTrue(changed)
         self.assertEqual(hits[0]["path"], "assistant/message.data.message.source.replayState")
         source = new_event["data"]["message"]["source"]
         self.assertEqual(source["replayState"], {"response": {"kind": "pi-ai", "version": 1}})
         self.assertEqual(source["callId"], "c1")
         self.assertEqual(message_event["data"]["message"]["source"]["replayState"]["kind"], "pi-ai")
+        self.assertEqual(skipped, [])
 
-    def test_non_json_line_passes_through(self):
-        event, changed, hits = dr.wrap_line_event("not json", rewrite=True)
+    def test_stream_and_source_upgrade_to_same_envelope(self):
+        """v2 形态：内嵌 stream finish 块与 message.source 必须同值升级。
+
+        DSH 的镜像校验要求 message.source.replayState 与「从 stream 重组出来的
+        replayState」（即 finish 块那份的原样回显）完全相等；只改一侧必然触发
+        「replay state disagrees with its embedded stream」。
+        """
+        flat = {"kind": "pi-ai", "version": 1, "api": "openai-completions",
+                "provider": "p", "model": "m", "responseId": "r",
+                "stopReason": "toolUse", "blocks": [{"type": "tool-call"}]}
+        event = {
+            "type": "assistant/message", "seq": 7,
+            "data": {
+                "message": {"source": {"kind": "model", "provider": "p", "model": "m",
+                                       "replayState": dict(flat)}},
+                "stream": [
+                    {"type": "chunk", "time": 1, "chunk": {"type": "block-start", "index": 0}},
+                    {"type": "chunk", "time": 2, "chunk": {"type": "finish",
+                                                           "reason": {"kind": "tool-calls"},
+                                                           "replayState": dict(flat)}},
+                ],
+            },
+        }
+        new_event, changed, hits, skipped = dr.wrap_line_event(event, rewrite=True)
+        self.assertTrue(changed)
+        self.assertEqual(skipped, [])
+        paths = sorted(h["path"] for h in hits)
+        self.assertEqual(paths, ["assistant/message.data.message.source.replayState",
+                                 "data.stream[].chunk.replayState"])
+        source = new_event["data"]["message"]["source"]["replayState"]
+        finish = new_event["data"]["stream"][1]["chunk"]["replayState"]
+        # 镜像不变式：两侧完全相等，且都是信封
+        self.assertEqual(source, finish)
+        self.assertEqual(set(source.keys()), {"response", "blocks"})
+        self.assertEqual(source["response"], {k: v for k, v in flat.items() if k != "blocks"})
+        self.assertEqual(source["blocks"], flat["blocks"])
+        # 原 stream 里非 finish 记录原样保留
+        self.assertEqual(new_event["data"]["stream"][0]["chunk"]["type"], "block-start")
+
+    def test_attempt_stream_finish_also_upgraded(self):
+        """assistant/attempt 的内嵌 stream finish 块同样要升级（格式校验覆盖它）。"""
+        event = {
+            "type": "assistant/attempt", "seq": 3,
+            "data": {"stream": [{"type": "chunk", "time": 1,
+                                 "chunk": {"type": "finish", "reason": {"kind": "stop"},
+                                           "replayState": {"kind": "pi-ai", "version": 1}}}]},
+        }
+        new_event, changed, hits, _ = dr.wrap_line_event(event, rewrite=True)
+        self.assertTrue(changed)
+        self.assertEqual(hits[0]["path"], "data.stream[].chunk.replayState")
+        finish = new_event["data"]["stream"][0]["chunk"]["replayState"]
+        self.assertEqual(finish, {"response": {"kind": "pi-ai", "version": 1}})
+
+    def test_max_tokens_with_tool_call_block_is_skipped(self):
+        """max-tokens 剪枝场景需要两侧取不同值，本工具跳过并上报，绝不猜测改写。"""
+        flat = {"kind": "pi-ai", "version": 1, "blocks": [{"type": "tool-call"}]}
+        event = {
+            "type": "assistant/message", "seq": 9,
+            "data": {
+                "message": {"source": {"kind": "model", "replayState": dict(flat)}},
+                "stream": [{"type": "chunk", "time": 1,
+                            "chunk": {"type": "finish", "reason": {"kind": "max-tokens"},
+                                      "replayState": dict(flat)}}],
+            },
+        }
+        new_event, changed, hits, skipped = dr.wrap_line_event(event, rewrite=True)
         self.assertFalse(changed)
         self.assertEqual(hits, [])
+        self.assertEqual(len(skipped), 2)  # stream 侧与 source 侧各记一条
+        self.assertIs(new_event, event)    # 原样保留
+
+    def test_non_json_line_passes_through(self):
+        event, changed, hits, skipped = dr.wrap_line_event("not json", rewrite=True)
+        self.assertFalse(changed)
+        self.assertEqual(hits, [])
+        self.assertEqual(skipped, [])
 
 
 # --------------------------------------------------------------------------- #
@@ -714,7 +788,7 @@ class TestSessionDataRepair(unittest.TestCase):
         self.assertEqual(report["format_version"], 0)
         self.assertEqual(report["session_id"], "session-r")
         self.assertEqual(len(report["hits"]), 1)
-        self.assertEqual(report["actions"][0]["rule"], "扁平replayState包装")
+        self.assertEqual(report["actions"][0]["rule"], "replayState升级为信封")
         self.assertFalse(report["changed"])
         self.assertTrue(any(p["code"] == "seq 不连续" for p in report["problems"]))
 
@@ -1149,9 +1223,9 @@ class TestCombinedPlan(unittest.TestCase):
         self.assertEqual(len(plan.index_plan.mutations), 1)
         self.assertEqual(len(plan.data_reports), 1)
         self.assertEqual(plan.data_reports[0]["status"], "需要修复")
-        self.assertEqual(plan.data_reports[0]["actions"][0]["rule"], "扁平replayState包装")
+        self.assertEqual(plan.data_reports[0]["actions"][0]["rule"], "replayState升级为信封")
         self.assertFalse(plan.empty)
-        self.assertIn("扁平replayState包装", "\n".join(plan.describe()))
+        self.assertIn("replayState升级为信封", "\n".join(plan.describe()))
 
     def test_apply_repairs_both_and_becomes_healthy(self):
         plan = dr.plan_dsh_repair(self.fx.dsh)
@@ -1209,7 +1283,7 @@ class TestCliRepairData(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("需修复 1", out)
         self.assertIn("dry-run", out)
-        self.assertIn("扁平replayState包装", out)
+        self.assertIn("replayState升级为信封", out)
         with open(self.path, "rb") as fh:
             self.assertEqual(fh.read(), self.content)
 
@@ -1253,7 +1327,7 @@ class TestCliRepairData(unittest.TestCase):
         code, out, _ = self._run("fix", "--dsh-home", fx.dsh)
         self.assertEqual(code, 0)
         self.assertIn("加入工作区", out)
-        self.assertIn("扁平replayState包装", out)
+        self.assertIn("replayState升级为信封", out)
         self.assertIn("dry-run", out)
 
 
