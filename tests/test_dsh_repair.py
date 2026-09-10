@@ -429,6 +429,84 @@ class TestLegacyReplayDetection(unittest.TestCase):
         self.assertEqual(len(report["hits"]), 1)
 
 
+class TestIncompatibleDescriptorDetection(unittest.TestCase):
+    """subagent/descriptor 版本兼容性检测（只检测不修复）。
+
+    依据官方 v0→v1 迁移校验（``assertReleasedEventPayload``）：该事件
+    ``version`` 不是 3 时迁移以 ``SessionFormatUnsupportedMigrationError``
+    拒绝，会话无法加载。真实数据里的 6 个 TeaVision 子代理会话即属此类，
+    且它们已登记进索引——检测必须覆盖已登记会话，否则永远漏报。
+    """
+
+    def setUp(self):
+        _enable_fake_zstd()
+        self.addCleanup(_disable_fake_zstd)
+        self.fx = _FakeDshHome()
+        self.addCleanup(self.fx.cleanup)
+
+    def _session_content(self, session_id: str, descriptor_version="omit") -> bytes:
+        """descriptor_version：数字 → 事件带该 version；None → 事件缺 version 键；
+        "omit" → 完全没有 subagent/descriptor 事件。"""
+        lines = [json.dumps({
+            "type": "session", "version": 0, "id": session_id,
+            "createdAt": 1, "cwd": "D:\\project\\r", "delegationDepth": 0,
+        })]
+        if descriptor_version != "omit":
+            data = {} if descriptor_version is None else {"version": descriptor_version}
+            lines.append(json.dumps({
+                "type": "subagent/descriptor", "seq": 1, "time": 2, "data": data,
+            }))
+        return ("\n".join(lines) + "\n").encode("utf-8")
+
+    def _scan(self, session_dir: str) -> tuple:
+        decompress, _compress, _name = dr.zstd_backend()
+        # fx.session 返回会话目录；_scan_file_content 需要日志文件路径
+        log_file = os.path.join(session_dir, "session.jsonl.zstd")
+        return dr._scan_file_content(log_file, decompress)
+
+    def test_descriptor_v2_is_flagged(self):
+        path = self.fx.session("--D-project-r--", "session-desc2",
+                               self._session_content("session-desc2", 2))
+        legacy, dup, descriptor_bad = self._scan(path)
+        self.assertFalse(legacy)
+        self.assertFalse(dup)
+        self.assertTrue(descriptor_bad)
+
+    def test_descriptor_v3_is_not_flagged(self):
+        path = self.fx.session("--D-project-r--", "session-desc3",
+                               self._session_content("session-desc3", 3))
+        _legacy, _dup, descriptor_bad = self._scan(path)
+        self.assertFalse(descriptor_bad)
+
+    def test_missing_version_is_flagged(self):
+        """缺失 version 与非法值同样过不了官方的计数校验，应如实标记。"""
+        path = self.fx.session("--D-project-r--", "session-desc0",
+                               self._session_content("session-desc0", None))
+        _legacy, _dup, descriptor_bad = self._scan(path)
+        self.assertTrue(descriptor_bad)
+
+    def test_no_descriptor_event_is_not_flagged(self):
+        path = self.fx.session("--D-project-r--", "session-plain",
+                               self._session_content("session-plain", "omit"))
+        _legacy, _dup, descriptor_bad = self._scan(path)
+        self.assertFalse(descriptor_bad)
+
+    def test_grouped_session_with_bad_descriptor_is_detected(self):
+        """已登记进索引的会话也要纳入内容扫描（真实场景：索引里有、加载不了）。"""
+        index = _make_ws_index({
+            "ws-r": {"path": "D:\\project\\r", "title": "r",
+                     "sessionIds": ["session-desc2"], "createdAt": "t1", "updatedAt": "t1"},
+        })
+        self.fx.session("--D-project-r--", "session-desc2",
+                        self._session_content("session-desc2", 2))
+        self.fx.write_index(index)
+        result = dr.detect_ungrouped(self.fx.dsh, decompress=lambda b: b)
+        self.assertEqual(result.descriptor_bad_sessions, ["session-desc2"])
+        self.assertEqual(result.ungrouped, [])          # 已登记，不算未分组
+        self.assertFalse(result.healthy)
+        self.assertTrue(any("子代理描述符不兼容" in line for line in result.summary_lines()))
+
+
 @unittest.skipUnless(_real_backend(), "需要真实 zstd 后端")
 class TestPlaintextLogDetection(unittest.TestCase):
     """明文会话日志（DSH ``compression: none``）的检测路径不得被静默跳过。
@@ -1165,9 +1243,10 @@ class TestRealZstdFrames(unittest.TestCase):
         with open(path, "wb") as fh:
             fh.write(buffer)
 
-        legacy, dup = dr._scan_file_content(path, dr.zstd_backend()[0])
+        legacy, dup, descriptor_bad = dr._scan_file_content(path, dr.zstd_backend()[0])
         self.assertTrue(legacy, "U+2028 不应让检测漏报")
         self.assertFalse(dup)
+        self.assertFalse(descriptor_bad)
         _, report = dr.repair_session_data(buffer)
         self.assertEqual(len(report["hits"]), 1)
 

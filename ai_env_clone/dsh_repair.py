@@ -24,6 +24,11 @@ DSH 旧会话数据「未分组 / 无法加载」检测与修复（纯标准库�
    迁移器会自动把它复制进合成 stream 的 finish 块）。max-tokens 剪枝场景
    （需要两侧取不同值）本工具跳过并上报，绝不猜测改写。
 
+3. **子代理描述符不兼容（只检测不修复）**：旧构建写下的
+   ``subagent/descriptor`` 事件 ``version`` 不是 3 时，官方 v0→v1 迁移直接
+   拒绝（``SessionFormatUnsupportedMigrationError``），会话无法加载；修复
+   需要理解子代理描述符 v2→v3 的官方契约，本工具仅检测并如实标记。
+
 zstd 说明：会话日志是 Zstandard 压缩的 JSONL，Python 标准库**没有** zstd。
 本模块按需探测可用后端（``zstandard`` / ``pyzstd`` / 系统 ``zstd`` 命令），
 没有则自动降级为「仅目录级检测」（不读文件内容）；修复仍可完成
@@ -392,6 +397,7 @@ class SessionOnDisk:
     header_error: str = ""      # header 读取失败原因（空串=成功/未尝试）
     legacy_replay: bool = False  # 内容含扁平 replayState（旧格式，需 zstd）
     dup_call_ids: bool = False   # 同 step 内重复宣告 tool-call id（需 zstd）
+    descriptor_bad: bool = False  # 含官方迁移不支持的 subagent/descriptor 版本（无法加载，暂不修复）
     log_file: str = ""          # 生效的会话日志文件（同目录内代际最高者）
     log_version: int = 0        # 该文件的格式代际（0 = session.jsonl.zstd）
 
@@ -519,20 +525,25 @@ def _is_flat_replay_state(value) -> bool:
     return isinstance(value, dict) and "kind" in value and "response" not in value
 
 
-def _scan_file_content(log_file: str, decompress: "Callable[[bytes], bytes]") -> "tuple[bool, bool]":
-    """扫描整份会话日志：返回 ``(是否含扁平 replayState, 是否含同 step 重复 tool-call id)``。
+def _scan_file_content(log_file: str, decompress: "Callable[[bytes], bytes]") -> "tuple[bool, bool, bool]":
+    """扫描整份会话日志。
 
+    :return: ``(是否含扁平 replayState, 是否含同 step 重复 tool-call id,
+        是否含官方迁移不支持的 subagent/descriptor 版本)``。
     扁平 replayState 判定为「有 ``kind``、无 ``response``」（与升级器的信封
     转换条件完全一致，故检测到的命中数与升级器实际改写的数量一致）；
-    重复 tool-call id 按 ``turn/start`` / ``step/end`` 重置。
+    重复 tool-call id 按 ``turn/start`` / ``step/end`` 重置；
+    subagent/descriptor 依据官方 v0→v1 迁移校验（``assertReleasedEventPayload``）：
+    该事件的 ``version`` 不是 3 时迁移直接拒绝，会话无法加载（本工具只检测、不修复）。
     与格式版本无关（v0/v1 数据都可能带扁平形态）。
     """
     try:
         text = _read_log_text(log_file, decompress)
     except Exception:
-        return False, False
+        return False, False, False
     events: list[dict] = []
     legacy = False
+    descriptor_bad = False
     # 只能按 "\n" 切行：JSONL 的行边界是 \n，而 str.splitlines() 还会在
     # U+2028/U+2029/U+0085 等处断行——这些字符 JSON.stringify 不转义、会原样
     # 出现在正文里，会让整行 JSON 解析失败而被静默跳过（检测漏报，修复却会改写）。
@@ -550,6 +561,11 @@ def _scan_file_content(log_file: str, decompress: "Callable[[bytes], bytes]") ->
         data = entry.get("data")
         if not isinstance(data, dict):
             continue
+        if entry.get("type") == "subagent/descriptor":
+            version = data.get("version")
+            # 官方要求 version === 3；缺失或其它值（含非法类型）都会被迁移拒绝
+            if not (isinstance(version, (int, float)) and not isinstance(version, bool) and version == 3):
+                descriptor_bad = True
         chunk = data.get("chunk")
         if isinstance(chunk, dict) and _is_flat_replay_state(chunk.get("replayState")):
             legacy = True
@@ -560,7 +576,7 @@ def _scan_file_content(log_file: str, decompress: "Callable[[bytes], bytes]") ->
             and _is_flat_replay_state(message["source"].get("replayState"))
         ):
             legacy = True
-    return legacy, bool(_duplicate_advertised_ids(events))
+    return legacy, bool(_duplicate_advertised_ids(events)), descriptor_bad
 
 
 def scan_sessions(dsh_home: str) -> list[SessionOnDisk]:
@@ -676,17 +692,19 @@ class DetectResult:
     index_exists: bool = True
     legacy_replay_sessions: list[str] = field(default_factory=list)
     dup_id_sessions: list[str] = field(default_factory=list)  # 含同 step 重复 tool-call id 的会话
+    descriptor_bad_sessions: list[str] = field(default_factory=list)  # 子代理描述符版本不受官方迁移支持、无法加载的会话
     zstd_name: str = ""
     zstd_missing: bool = False
 
     @property
     def healthy(self) -> bool:
-        """无未分组、索引无问题、无旧格式 / 重复调用 id 会话。"""
+        """无未分组、索引无问题、无旧格式 / 重复调用 id / 描述符不兼容会话。"""
         return (
             not self.ungrouped
             and not self.index_problems
             and not self.legacy_replay_sessions
             and not self.dup_id_sessions
+            and not self.descriptor_bad_sessions
         )
 
     def summary_lines(self) -> list[str]:
@@ -713,6 +731,12 @@ class DetectResult:
             lines.append(
                 "重复调用 id 会话（v0→v1 迁移会拒绝）：%d 个，需在「修复重复调用 ID」勾选时一并处理"
                 % len(self.dup_id_sessions)
+            )
+        if self.descriptor_bad_sessions:
+            lines.append(
+                "子代理描述符不兼容会话（subagent/descriptor 版本不受官方迁移支持，无法加载）：%d 个，"
+                "本工具暂不自动修复，已原样保留"
+                % len(self.descriptor_bad_sessions)
             )
         if self.zstd_missing:
             lines.append(
@@ -794,6 +818,15 @@ def detect_ungrouped(
     known = _collect_index_sessions(idx)
 
     for session in sessions:
+        # 内容扫描覆盖全部会话（不只未分组）：已登记的历史会话同样可能带
+        # 扁平 replayState，或含官方迁移不支持的子代理描述符版本
+        if decompress and with_content_check:
+            legacy, dup, descriptor_bad = _scan_file_content(session.log_file, decompress)
+            session.legacy_replay = legacy
+            session.dup_call_ids = dup
+            session.descriptor_bad = descriptor_bad
+        if session.descriptor_bad:
+            result.descriptor_bad_sessions.append(session.session_id)
         if session.session_id in known:
             continue
         # 尝试读 header（仅当有 zstd）
@@ -801,10 +834,6 @@ def detect_ungrouped(
             header, err = _read_session_header(session.log_file, decompress)
             session.header = header
             session.header_error = err
-            if with_content_check:
-                legacy, dup = _scan_file_content(session.log_file, decompress)
-                session.legacy_replay = legacy
-                session.dup_call_ids = dup
         wid, _ = _find_workspace_for_session(session, workspaces, decompress)
         result.ungrouped.append(session)
         if wid is not None:
@@ -843,6 +872,23 @@ def detect_duplicate_call_ids(dsh_home: str) -> list[str]:
     out: list[str] = []
     for session in scan_sessions(home):
         if _scan_file_content(session.log_file, decompress)[1]:
+            out.append(session.session_id)
+    return out
+
+
+def detect_incompatible_descriptors(dsh_home: str) -> list[str]:
+    """仅做子代理描述符兼容性检测（需要 zstd），返回无法加载的会话 id 列表。
+
+    官方 v0→v1 迁移要求 ``subagent/descriptor.version === 3``，旧版本描述符
+    会被 ``SessionFormatUnsupportedMigrationError`` 拒绝；本工具只检测不修复。
+    """
+    decompress, _compress, _name = zstd_backend()
+    if not decompress:
+        return []
+    home = resolve_dsh_home(dsh_home)
+    out: list[str] = []
+    for session in scan_sessions(home):
+        if _scan_file_content(session.log_file, decompress)[2]:
             out.append(session.session_id)
     return out
 
@@ -2097,6 +2143,7 @@ def main(argv: "list[str] | None" = None) -> int:
                                 "cwd": s.cwd,
                                 "legacy_replay": s.legacy_replay,
                                 "dup_call_ids": s.dup_call_ids,
+                                "descriptor_bad": s.descriptor_bad,
                             }
                             for s in result.ungrouped
                         ],
@@ -2106,6 +2153,7 @@ def main(argv: "list[str] | None" = None) -> int:
                         "index_problems": result.index_problems,
                         "legacy_replay_sessions": result.legacy_replay_sessions,
                         "dup_id_sessions": result.dup_id_sessions,
+                        "descriptor_bad_sessions": result.descriptor_bad_sessions,
                     },
                     ensure_ascii=False,
                     indent=2,
