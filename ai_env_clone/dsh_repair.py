@@ -733,10 +733,15 @@ class DetectResult:
                 % len(self.dup_id_sessions)
             )
         if self.descriptor_bad_sessions:
+            # 与未分组会话取交集：描述符不兼容的会话很可能就是未分组的那批，
+            # 标注重叠避免用户误以为「可修复 6 + 不兼容 6 = 12 个」而数量对不上。
+            db_ids = set(self.descriptor_bad_sessions)
+            overlap = len({s.session_id for s in self.ungrouped} & db_ids)
+            same = "" if overlap == 0 else "（其中 %d 个与上方未分组会话为同一批）" % overlap
             lines.append(
-                "子代理描述符不兼容会话（subagent/descriptor 版本不受官方迁移支持，无法加载）：%d 个，"
+                "子代理描述符不兼容会话（subagent/descriptor 版本不受官方迁移支持，无法加载）：%d 个%s，"
                 "本工具暂不自动修复，已原样保留"
-                % len(self.descriptor_bad_sessions)
+                % (len(self.descriptor_bad_sessions), same)
             )
         if self.zstd_missing:
             lines.append(

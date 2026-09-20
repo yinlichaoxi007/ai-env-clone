@@ -317,6 +317,12 @@ class QoderBackupApp:
             anchor="w", justify="left", wraplength=760,
         )
         self.dsh_health_label.pack(fill=tk.X)
+        # zstd 缺失时显示「安装并重新检测」按钮（默认隐藏，按检测结果切换）
+        self.dsh_zstd_install_btn = ttk.Button(
+            self.dsh_health_frame, text="安装 zstd 并重新检测",
+            command=self._dsh_install_zstd, width=20,
+        )
+        self.dsh_zstd_install_btn.pack_forget()
         health_row = ttk.Frame(self.dsh_health_frame)
         health_row.pack(fill=tk.X, pady=(2, 0))
         self.dsh_check_btn = ttk.Button(
@@ -342,6 +348,9 @@ class QoderBackupApp:
             foreground="#666",
         ).pack(side=tk.LEFT, padx=(8, 0))
         # 默认隐藏；选中 dsh 工具时由 _update_dsh_health_visibility 显示
+        # 是否已检测且存在未分组会话：None=未检测、True/False=已检测结论，
+        # 供修复按钮置灰判断（无未分组会话时禁用，避免无谓点击）。
+        self._dsh_has_ungrouped = None
         self.dsh_health_frame.pack_forget()
 
         # 备份内容
@@ -1065,15 +1074,27 @@ class QoderBackupApp:
             frame.pack_forget()
 
     def _set_dsh_buttons_state(self) -> None:
-        """数据目录有效时启用检测/修复按钮，否则禁用。"""
+        """数据目录有效时启用检测按钮；修复按钮另需「存在未分组会话」才启用。
+
+        修复按钮置灰规则：目录无效 → 禁用；已检测且明确无未分组会话
+        （``_dsh_has_ungrouped is False``）→ 禁用；其余（未检测 / 有无分组）
+        → 可用，避免用户点击后被告知「无需修复」造成困惑。
+        """
         ok = os.path.isdir(self.root_dir)
-        for btn in ("dsh_check_btn", "dsh_fix_btn"):
-            w = getattr(self, btn, None)
-            if w is not None:
-                try:
-                    w.configure(state="normal" if ok else "disabled")
-                except tk.TclError:
-                    pass
+        check_w = getattr(self, "dsh_check_btn", None)
+        if check_w is not None:
+            try:
+                check_w.configure(state="normal" if ok else "disabled")
+            except tk.TclError:
+                pass
+        fix_w = getattr(self, "dsh_fix_btn", None)
+        if fix_w is not None:
+            has_ungrouped = getattr(self, "_dsh_has_ungrouped", None)
+            fix_ok = ok and (has_ungrouped is not False)
+            try:
+                fix_w.configure(state="normal" if fix_ok else "disabled")
+            except tk.TclError:
+                pass
 
     def _dsh_check(self) -> None:
         """检测 DSH 会话健康：未分组会话 / 索引问题 / 旧格式 replayState / 重复调用 ID。"""
@@ -1091,6 +1112,46 @@ class QoderBackupApp:
             self.msg_queue.put(("dsh_report", (result, zstd_name)))
 
         self._run_bg(work)
+
+    def _show_dsh_report_dialog(self, title: str, text: str) -> None:
+        """显示白底黑字的自定义报告弹窗，避免系统暗色主题下 messagebox 文字看不清。"""
+        top = tk.Toplevel(self.root)
+        top.title(title)
+        top.transient(self.root)
+        top.configure(bg="white")
+        top.resizable(False, False)
+        try:
+            icon = self.root.wm_iconbitmap()
+            if icon:
+                top.iconbitmap(icon)
+        except Exception:
+            pass
+
+        lbl = tk.Label(
+            top,
+            text=text,
+            bg="white",
+            fg="black",
+            justify=tk.LEFT,
+            anchor="nw",
+            wraplength=460,
+            padx=12,
+            pady=12,
+            font=("", 10),
+        )
+        lbl.pack(fill=tk.BOTH, expand=True)
+
+        btn = ttk.Button(top, text="确定", command=top.destroy, width=10)
+        btn.pack(pady=(0, 12))
+        btn.focus_set()
+
+        top.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - top.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - top.winfo_height()) // 2
+        top.geometry(f"+{x}+{y}")
+
+        top.grab_set()
+        top.wait_window(top)
 
     def _dsh_fix(self) -> None:
         """修复：workspace 索引归属 + 会话文件内容（勾选时含重复调用 ID 去重）。
@@ -1120,6 +1181,15 @@ class QoderBackupApp:
             text=text,
             foreground="#0a6" if result.healthy else "#c60",
         )
+        # zstd 缺失时显示「安装并重新检测」按钮，否则隐藏（成对处理，不留残留）
+        if getattr(result, "zstd_missing", False):
+            self.dsh_zstd_install_btn.pack(fill=tk.X, pady=(4, 0))
+        else:
+            self.dsh_zstd_install_btn.pack_forget()
+        # 记录未分组结论并据此置灰修复按钮（无未分组会话时禁用，避免无谓点击）
+        self._dsh_has_ungrouped = bool(getattr(result, "ungrouped", []))
+        self._set_dsh_buttons_state()
+        self._fit_layout()
         self._set_status("DSH 会话健康检测完成")
         if result.healthy:
             title = "DSH 会话健康：正常"
@@ -1131,7 +1201,70 @@ class QoderBackupApp:
                 + len(result.dup_id_sessions)
                 + len(result.descriptor_bad_sessions)
             )
-        messagebox.showinfo(title, text)
+        self._show_dsh_report_dialog(title, text)
+
+    def _dsh_install_zstd(self) -> None:
+        """点击「安装 zstd 并重新检测」：后台安装 zstd 后端后重新探测并复检。
+
+        仅当环境可就地安装时（源码运行）才尝试 pip；打包后的 exe 冻结环境
+        无法把 zstd 装进自身，直接标记为不可安装，交由主线程提示改用源码运行。
+        """
+        if self.busy:
+            messagebox.showwarning("请稍候", "当前有任务正在执行。")
+            return
+        self._set_status("正在安装 zstd 解压支持…")
+
+        def work():
+            from ai_env_clone.dsh_repair import zstd_backend
+
+            # 冻结（PyInstaller 单文件 exe）环境：sys.path 指向临时 _MEI 目录，
+            # pip 装不进运行期，避免无谓网络等待。
+            frozen = bool(getattr(sys, "frozen", False))
+            ok = False
+            name = ""
+            if not frozen:
+                for pkg in ("zstandard", "pyzstd"):
+                    code = subprocess.run(
+                        [sys.executable, "-m", "pip", "install", pkg],
+                        capture_output=True, text=True,
+                    ).returncode
+                    if code == 0:
+                        break
+                decompress, _compress, name = zstd_backend()  # 重新探测（会重新 import）
+                ok = decompress is not None
+            self.msg_queue.put(("dsh_zstd_installed", (ok, name, frozen)))
+
+        self._run_bg(work)
+
+    def _on_zstd_installed(self, payload) -> None:
+        """主线程处理安装结果：成功则隐藏按钮并复检；失败则区分环境给出指引。"""
+        ok, name, frozen = payload
+        if ok:
+            self._set_status("已安装 zstd（%s），正在重新检测…" % name)
+            # 隐藏按钮；复检后若 zstd 已可用，_render_dsh_report 不会再显示它
+            self.dsh_zstd_install_btn.pack_forget()
+            self._fit_layout()
+            self._dsh_check()
+            return
+        self._set_status("zstd 安装失败")
+        if frozen:
+            messagebox.showwarning(
+                "无法在打包程序中安装",
+                "当前运行的是打包后的 AiEnvClone.exe，无法就地安装 zstd。\n\n"
+                "方式一：改源码运行（推荐）\n"
+                "  1) 删除 dist\\AiEnvClone.exe\n"
+                "  2) 重新运行 run.bat（会自动回退到 Python 源码运行）\n"
+                "  3) 在源码模式下点击「安装 zstd 并重新检测」完成安装\n\n"
+                "方式二：手动命令行安装\n"
+                "  pip install zstandard\n"
+                "  python -m ai_env_clone",
+            )
+        else:
+            messagebox.showerror(
+                "zstd 安装失败",
+                "自动安装 zstandard / pyzstd 失败（可能是网络问题）。\n"
+                "请手动执行：pip install zstandard，然后重新检测。",
+            )
 
     def _confirm_dsh_fix(self, plan) -> None:
         """主线程确认联合修复计划，确认后后台备份 + 写盘。"""
@@ -1313,6 +1446,10 @@ class QoderBackupApp:
                         self.pbar["value"] = 0
                         result, zstd_name = payload
                         self._render_dsh_report(result, zstd_name)
+                    elif kind == "dsh_zstd_installed":
+                        # zstd 自动安装完成（后台线程产出，主线程处理）
+                        self.pbar["value"] = 0
+                        self._on_zstd_installed(payload)
                     elif kind == "dsh_fix_plan":
                         # 联合修复计划已生成：主线程确认后执行
                         self.pbar["value"] = 0
