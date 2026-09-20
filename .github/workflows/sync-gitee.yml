@@ -1,0 +1,68 @@
+name: Sync Release to Gitee (manual)
+
+# 手动补传：GitHub Release 的二进制资产因超时未同步到 Gitee 时，手动触发本 workflow。
+# 从 GitHub 下载对应 tag 的资产（GitHub 内网秒级），复用 gitee_upload.sh 补传 Gitee，
+# 无需重新构建。gitee_upload.sh 幂等，已上传的资产自动跳过。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要补传的 tag（留空=最新 release）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Sync assets to Gitee
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag & prerelease
+        id: resolve
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+          fi
+          if [ -z "$TAG" ]; then
+            echo "!! no release found and no tag given"
+            exit 1
+          fi
+          case "$TAG" in
+            *[Rr][Cc]*|*[Bb][Ee][Tt][Aa]*|*[Aa][Ll][Pp][Hh][Aa]*|*[Pp][Rr][Ee][Vv][Ii][Ee][Ww]*|*[Dd][Ee][Vv]*)
+              echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "resolved tag: $TAG"
+
+      - name: Download assets from GitHub
+        shell: bash
+        run: |
+          mkdir -p assets
+          gh release download "${{ steps.resolve.outputs.tag }}" --dir assets
+          ls -la assets
+
+      - name: Sync to Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN || '' }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          PRERELEASE: ${{ steps.resolve.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -e
+          if [ -z "$GITEE_TOKEN" ]; then
+            echo "GITEE_TOKEN 未配置，跳过 Gitee 同步"
+            exit 0
+          fi
+          bash .github/scripts/gitee_upload.sh "yinlichaoxi007/ai-env-clone" "$TAG" "$PRERELEASE" assets
