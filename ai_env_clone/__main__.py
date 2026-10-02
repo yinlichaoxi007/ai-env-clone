@@ -26,6 +26,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 from ai_env_clone.adapters import get_adapter, list_adapters
+from ai_env_clone import import_matrix, session_migration, workspace_plan
 from ai_env_clone.compress_estimate import (
     COMPRESS_LEVELS,
     DEFAULT_COMPRESS_LEVEL,
@@ -39,10 +40,14 @@ from ai_env_clone.core import (
     BackupError,
     ProgressInfo,
     classify_zip_name,
+    companion_notes,
     import_backup,
     inspect_backup,
     list_backup_dir,
+    manifest_origin_info,
+    origin_info_lines,
     scan_items,
+    session_workspaces_lines,
 )
 
 APP_TITLE_TPL = "%s 备份迁移工具"  # % (tool_display_name,)
@@ -158,8 +163,10 @@ class QoderBackupApp:
         # 记住用户本次选择，下次启动默认沿用
         _save_last_tool(self.adapter.name)
         self.status.configure(text="已切换到 %s" % self.adapter.display_name)
-        # dsh 工具显示「会话健康」行，其他工具隐藏
-        self._update_dsh_health_visibility()
+        # 导入能力区随所选工具刷新（提示可导入的软件 / 版本 / 数据范围）
+        self._refresh_import_matrix()
+        # 仅特定工具显示的行（DSH 会话健康行 / Qoder 历史诊断行）随工具刷新
+        self._update_tool_rows_visibility()
 
     def _build_ui(self) -> None:
         pad = {"padx": 12, "pady": 6}
@@ -353,6 +360,25 @@ class QoderBackupApp:
         self._dsh_has_ungrouped = None
         self.dsh_health_frame.pack_forget()
 
+        # Qoder 历史诊断行：仅选中 qoder 时显示。新版 Qoder CN 已改为独立桌面端
+        # （Electron，数据根 %APPDATA%/com.qodercn.app.stable，会话主库 main.sqlite），
+        # 旧数据在 ~/.qoder-cn；应用内「导入旧版数据」只搬它认识的那部分，
+        # 常见「导入成功但历史仍不可见」。此处给出结构化诊断（见 adapters.qoder.diagnose_history）。
+        self.qoder_diag_frame = ttk.LabelFrame(self.root, text="历史会话诊断")
+        diag_row = ttk.Frame(self.qoder_diag_frame)
+        diag_row.pack(fill=tk.X, pady=(2, 0))
+        self.qoder_diag_btn = ttk.Button(
+            diag_row, text="检测历史会话", command=self._qoder_diag, width=14
+        )
+        self.qoder_diag_btn.pack(side=tk.LEFT)
+        ttk.Label(
+            diag_row,
+            text="诊断「新版导入数据后仍看不到历史会话」：对比新旧两处数据根"
+            "（新版 main.sqlite / 旧版 local.db）与导入账本，给出成因结论",
+            foreground="#666",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        self.qoder_diag_frame.pack_forget()
+
         # 备份内容
         # mid 不 expand：高度由内部（bar + 锁高 inner 285）自然决定，不吸收主窗
         # 剩余竖向空间——否则识别区较矮的 qoder 会把大量空白灌到 mid 内 inner
@@ -443,6 +469,44 @@ class QoderBackupApp:
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 0), pady=0)
         sb.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 0), pady=0)
 
+        # 数据导入：在**当前所选工具**的备份窗口内，提示「可导入的软件 + 版本 +
+        # 数据范围 + 状态」，并提供导入入口（把其它软件的会话以本工具原生格式写出）。
+        # 内容随工具切换刷新（见 _refresh_import_matrix）。
+        self.imp_frame = ttk.LabelFrame(
+            self.root, text="数据导入（把其它软件的会话导入到「%s」）" % self.adapter.display_name
+        )
+        self.imp_frame.pack(fill=tk.X, **pad)
+
+        imp_head = ttk.Frame(self.imp_frame)
+        imp_head.pack(fill=tk.X, padx=8, pady=(8, 2))
+        self.imp_summary = ttk.Label(imp_head, text="", foreground="#0a6", anchor="w")
+        self.imp_summary.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.imp_btn = ttk.Button(
+            imp_head, text="导入会话…", command=self.on_migrate, width=14
+        )
+        self.imp_btn.pack(side=tk.RIGHT)
+        ttk.Button(
+            imp_head, text="导入说明", command=self._show_import_help, width=10
+        ).pack(side=tk.RIGHT, padx=(0, 6))
+
+        imp_body = ttk.Frame(self.imp_frame)
+        imp_body.pack(fill=tk.X, padx=8, pady=(0, 8))
+        # 只读 Text：固定 4 行高 + 滚动条，避免来源条目多时把主窗口撑高。
+        self.imp_text = tk.Text(
+            imp_body, height=4, wrap="word", relief=tk.FLAT, highlightthickness=0,
+            background=self.root.cget("background"), cursor="arrow",
+        )
+        imp_sb = ttk.Scrollbar(imp_body, orient="vertical", command=self.imp_text.yview)
+        self.imp_text.configure(yscrollcommand=imp_sb.set)
+        self.imp_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        imp_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.imp_text.tag_configure("head", font=("TkDefaultFont", 9, "bold"))
+        self.imp_text.tag_configure("scope", foreground="#333")
+        self.imp_text.tag_configure("note", foreground="#777")
+        for st, color in import_matrix.STATUS_COLORS.items():
+            self.imp_text.tag_configure("st_" + st, foreground=color)
+        self.imp_text.configure(state="disabled")
+
         # 选项
         opt = ttk.LabelFrame(self.root, text="选项")
         opt.pack(fill=tk.X, **pad)
@@ -529,9 +593,10 @@ class QoderBackupApp:
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
 
         # 构建完成后按实际内容自适应窗口高度（保证状态栏等完整区域默认可见）
+        self._refresh_import_matrix()
         self._fit_layout()
-        # dsh 工具显示「会话健康」行；其他工具隐藏
-        self._update_dsh_health_visibility()
+        # dsh 工具显示「会话健康」行；其他工具隐藏（含 Qoder 历史诊断行）
+        self._update_tool_rows_visibility()
 
     # ------------------------------------------------------------- helpers --
     def _fit_layout(self) -> None:
@@ -718,6 +783,10 @@ class QoderBackupApp:
             except ValueError:
                 rel_path = first.path
             detail = "%s\n路径: %s" % (detail, rel_path)
+            # 携带源设备信息的条目：**在勾选处**就说清（而不是等备份完才说），
+            # 因为「要不要把这个包发给别人」是勾选那一刻就在做的决定。
+            if first.carries_origin:
+                detail += "\n携带源设备信息：%s" % first.carries_origin
             lbl = ttk.Label(
                 row, text="%s %s" % (detail, tag),
                 foreground=color, anchor="w", justify="left",
@@ -874,6 +943,97 @@ class QoderBackupApp:
         if d:
             self.root_var.set(d)
             self._redetect()
+
+    # ----------------------------------------------------------- 数据导入 --
+    def _refresh_import_matrix(self) -> None:
+        """把「当前所选工具」的导入能力矩阵渲染进导入区（工具切换时刷新）。"""
+        name = self.adapter.name
+        info = import_matrix.describe(name)
+        try:
+            self.imp_frame.configure(
+                text="数据导入（把其它软件的会话导入到「%s」）" % self.adapter.display_name
+            )
+            self.imp_summary.configure(text=info["summary"])
+            self.imp_text.configure(state="normal")
+            self.imp_text.delete("1.0", tk.END)
+            for row in info["rows"]:
+                self.imp_text.insert(
+                    tk.END,
+                    "· %s（%s）" % (row["display"], row["versions"]),
+                    ("head",),
+                )
+                self.imp_text.insert(
+                    tk.END, "  —  %s\n" % row["status_label"], ("st_" + row["status"],)
+                )
+                for item in row["scope"]:
+                    self.imp_text.insert(tk.END, "      可导入范围：%s\n" % item, ("scope",))
+                if row["note"]:
+                    self.imp_text.insert(tk.END, "      说明：%s\n" % row["note"], ("note",))
+            self.imp_text.configure(state="disabled")
+            self.imp_btn.configure(state="normal" if info["has_importable"] else "disabled")
+        except tk.TclError:  # 极端情况下控件已销毁，忽略
+            pass
+
+    def _show_import_help(self) -> None:
+        """弹窗展示「导入 / 导出」的完整说明与各工具支持情况。"""
+        lines = [
+            "「数据导入」= 把其它软件的历史会话，以当前所选工具的原生格式写出，",
+            "使其能被当前工具像原生会话一样打开（会话内容、推理与工具调用尽量保留）。",
+            "",
+            "· 仅支持明文可读会话的工具；会话主库加密的工具（如下方标注）只能整体",
+            "  备份 / 还原，无法跨软件互换。",
+            "· 导入不会覆盖目标工具已有会话：新会话使用全新生成的 id。",
+            "· 部分工具对「工作区 / 项目路径」敏感（CodeBuddy / DSH），建议保持目标机",
+            "  项目路径与源机器一致，否则会话可能不被索引显示。",
+            "",
+        ]
+        for tool in import_matrix.known_targets():
+            lines.extend(import_matrix.format_lines(tool))
+            lines.append("")
+        self._show_text_dialog("数据导入说明", "\n".join(lines))
+
+    def _show_text_dialog(self, title: str, text: str) -> None:
+        """通用只读文本弹窗（可滚动、可复制）。
+
+        无头测试下退化为 ``messagebox.showinfo``，避免弹出真实窗口。
+        """
+        if HEADLESS:
+            messagebox.showinfo(title, text)
+            return
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("760x560")
+        win.transient(self.root)
+        frame = ttk.Frame(win)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        txt = tk.Text(frame, wrap="word", relief=tk.FLAT)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")
+        ttk.Button(win, text="关闭", command=win.destroy, width=12).pack(pady=(0, 10))
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        return win
+
+    def on_migrate(self) -> None:
+        """打开「导入会话」对话框（仅当前工具支持导入时可用）。"""
+        if self.busy:
+            messagebox.showinfo("请稍候", "当前有任务正在进行，请等待完成后再试。")
+            return
+        info = import_matrix.describe(self.adapter.name)
+        if not info["has_importable"]:
+            messagebox.showinfo(
+                "暂不支持导入",
+                "「%s」目前不支持从其它软件导入会话。\n\n%s"
+                % (self.adapter.display_name, info["summary"]),
+            )
+            return
+        MigrateDialog(self)
 
     def _detect_root(self, explicit: str | None = None) -> str:
         """经适配器探测数据根目录；显式指定或被探测到则用，否则回退默认建议路径。"""
@@ -1040,7 +1200,7 @@ class QoderBackupApp:
                 # 保留勾选（_refresh_items 内 prev_sel 沿用当前勾选），仅标红未找到项
                 self._refresh_items()
                 self._set_status("未找到数据目录，请手动指定")
-                self._update_dsh_health_visibility()
+                self._update_tool_rows_visibility()
                 return
             # 从未成功识别过：仍重建一次，生成稳定的占位清单（各项未找到）
         self.items = self.adapter.build_items(self.root_dir)
@@ -1048,7 +1208,7 @@ class QoderBackupApp:
         self._refresh_items()
         self._refresh_uid_combo()
         self._set_status("已重新检测数据目录")
-        self._update_dsh_health_visibility()
+        self._update_tool_rows_visibility()
 
     # -------------------------------------------------- DSH 会话健康检测/修复 --
     def _dsh_home_for_check(self) -> str:
@@ -1072,6 +1232,88 @@ class QoderBackupApp:
             self._set_dsh_buttons_state()
         else:
             frame.pack_forget()
+
+    def _update_tool_rows_visibility(self) -> None:
+        """统一刷新「仅特定工具显示」的行（当前：DSH 会话健康行、Qoder 历史诊断行）。
+
+        工具切换 / 重新探测数据目录后调用，保证行可见性与当前适配器一致。
+        """
+        self._update_dsh_health_visibility()
+        self._update_qoder_diag_visibility()
+
+    def _update_qoder_diag_visibility(self) -> None:
+        """qoder 适配器选中时显示「历史会话诊断」行，其他工具隐藏（不破坏布局）。
+
+        与 ``_update_dsh_health_visibility`` 同理，用幂等 ``pack`` / ``pack_forget``
+        而非 ``winfo_ismapped``：headless（withdraw）下后者恒为 False。
+        """
+        frame = getattr(self, "qoder_diag_frame", None)
+        if frame is None:
+            return
+        if self.adapter.name == "qoder":
+            frame.pack(fill=tk.X, padx=10, pady=(0, 8))
+        else:
+            frame.pack_forget()
+
+    def _qoder_diag(self) -> None:
+        """检测 Qoder 新旧两处数据根，诊断「导入后仍看不到历史会话」的成因。"""
+        if self.busy:
+            messagebox.showwarning("请稍候", "当前有任务正在执行。")
+            return
+        from ai_env_clone.adapters.qoder import diagnose_history
+
+        home = os.path.expanduser("~")
+        self._set_status("正在检测 Qoder 历史会话…")
+
+        def work():
+            try:
+                report = diagnose_history(home)
+            except Exception as exc:  # noqa: BLE001
+                self.msg_queue.put(("error", "%s: %s" % (type(exc).__name__, exc)))
+                return
+            self.msg_queue.put(("qoder_report", report))
+
+        self._run_bg(work)
+
+    def _render_qoder_report(self, report: dict) -> None:
+        """主线程渲染 Qoder 诊断结果（结构化事实 + 结论列表）。"""
+        def _n(v):
+            return "读取失败" if v is None else str(v)
+
+        lines = [
+            "【数据根】",
+            "· 新版桌面端（Electron）：%s" % report["electron_root"],
+            "  存在：%s" % ("是" if report["electron_exists"] else "否"),
+            "· 旧版（插件 / 旧桌面端）：%s" % report["legacy_db"],
+            "",
+            "【会话与导入账本】",
+            "· 新版会话库 main.sqlite：会话 %s 个 / 消息 %s 条"
+            % (_n(report["new_sessions"]), _n(report["new_messages"])),
+            "· 应用内导入账本 sessionMigration.sqlite：import_job %s / import_history %s"
+            % (_n(report["import_jobs"]), _n(report["import_history"])),
+            "· 旧版会话库 local.db：会话 %s 个 / 消息 %s 条"
+            % (_n(report["legacy_sessions"]), _n(report["legacy_messages"])),
+            "· 旧版交接标记 .cn_migration 已落盘：%s"
+            % ("是" if report["cn_migration_done"] else "否"),
+            "",
+            "【结论】",
+        ]
+        lines += ["· " + f for f in report["findings"]]
+        lines += [
+            "",
+            "说明：旧版 local.db 的容器是标准 SQLite（未整库加密），但会话正文列"
+            "（chat_message.content / chat_record.question）为列级密文，正文取不出 —— "
+            "故本工具只能整库搬运，无法转成其它软件的原生格式，也无法代 Qoder 完成导入。"
+            "跨电脑迁移请用本工具的整库备份 / 还原（Qoder 适配器已覆盖三处数据面："
+            "~/.qoder-cn 旧代数据 + CLI/Agent 新族、桌面端 main.sqlite、本地工作区）。",
+        ]
+        text = "\n".join(lines)
+        empty_new = report["new_sessions"] == 0
+        self._show_plain_report_dialog(
+            "Qoder 历史会话诊断：%s" % ("新版会话库为空" if empty_new else "已读取到新版会话"),
+            text,
+        )
+        self._set_status("Qoder 历史会话诊断完成")
 
     def _set_dsh_buttons_state(self) -> None:
         """数据目录有效时启用检测按钮；修复按钮另需「存在未分组会话」才启用。
@@ -1113,8 +1355,18 @@ class QoderBackupApp:
 
         self._run_bg(work)
 
-    def _show_dsh_report_dialog(self, title: str, text: str) -> None:
-        """显示白底黑字的自定义报告弹窗，避免系统暗色主题下 messagebox 文字看不清。"""
+    def _show_plain_report_dialog(self, title: str, text: str) -> None:
+        """显示白底黑字的自定义只读报告弹窗，避免系统暗色主题下 messagebox 文字看不清。
+
+        工具无关：DSH「会话健康」与 Qoder「历史会话诊断」等报告共用。
+
+        ``HEADLESS``（单元测试）下退化为 ``messagebox.showinfo``：自定义弹窗会
+        ``grab_set()`` + ``wait_window()`` 阻塞等用户点击，在无头测试里会**永久挂起**，
+        故必须避开；测试侧已 mock ``messagebox``，行为等价且不阻塞。
+        """
+        if HEADLESS:
+            messagebox.showinfo(title, text)
+            return
         top = tk.Toplevel(self.root)
         top.title(title)
         top.transient(self.root)
@@ -1201,7 +1453,7 @@ class QoderBackupApp:
                 + len(result.dup_id_sessions)
                 + len(result.descriptor_bad_sessions)
             )
-        self._show_dsh_report_dialog(title, text)
+        self._show_plain_report_dialog(title, text)
 
     def _dsh_install_zstd(self) -> None:
         """点击「安装 zstd 并重新检测」：后台安装 zstd 后端后重新探测并复检。
@@ -1446,6 +1698,10 @@ class QoderBackupApp:
                         self.pbar["value"] = 0
                         result, zstd_name = payload
                         self._render_dsh_report(result, zstd_name)
+                    elif kind == "qoder_report":
+                        # Qoder 历史会话诊断结果（后台线程产出，主线程渲染）
+                        self.pbar["value"] = 0
+                        self._render_qoder_report(payload)
                     elif kind == "dsh_zstd_installed":
                         # zstd 自动安装完成（后台线程产出，主线程处理）
                         self.pbar["value"] = 0
@@ -1656,6 +1912,28 @@ class QoderBackupApp:
                 )
                 if locate_sensitive:
                     base_msg += "\n\n已自动打开相关文件并定位到敏感字段，请手动记录后关闭。"
+            # 配套条目提醒：勾了某条目、但它「成对存在」的配套条目没勾时明示一次。
+            # 典型是 DSH：settings.yaml 只存密钥**引用**（apiKeyEnv），真密钥在同目录
+            # .credentials.yaml（默认不勾）⇒ 不提醒的话，用户还原后模型直接用不了，
+            # 且完全看不出原因。提示落在「刚拿到包」这一刻，用户才好决定是否单独备份。
+            companion = companion_notes(sel_items)
+            if companion:
+                base_msg += "\n\n提示：\n" + "\n\n".join(companion)
+            # 携带源设备信息（路径等）：备份完成后明示一次——用户此刻手里刚拿到包，
+            # 最可能发生的动作就是把它拷走/发出去，提醒要落在这个时点。
+            origin_rows = manifest_origin_info(mf)
+            if origin_rows:
+                merged: list = []
+                for row in origin_rows:
+                    sig = (row["label"] or row["key"], row["note"])
+                    if sig not in merged:
+                        merged.append(sig)
+                base_msg += (
+                    "\n\n⚠ 隐私提醒：本备份包会携带源机器上的路径等信息：\n%s\n"
+                    "这些信息是会话/记录本身自带的（也是还原后把数据归回原工程工作区的依据），"
+                    "但把备份包分享、上传或发给他人时，它们会一并外传，请留意。"
+                    % "\n".join("　· %s：%s" % (lbl, note) for lbl, note in merged)
+                )
             # done payload 扩展为三元组：(title, text, reveal_paths)；reveal_paths 为空列表时主线程不定位
             reveal = sensitive_paths if (locate_sensitive and sensitive_paths) else []
             self.msg_queue.put(
@@ -1831,16 +2109,25 @@ class QoderBackupApp:
             messagebox.showerror("无法读取", str(exc))
             return
 
+        # 携带源设备信息（相对路径 / 标记）的条目：还原会写回本机对应位置，
+        # 属预期行为且对「归回原工作区」有用，提前说一句即可，不做阻拦。
+        origin_rows = manifest_origin_info(info.get("manifest") or {})
+        origin_line = ""
+        if origin_rows:
+            origin_line = ("\n本包携带 %d 处源机器的路径等信息（IDE 工作区记录 / 会话正文等），"
+                           "还原时会一并写回本机对应位置。\n" % len(origin_rows))
+
         if not messagebox.askyesno(
             "确认还原备份包",
             "即将把%s还原（覆盖写入）到：\n%s\n\n"
-            "将自动解压并写入 %d 个文件（%s），无需手动解压。\n\n"
+            "将自动解压并写入 %d 个文件（%s），无需手动解压。\n%s\n"
             "请务必先完全退出 %s，否则可能导致数据损坏。\n是否继续？"
             % (
                 "回滚快照" if expected_kind == "rollback" else "备份包",
                 self.root_dir,
                 info["file_count"],
                 human_size(info["total_bytes"]),
+                origin_line,
                 self.adapter.display_name,
             ),
         ):
@@ -2389,6 +2676,12 @@ class BackupBrowser:
                                  % (self.CATEGORY_LABEL.get(cat, cat),
                                     human_size(by_cat[cat])))
 
+        # 携带的源设备信息：让用户在**打开/分享这个包之前**就知道包里有源机器的路径。
+        # 旧备份包没有该字段（origin_info_lines 返回空），此处自然不显示，不报错、不推断。
+        lines.extend(origin_info_lines(mf))
+        # 包内附带的「会话 -> 原始工作区路径」映射（本工具生成、随包携带）。
+        lines.extend(session_workspaces_lines(mf))
+
         if info["unsafe"]:
             lines.append("")
             lines.append("⚠ 检测到 %d 个非法路径，恢复将被阻止" % len(info["unsafe"]))
@@ -2516,6 +2809,678 @@ class BackupBrowser:
         else:
             self.detail.insert("1.0", text)
         self.detail.configure(state="disabled")
+
+
+def missing_workspaces_text(plans: list, limit: int = 8) -> str:
+    """「这些目标工作区不存在」对话框里的明细文本（每行带**落点来源**）。
+
+    为什么必须带来源：跨机还原后本机往往没有那个工程目录，用户要判断「要不要创建」，
+    就得知道这个路径是**源会话原来的工程**（创建它 = 让会话回到原工作区），还是
+    只是某工具的**默认落点**（创建它 = 收容无工作区的会话）。两者都合法，但含义不同。
+    """
+    rows = []
+    for p in plans[:limit] if limit else plans:
+        if p.note.startswith("由源会话"):
+            src = "源会话还原"
+        else:
+            src = workspace_plan.MODE_LABELS.get(p.mode, p.mode)
+        rows.append("· %s（%s）" % (p.path, src))
+    if limit and len(plans) > limit:
+        rows.append("…（共 %d 处）" % len(plans))
+    return "\n".join(rows)
+
+
+class MigrateDialog:
+    """「导入会话」对话框：从其它软件选会话，导入为当前工具的原生会话。
+
+    上方选择来源软件与来源目录，扫描出可导入会话列表（支持 Ctrl / Shift 多选，
+    一次导入多条）；下方是**自动判定**的落点设置。
+
+    目标工作区**默认不需要用户填**（判定规则见 :mod:`ai_env_clone.workspace_plan`）：
+
+    1. 源会话自带工作区 -> 直接沿用（尽量与源机器路径同源）；
+    2. 源会话没有工作区 -> 用当前工具「无工作区会话」的默认落点；
+    3. 勾选「手动指定工作区」-> 本次导入的**全部**会话都落到同一个工作区，
+       **包括自带工作区的会话**；界面常驻警示，导入前还会再确认一次。
+
+    「目标工作区」一栏**只展示实际会落到的那个工作区**：单选显示具体落点；多选且
+    落点不一致时只提示「存在 N 个不同的工作区」（不挑一条显示，否则会被读成统一
+    落点）；落点一致时显示该落点，**并注明它是不是各会话自带的**。未勾选手动指定时
+    **手动输入行整体收起**——置灰保留上一次填的路径会让人误以为它就是本次实际落点。
+
+    ⚠️ 多选时**绝不能只甩一个路径**：见 :meth:`MigrateDialog._describe_multi`——
+    「手动指定」勾选时的预填值就是自动判定值，二者字符串完全相同，只显示路径会被读成
+    「这不就是我手动填的那个」；若该值其实是工具的默认落点，还会被读成「这些会话原本
+    就属于这个工作区」（WorkBuddy 的默认落点更是本次现造的时间戳新目录）。
+
+    工作区在目标机不存在时**不静默创建**：先问用户（是=创建后再导入 /
+    否=不创建但仍按原落点导入 / 取消=中止导入），避免「写了但看不到」。
+
+    导入在后台线程执行，避免大会话（如 DSH 的 MB 级 jsonl.zstd）卡住界面。
+    """
+
+    def __init__(self, app: "QoderBackupApp"):
+        self.app = app
+        self.target_tool = app.adapter.name
+        self.target_display = app.adapter.display_name
+
+        cap = import_matrix.matrix_for(self.target_tool)
+        self.sources = list(cap.importable) if cap else []
+        self._by_display = {s.display: s for s in self.sources}
+        self.cur_source = self.sources[0] if self.sources else None
+        self.items: list = []
+        self._result = None
+        #: 导入过程中的 warn 回调累计（落点同源提示等），导入**执行后**一次性汇总展示。
+        self.warns: list = []
+        #: 本批导入「无工作区会话」的默认落点。WorkBuddy 的 playground 目录名带时间戳，
+        #: 这里固定一次，保证同一批导入落到同一处（而不是每导入一条就新建一个目录）。
+        self._default_ws = workspace_plan.default_workspace(
+            self.target_tool, datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
+
+        self.win = tk.Toplevel(app.root)
+        self.win.title("导入会话 → %s" % self.target_display)
+        self.win.geometry("780x660")
+        self.win.transient(app.root)
+        self._build()
+        if self.cur_source is not None:
+            self._on_source_change()
+
+    # ---------------------------------------------------------------- UI --
+    def _build(self) -> None:
+        pad = {"padx": 10, "pady": 6}
+
+        src = ttk.LabelFrame(self.win, text="来源软件（明文可读，可导入到「%s」）" % self.target_display)
+        src.pack(fill=tk.X, **pad)
+
+        row = ttk.Frame(src)
+        row.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Label(row, text="来源软件：").pack(side=tk.LEFT)
+        self.src_var = tk.StringVar(value=self.cur_source.display if self.cur_source else "")
+        self.src_combo = ttk.Combobox(
+            row, textvariable=self.src_var, width=22, state="readonly",
+            values=[s.display for s in self.sources],
+        )
+        self.src_combo.pack(side=tk.LEFT, padx=(4, 0))
+        self.src_combo.bind("<<ComboboxSelected>>", lambda *_: self._on_source_change())
+        self.src_note = ttk.Label(row, text="", foreground="#666")
+        self.src_note.pack(side=tk.LEFT, padx=(8, 0))
+
+        row2 = ttk.Frame(src)
+        row2.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Label(row2, text="来源目录：").pack(side=tk.LEFT)
+        self.src_root_var = tk.StringVar()
+        ttk.Entry(row2, textvariable=self.src_root_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0)
+        )
+        ttk.Button(row2, text="浏览…", command=self._browse_source, width=8).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+        ttk.Button(row2, text="扫描会话", command=self._scan, width=10).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+
+        # 会话列表（支持多选：Ctrl / Shift）
+        lst = ttk.LabelFrame(self.win, text="可导入会话（Ctrl / Shift 可多选，一次导入多条）")
+        lst.pack(fill=tk.BOTH, expand=True, **pad)
+        listwrap = ttk.Frame(lst)
+        listwrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.listbox = tk.Listbox(listwrap, activestyle="dotbox", selectmode="extended")
+        lsb = ttk.Scrollbar(listwrap, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=lsb.set)
+        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        lsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.listbox.bind("<<ListboxSelect>>", lambda *_: self._on_pick())
+
+        # 落点设置
+        dst = ttk.LabelFrame(self.win, text="导入落点（%s 原生位置）" % self.target_display)
+        dst.pack(fill=tk.X, **pad)
+
+        self.tgt_root_var = tk.StringVar(value=session_migration.default_target_root(self.target_tool))
+        r = ttk.Frame(dst)
+        r.pack(fill=tk.X, padx=8, pady=(8, 2))
+        ttk.Label(r, text="目标根目录：").pack(side=tk.LEFT)
+        ttk.Entry(r, textvariable=self.tgt_root_var, state="readonly").pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0)
+        )
+
+        # 目标工作区：默认自动判定，只读展示；勾选后可手动指定
+        ws_row = ttk.Frame(dst)
+        ws_row.pack(fill=tk.X, padx=8, pady=(2, 2))
+        ttk.Label(ws_row, text="目标工作区：").pack(side=tk.LEFT, anchor="n")
+        self.ws_preview_var = tk.StringVar()
+        ttk.Label(ws_row, textvariable=self.ws_preview_var, foreground="#0a6",
+                  wraplength=620, justify=tk.LEFT).pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                                        padx=(4, 0))
+
+        self.manual_row = ttk.Frame(dst)
+        self.manual_row.pack(fill=tk.X, padx=8, pady=(4, 0))
+        self.manual_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self.manual_row, text="手动指定工作区", variable=self.manual_var,
+            command=self._on_manual_toggle,
+        ).pack(side=tk.LEFT)
+        self.manual_lbl = ttk.Label(self.manual_row, text="")
+        self.manual_lbl.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.manual_entry_row = ttk.Frame(dst)
+        self.manual_entry_row.pack(fill=tk.X, padx=8, pady=(2, 0))
+        self.manual_var_value = tk.StringVar(value="")
+        #: CodeBuddy 的工作区标识是路径派生出的 id，不方便手打：给一份目标机已有 id 供选。
+        self.manual_combo = ttk.Combobox(
+            self.manual_entry_row, textvariable=self.manual_var_value, width=52,
+            values=session_migration.list_target_workspaces(
+                self.target_tool, self.tgt_root_var.get()
+            ),
+        )
+        self.manual_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.manual_combo.bind("<KeyRelease>", lambda *_: self._refresh_preview())
+        self.manual_combo.bind("<<ComboboxSelected>>", lambda *_: self._refresh_preview())
+        self.manual_browse_btn = ttk.Button(
+            self.manual_entry_row, text="浏览…", command=self._browse_manual, width=8
+        )
+        self.manual_browse_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        # 手动指定 = 覆盖全部会话（含自带工作区的）——常驻警示，避免误操作
+        # 注：Tk 标签不渲染 Markdown，正文里不要写 ** 之类的标记（会原样显示）。
+        self.manual_warn = ttk.Label(
+            dst, foreground="#c00", wraplength=720, justify=tk.LEFT,
+            text="⚠ 手动指定会覆盖本次导入的全部会话的工作区，包括本身就自带工作区的会话。",
+        )
+
+        self.hint = ttk.Label(dst, text="", foreground="#a05a00", wraplength=720, justify=tk.LEFT)
+        self.hint.pack(fill=tk.X, padx=8, pady=(4, 4))
+
+        # 操作
+        act = ttk.Frame(self.win)
+        act.pack(fill=tk.X, **pad)
+        self.status_lbl = ttk.Label(act, text="", foreground="#0a6")
+        self.status_lbl.pack(side=tk.LEFT)
+        ttk.Button(act, text="关闭", command=self.win.destroy, width=10).pack(side=tk.RIGHT)
+        self.import_btn = ttk.Button(
+            act, text="导入选中会话", command=self._do_import, width=14
+        )
+        self.import_btn.pack(side=tk.RIGHT, padx=(0, 8))
+
+        self._sync_rows()
+
+    def _sync_rows(self) -> None:
+        """按目标工具类型设置「工作区」栏的命名与提示，并重置手动输入行。"""
+        tool = self.target_tool
+        self.manual_lbl.configure(text="（%s）" % workspace_plan.workspace_kind_label(tool))
+
+        hints = {
+            "reasonix": "Reasonix 按「项目名」隔离会话；自动判定取源会话的项目名，"
+                        "取不到时用 global-workspace。",
+            "codebuddy": "CodeBuddy 按项目路径派生的 workspaceId 索引会话"
+                         "（实测 = md5(路径小写、反斜杠)）；自动判定取源 workspaceId，"
+                         "或由源会话的工作区路径派生。",
+            "workbuddy": "写出的会话会登记进 workbuddy.db 的 sessions 表；"
+                         "自动判定沿用源会话的工作区路径（来源是 CodeBuddy 时，先把它那串"
+                         "工作区 id 反查回项目路径），确实取不到时才落到 "
+                         "~/WorkBuddy/<时间戳>（与产品 playground 一致）。",
+            "dsh": "DSH 会话按工作区索引，并在 storages/workspace.json 登记；"
+                   "自动判定沿用源会话的工作区路径（CodeBuddy 来源先反查 id 对应的路径），"
+                   "确实取不到时落到用户主目录。写出前需可用 zstd 后端（缺失时会明确报错）。",
+        }
+        self.hint.configure(text=hints.get(tool, ""))
+        self._on_manual_toggle()
+
+    # ------------------------------------------------------- 工作区判定 --
+    def _manual_value(self) -> str:
+        """用户手动指定的工作区标识（未勾选时返回空串 = 走自动）。"""
+        if not self.manual_var.get():
+            return ""
+        return self.manual_var_value.get().strip()
+
+    def _plan_for(self, item, manual: str = "") -> "workspace_plan.WorkspacePlan":
+        return workspace_plan.plan_for(
+            self.target_tool, item, manual,
+            root=self.tgt_root_var.get(), default_value=self._default_ws,
+            origin=(item or {}).get("title", "") or "",
+        )
+
+    def _selected_plans(self) -> list:
+        """当前选择下，**每条会话各一份**落点计划（顺序与 :meth:`_selected_items` 一致）。
+
+        手动指定时每条都是同一个值（即「覆盖全部会话」），但仍是 N 份，
+        以保证与 ``_build_jobs`` 的 ``zip`` 一一对应——否则多选时只有第一条会被导入。
+        """
+        manual = self._manual_value()
+        items = self._selected_items()
+        if not items:
+            return [self._plan_for(None, manual)]
+        return [self._plan_for(None if manual else it, manual) for it in items]
+
+    def _refresh_preview(self) -> None:
+        """刷新「目标工作区」预览：**只展示实际会落到的那个工作区**。
+
+        - 未勾选手动：单选（或未选）时显示自动判定的具体落点；多选且落点不一致时
+          只说明「存在多个路径」，**不挑一条显示**——挑一条会被误读成统一落点；
+        - 勾选手动：显示手动值，并标注它会覆盖全部会话。
+
+        ⚠️ **多选时必须交代落点来源**（沿用会话自带 / 工具默认）。只甩一个路径会有两种
+        误读：① 被当成「我手动填过的那一个」——因为「手动指定」勾选时的**预填值**就是
+        自动判定值（``_on_manual_toggle``），两者字符串一模一样；② 被当成「这些会话原本
+        就属于这个工作区」——而它其实只是该工具「无工作区会话」的默认落点（WorkBuddy
+        还是本次现造的时间戳新目录）。故凡涉及工具默认落点，一律写明「非手动指定」。
+        """
+        manual = self._manual_value()
+        plans = self._selected_plans()
+        picked = len(self._selected_items())
+        if manual:
+            p = plans[0]
+            text = "%s    【%s】" % (
+                workspace_plan.describe_value(self.target_tool, p.value) or "（未确定）",
+                workspace_plan.MODE_LABELS[workspace_plan.MODE_MANUAL])
+            text += " · 目标机已存在" if p.exists else " · 目标机不存在（导入时会询问是否创建）"
+            if picked > 1:
+                text += " · 将覆盖全部 %d 条会话" % picked
+        elif picked <= 1:
+            p = plans[0]
+            text = workspace_plan.describe(p)
+            if p.path and not p.exists and p.mode == workspace_plan.MODE_SESSION:
+                text += " · 导入时会询问是否创建"
+        else:
+            text = self._describe_multi(plans)
+        if self.manual_var.get() and not manual:
+            text += "　⚠ 已勾选「手动指定」但未填值，将按自动判定"
+        self.ws_preview_var.set(text)
+
+    def _describe_multi(self, plans: list) -> str:
+        """多选（≥2 条）时的落点预览文案：先报结构，再报来源，最后报存在性。"""
+        MODE_DEFAULT = workspace_plan.MODE_DEFAULT
+        MODE_SESSION = workspace_plan.MODE_SESSION
+        n = len(plans)
+        values = {p.value for p in plans}
+        n_default = sum(1 for p in plans if p.mode == MODE_DEFAULT)
+        shown = workspace_plan.describe_value(self.target_tool, plans[0].value)
+
+        if len(values) == 1:
+            if plans[0].mode == MODE_SESSION:
+                # 各会话自带的工作区恰好是同一个：这就是它们真实的归属，直接显示
+                text = ("%s    【自动 · 已选 %d 条会话，会话自带的工作区相同，均落到这一处】"
+                        % (shown, n))
+            elif plans[0].mode == MODE_DEFAULT:
+                # 措辞按成因区分：真的「没记录工作区」 vs 「只记了不可逆的工作区 id」
+                # （CodeBuddy），后者不能让用户以为「源会话本来就没有工作区」。
+                reason = ("都没有可还原为路径的工作区" if plans[0].note
+                          else "都没有记录工作区")
+                text = ("已选 %d 条会话，%s → 统一落到 %s 的默认落点：%s"
+                        "    【自动判定，非手动指定】"
+                        % (n, reason, self.target_display, shown))
+                if plans[0].note:
+                    text += "　⚠ " + plans[0].note
+            else:  # 取值恰好相同但来源混合（某条 cwd 正好等于默认落点）
+                text = ("%s    【自动 · 已选 %d 条会话，落点恰好相同（来源混合：%d 条沿用"
+                        "自带、%d 条用工具默认）】"
+                        % (shown, n, n - n_default, n_default))
+        else:
+            text = ("已选 %d 条会话，存在 %d 个不同的工作区（各按自身自动判定写入，"
+                    "此处不合并显示）" % (n, len(values)))
+            if n_default:
+                # 同样是「没工作区」，成因可能不同：真没记录 vs 只有不可逆的 id（CodeBuddy）
+                why = ("未记录可还原为路径的工作区"
+                       if any(p.note for p in plans if p.mode == MODE_DEFAULT)
+                       else "未记录工作区")
+                text += ("；其中 %d 条%s，将落到 %s 的默认落点"
+                         % (n_default, why, self.target_display))
+        missing = workspace_plan.describe_missing(plans)
+        if missing:
+            # 用「另有」而非「其中」：上面可能已经有「其中 N 条未记录工作区」一句
+            text += "；另有 %d 处目标机不存在（导入时会询问是否创建）" % len(missing)
+        return text
+
+    def _on_manual_toggle(self) -> None:
+        """手动指定开关：联动输入行、浏览按钮与警示文案。
+
+        未勾选时**整行收起**（而不是置灰保留）——留着上一次填的手动路径，
+        会让人误以为它就是本次导入实际要用的落点。
+        """
+        on = bool(self.manual_var.get())
+        state = "normal" if on else "disabled"
+        self.manual_combo.configure(state=state)
+        self.manual_browse_btn.configure(state=state)
+        if on:
+            if not self.manual_var_value.get().strip():
+                # 预填当前自动判定值，便于在它基础上微调
+                auto = self._plan_for(self._selected_items()[0] if self._selected_items() else None)
+                self.manual_var_value.set(auto.value)
+            self._offer_hint_candidates()
+            # 先 pack 警示行，再把它前面的输入行插进去（Tk 的 before= 要求参照物已被管理）
+            self.manual_warn.pack(fill=tk.X, padx=8, pady=(2, 0), before=self.hint)
+            self.manual_entry_row.pack(fill=tk.X, padx=8, pady=(2, 0), before=self.manual_warn)
+        else:
+            self.manual_entry_row.pack_forget()
+            self.manual_warn.pack_forget()
+        self._refresh_preview()
+
+    def _offer_hint_candidates(self) -> None:
+        """把「源会话正文里出现过的候选路径」列进手动输入下拉，供一键采用。
+
+        场景：源会话是 CodeBuddy 的、只留了不可逆的 ``workspaceId``（md5），而本机
+        又没有它的「已打开工程」记录（典型：另一台机器备份过来、本机从没打开过）——
+        这时自动判定退到工具默认落点，但正文里其实出现过工程路径。**不自动采用**
+        （实测启发式会推错），而是摆进下拉让人挑。
+        """
+        hints: list = []
+        # 用**自动判定**的计划取候选：此刻手动值已生效，走 _selected_plans() 会拿到
+        # 手动计划（没有 hints），候选就丢了。
+        for it in self._selected_items():
+            for h in self._plan_for(it).hints:
+                if h not in hints:
+                    hints.append(h)
+        if not hints:
+            return
+        try:
+            existing = list(self.manual_combo.cget("values") or ())
+        except tk.TclError:  # pragma: no cover - 极端情况下控件已销毁
+            existing = []
+        self.manual_combo.configure(values=hints + [v for v in existing if v not in hints])
+
+    def _browse_manual(self) -> None:
+        """选目录 -> 填入工作区标识（WorkBuddy/DSH 为路径；CodeBuddy 派生 id；Reasonix 取目录名）。"""
+        d = filedialog.askdirectory(title="选择目标工作区目录")
+        if not d:
+            return
+        kind = workspace_plan.workspace_kind(self.target_tool)
+        if kind == workspace_plan.KIND_ID:
+            d = workspace_plan.codebuddy_workspace_id(d)
+        elif kind == workspace_plan.KIND_SCOPE:
+            d = workspace_plan.scope_from_path(d) or d
+        self.manual_var_value.set(d)
+        self._refresh_preview()
+
+    # ------------------------------------------------------------ 事件 --
+    def _on_source_change(self) -> None:
+        src = self._by_display.get(self.src_var.get())
+        if src is None:
+            return
+        self.cur_source = src
+        self.src_note.configure(text=src.note)
+        self.src_root_var.set(session_migration.default_source_root(src.tool))
+        self._scan()
+
+    def _browse_source(self) -> None:
+        d = filedialog.askdirectory(title="选择来源数据目录")
+        if d:
+            self.src_root_var.set(d)
+            self._scan()
+
+    def _scan(self) -> None:
+        if self.cur_source is None:
+            return
+        self.listbox.delete(0, tk.END)
+        self.items = session_migration.list_source_sessions(
+            self.cur_source.tool, self.src_root_var.get()
+        )
+        for it in self.items:
+            title = it["title"] or "(无标题)"
+            self.listbox.insert(tk.END, "%s    —  %s" % (title[:60], it["detail"]))
+        self.status_lbl.configure(
+            text="共扫描到 %d 个会话" % len(self.items),
+            foreground="#0a6" if self.items else "#a05a00",
+        )
+        if self.items:
+            self.listbox.selection_set(0)
+            self._on_pick()
+        else:
+            self._refresh_preview()
+
+    def _on_pick(self) -> None:
+        """选中会话变化：只需刷新「目标工作区」预览（工作区由规则自动判定）。"""
+        self._refresh_preview()
+
+    def _selected_items(self) -> list:
+        """当前选中的全部会话条目（支持多选）。"""
+        return [self.items[i] for i in self.listbox.curselection() if 0 <= i < len(self.items)]
+
+    def _selected_item(self):
+        items = self._selected_items()
+        return items[0] if items else None
+
+    # ------------------------------------------------------------ 导入 --
+    def _confirm_manual_override(self, items: list, plan) -> bool:
+        """手动指定工作区时的确认：明确指出会覆盖「自带工作区」的会话。"""
+        owned = [it for it in items
+                 if workspace_plan.session_workspace(self.target_tool, it)]
+        if not owned or HEADLESS:
+            return True
+        return bool(messagebox.askyesno(
+            "确认覆盖工作区",
+            "已勾选「手动指定工作区」。\n\n"
+            "本次导入的 %d 条会话将全部落到：\n%s\n\n"
+            "其中 %d 条本身就自带工作区，它们原本的工作区归属会被覆盖。\n\n是否继续？"
+            % (len(items), plan.value, len(owned)),
+            parent=self.win,
+        ))
+
+    def _confirm_unresolved_workspaces(self, items: list, plans: list) -> bool:
+        """落点无法确定的会话：导入前**显式**确认，不再静默退默认落点。
+
+        这类会话原本**有**工作区，但只留下一个不可逆的 id（CodeBuddy 的 ``workspaceId``
+        = ``md5(项目路径)``），备份包与本机都没能还原成路径。若不提醒，用户只会在导入
+        完成后才发现会话跑到了工具的默认目录（WorkBuddy 还会现造一个带时间戳的新目录）。
+
+        :return: ``True`` 继续导入；``False`` 不继续（已中止，或已切到「手动指定」）。
+        """
+        if HEADLESS:
+            return True
+        pairs = [(it, p) for it, p in zip(items, plans)
+                 if p.mode == workspace_plan.MODE_DEFAULT
+                 and (it.get("workspace_id") or "").strip()]
+        if not pairs:
+            return True
+
+        cands: list = []
+        for it, _p in pairs:
+            for c in (it.get("workspace_candidates") or []):
+                if c and c not in cands:
+                    cands.append(c)
+
+        head = "\n".join(
+            "· %s（工作区 %s…）" % (it.get("title") or "(无标题)",
+                                    (it.get("workspace_id") or "")[:8])
+            for it, _p in pairs[:6])
+        if len(pairs) > 6:
+            head += "\n…（共 %d 条）" % len(pairs)
+        msg = (
+            "有 %d 条会话无法确定原本的工作区：\n\n%s\n\n"
+            "它们原本有工作区，但只留下一个不可逆的 id（由项目路径哈希而来），"
+            "备份包与本机都没能把它还原成路径。\n\n"
+            "本次会把这些会话落到目标工具的默认落点：\n%s\n"
+            % (len(pairs), head, pairs[0][1].path or pairs[0][1].value)
+        )
+        if cands:
+            msg += ("\n它们的正文里出现过下列候选路径（仅供参考、不保证正确）：\n"
+                    + "\n".join("· " + c for c in cands[:6]))
+            if len(cands) > 6:
+                msg += "\n…（共 %d 条）" % len(cands)
+        msg += ("\n\n是：接受默认落点，继续导入\n"
+                "否：返回，改用「手动指定工作区」自己填\n"
+                "取消：中止本次导入")
+
+        ans = messagebox.askyesnocancel("无法确定原始工作区", msg, parent=self.win)
+        if ans is None:
+            self.status_lbl.configure(text="已取消导入（工作区未确定）",
+                                      foreground="#a05a00")
+            return False
+        if ans:
+            return True
+        # 「否」：切到手动指定并把候选预填进下拉，让用户挑一个或自己填
+        self.manual_var.set(True)
+        if cands and not self.manual_var_value.get().strip():
+            self.manual_var_value.set(cands[0])
+        self._on_manual_toggle()
+        self.status_lbl.configure(
+            text="已切到「手动指定工作区」——确认落点后再次点「导入」",
+            foreground="#a05a00")
+        return False
+
+    def _ask_create_workspaces(self, plans: list):
+        """工作区在目标机不存在时询问是否创建。
+
+        :return: ``True`` 创建 / ``False`` 不创建（仍按原落点导入）/ ``None`` 中止导入。
+        """
+        if HEADLESS:
+            return True
+        return messagebox.askyesnocancel(
+            "目标工作区不存在",
+            "以下目标工作区在目标机上不存在：\n\n%s\n\n是否自动创建？\n"
+            "　是：先创建目录再导入\n"
+            "　否：不创建，仍按原落点导入（目标工具写出时会自建自己需要的目录）\n"
+            "　取消：中止本次导入" % missing_workspaces_text(plans),
+            parent=self.win,
+        )
+
+    def _do_import(self) -> None:
+        items = self._selected_items()
+        if not items:
+            messagebox.showinfo("请选择会话",
+                                "请先在列表中选择要导入的会话（可 Ctrl / Shift 多选）。",
+                                parent=self.win)
+            return
+        if self.cur_source is None:
+            return
+
+        tool = self.target_tool
+        if tool not in ("reasonix", "codebuddy", "workbuddy", "dsh"):
+            messagebox.showinfo("不支持", "目标工具暂不支持导入。", parent=self.win)
+            return
+
+        # ---- 工作区：自动判定（源会话自带 > 工具默认），手动指定则覆盖全部 ----
+        manual = self._manual_value()
+        plans = [self._plan_for(None if manual else it, manual) for it in items]
+        if manual and not self._confirm_manual_override(items, plans[0]):
+            return
+        # 落点「推不出来」的会话（只有不可逆的 workspaceId）：导入前显式确认一次，
+        # 免得用户事后才发现它们跑到了工具默认目录。
+        if not manual and not self._confirm_unresolved_workspaces(items, plans):
+            return
+
+        self.warns = []
+        missing = workspace_plan.describe_missing(plans)
+        if missing:
+            choice = self._ask_create_workspaces(missing)
+            if choice is None:
+                self.status_lbl.configure(text="已取消导入（工作区未创建）", foreground="#a05a00")
+                return
+            if choice:
+                created = [p for p in (workspace_plan.ensure(m) for m in missing) if p[0]]
+                if created:
+                    self.warns.append("已按要求创建目标工作区目录：\n"
+                                      + "\n".join("· " + c[1] for c in created))
+            else:
+                self.warns.append(
+                    "目标工作区目录不存在且未创建，仍按原落点导入；"
+                    "若该路径在目标机确实不存在，目标工具可能把会话显示为「未知工作区」。")
+
+        # ---- 逐条组装导入参数（每条会话用自己的落点） ----
+        jobs = self._build_jobs(items, plans)
+        if not jobs:
+            return
+
+        self._result = None
+        self.import_btn.configure(state="disabled")
+        self.status_lbl.configure(
+            text="正在导入 %d 条会话…（解析来源 → 写出为目标原生格式）" % len(jobs),
+            foreground="#0a6")
+
+        threading.Thread(target=self._run_jobs, args=(jobs,), daemon=True).start()
+        self.win.after(150, self._poll_import)
+
+    def _build_jobs(self, items: list, plans: list) -> list:
+        """把「会话 + 落点计划」翻译成 ``migrate_session`` 的调用参数（纯函数，便于测试）。"""
+        tool = self.target_tool
+        jobs: list = []
+        for it, plan in zip(items, plans):
+            kwargs = {
+                "source_tool": self.cur_source.tool,
+                "source_path": it["path"],
+                "target_tool": tool,
+                "target_root": self.tgt_root_var.get(),
+            }
+            if tool == "reasonix":
+                # Reasonix 的工作区 = 项目名（scope）
+                kwargs["scope"] = plan.value or workspace_plan.default_workspace("reasonix")
+            else:
+                # CodeBuddy 的 workspaceId / WorkBuddy 与 DSH 的工作区路径（cwd）
+                kwargs["workspace_id"] = plan.value
+            if self.cur_source.tool == "zcode":
+                kwargs["source_session_id"] = it["id"]
+            jobs.append((it, kwargs))
+        return jobs
+
+    def _run_jobs(self, jobs: list) -> None:
+        """逐条导入（在后台线程执行），结果写入 ``self._result``。"""
+        done: list = []
+        errs: list = []
+        for it, kwargs in jobs:
+            title = it.get("title") or "(无标题)"
+            try:
+                sid = session_migration.migrate_session(
+                    warn=lambda m: self.warns.append(m), **kwargs
+                )
+                done.append((title, sid))
+            except Exception as exc:  # noqa: BLE001
+                errs.append("%s：%s: %s" % (title, type(exc).__name__, exc))
+        if errs and not done:
+            self._result = ("err", "\n".join(errs))
+        elif errs:
+            self._result = ("partial", (done, errs))
+        else:
+            self._result = ("ok", done)
+
+    def _poll_import(self) -> None:
+        if self._result is None:
+            self.win.after(150, self._poll_import)
+            return
+        status, payload = self._result
+        self.import_btn.configure(state="normal")
+
+        if status in ("ok", "partial"):
+            errs: list = []
+            if status == "partial":
+                done, errs = payload
+            elif isinstance(payload, list):
+                done = payload
+            else:  # 兼容单条结果（("ok", "<sid>")）
+                done = [("", payload)]
+            body = "\n".join("· %s → %s" % (t or "(无标题)", sid) for t, sid in done[:10])
+            if len(done) > 10:
+                body += "\n…（共 %d 条）" % len(done)
+            if errs:
+                self.status_lbl.configure(
+                    text="部分完成：%d 条成功 / %d 条失败" % (len(done), len(errs)),
+                    foreground="#a05a00")
+                messagebox.showwarning(
+                    "部分导入完成",
+                    "已导入 %d 条会话为 %s 的原生会话：\n\n%s\n\n失败 %d 条：\n%s"
+                    % (len(done), self.target_display, body, len(errs),
+                       "\n".join("· " + e for e in errs)),
+                    parent=self.win)
+            else:
+                self.status_lbl.configure(
+                    text="导入完成：%d 条会话" % len(done), foreground="#0a6")
+                messagebox.showinfo(
+                    "导入完成",
+                    "已导入 %d 条会话为 %s 的原生会话。\n\n%s\n\n"
+                    "如界面未立即显示，请重启 %s 后再查看。"
+                    % (len(done), self.target_display, body, self.target_display),
+                    parent=self.win)
+            # 警告汇总：**执行后**一次性展示，不逐条打断（非阻断，会话已写入）。
+            if self.warns:
+                messagebox.showwarning(
+                    "导入已完成，但有注意事项",
+                    "会话已成功写入，但有以下事项需要确认：\n\n"
+                    + "\n\n".join("· " + w for w in self.warns),
+                    parent=self.win,
+                )
+        else:
+            self.status_lbl.configure(text="导入失败：%s" % payload, foreground="#c00")
+            detail = payload
+            if self.warns:
+                detail += "\n\n附带提示：\n" + "\n".join("· " + w for w in self.warns)
+            messagebox.showerror("导入失败", detail, parent=self.win)
 
 
 class _Tooltip:

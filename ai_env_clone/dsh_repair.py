@@ -1,7 +1,7 @@
 """
 DSH 旧会话数据「未分组 / 无法加载」检测与修复（纯标准库，零第三方依赖）。
 
-背景（对 ``D:\\project\\第三方修复脚本`` 修复措施的核实结论）：
+背景（对某第三方修复脚本思路的核实结论）：
 
 1. **未分组**：会话日志在 ``~/.dsh/sessions/<projectKey>/<sessionId>/`` 存在，
    但 ``~/.dsh/storages/workspace.json`` 的 ``tables.workspaces.<uuid>.sessionIds``
@@ -10,7 +10,7 @@ DSH 旧会话数据「未分组 / 无法加载」检测与修复（纯标准库�
    索引被整体覆盖等。修复 = 把会话 id 补进正确工作区记录的 ``sessionIds``
    （视需要补建工作区记录并登记进 ``global.workspaceIds``）——这与 DSH 官方
    ``workspaceRegistry.bootstrap`` 的行为等价，只是离线执行、无需启动 DSH。
-   第三方修复脚本 的 ``tools/补全工作区索引.mjs`` 正是这一修复的手工版。
+   该脚本的 ``tools/补全工作区索引.mjs`` 正是这一修复的手工版。
 
 2. **无法加载**：包络拆分前旧构建写入的扁平 ``replayState``
    （``{kind: 'pi-ai', version: 1, ..., blocks: [...]}``，无 ``response`` 成员）
@@ -195,7 +195,12 @@ def zstd_backend() -> "tuple[Callable[[bytes], bytes] | None, Callable[[bytes], 
             # size in frame header"）。改用流式 DecompressionObj；注意
             # ``decompress()`` 返回已产出的输出、``flush()`` 只返回剩余部分，
             # 两者都要拼接。
-            obj = zstandard.ZstdDecompressor().decompressobj()
+            #
+            # ⚠️ 必须 read_across_frames=True：DSH 的会话文件是**多帧** zstd
+            # 拼接（本机一个 4.3MB 的 session.v3.jsonl.zstd 实测含多帧），
+            # 默认 False 时只解第一帧——4.3MB 只解出 205 字节（首行 session 头），
+            # 会把「内容完好」的会话误判为截断/空。
+            obj = zstandard.ZstdDecompressor().decompressobj(read_across_frames=True)
             return obj.decompress(data) + obj.flush()
 
         def _zstd_standard_compress(data: bytes) -> bytes:
@@ -210,12 +215,13 @@ def zstd_backend() -> "tuple[Callable[[bytes], bytes] | None, Callable[[bytes], 
         def _pyzstd_decompress(data: bytes) -> bytes:
             if not data:
                 return b""
+            # pyzstd.decompress() 原生支持多帧拼接；decompressobj 不一定，
+            # 故优先用前者，失败再退回流式（容忍无内容长度的帧）。
             try:
-                # 同样走流式，容忍无内容长度的帧
+                return pyzstd.decompress(data)
+            except (AttributeError, TypeError, ValueError):
                 obj = pyzstd.decompressobj()
                 return obj.decompress(data) + obj.flush()
-            except (AttributeError, TypeError):
-                return pyzstd.decompress(data)
 
         def _pyzstd_compress(data: bytes) -> bytes:
             try:

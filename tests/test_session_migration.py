@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from ai_env_clone.session_migration import (
     SessionParser,
@@ -67,6 +68,37 @@ class TestParseCodeBuddy(unittest.TestCase):
         self.assertIn("闭包是指", s.messages[1].content)
         # reasoning_content 应被提取
         self.assertIn("定义再给示例", s.messages[1].reasoning_content)
+
+
+class TestScanCodeBuddyResolvesWorkspace(unittest.TestCase):
+    """扫描 CodeBuddy 会话时，必须把 ``workspaceId`` 反查成项目路径填进 ``cwd``。
+
+    否则迁移到 WorkBuddy / DSH 时会被判成「源会话没有工作区」，落到工具默认落点
+    （WorkBuddy 是 ``~/WorkBuddy/<时间戳>``），而**不是**会话原本的工程工作区。
+    """
+
+    def _scan(self, index):
+        from ai_env_clone import session_migration as sm
+        with mock.patch("ai_env_clone.workspace_plan.codebuddy_workspace_path_index",
+                        return_value=index):
+            return sm.list_source_sessions(
+                "codebuddy", os.path.join(FIX, "codebuddy_sessions", "history"))
+
+    def test_cwd_resolved_from_index(self):
+        wid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        items = self._scan({wid: r"D:\project\ai-env-clone"})
+        self.assertTrue(items)
+        for it in items:
+            self.assertEqual(it["workspace_id"], wid)
+            self.assertEqual(it["cwd"], r"D:\project\ai-env-clone")
+            self.assertIn(r"D:\project\ai-env-clone", it["detail"])
+
+    def test_cwd_empty_when_unresolved(self):
+        """反查不到 -> 仍然给出条目，``cwd`` 留空（由落点判定退回默认落点并说明成因）。"""
+        items = self._scan({})
+        self.assertTrue(items)
+        self.assertEqual(items[0]["cwd"], "")
+        self.assertEqual(items[0]["workspace_id"], "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 
 
 class TestMigrateRoundTrip(unittest.TestCase):

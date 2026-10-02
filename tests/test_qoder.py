@@ -931,5 +931,204 @@ class TestGuiThreadSafety(TempEnv):
         self.assertEqual(cur[0].uid, self.other_uid)
 
 
+class TestQoderUidResolution(unittest.TestCase):
+    """UID 确定式解析（对照实测：目录名可能是完整 UUIDv7 或前 8 位截断写法）。"""
+
+    FULL_UID = "019eb095-47ef-70d2-8a41-ea6278c176b1"
+    SHORT_UID = "019eb095"
+    OLD_UID = "13166325"
+
+    def setUp(self) -> None:
+        from ai_env_clone.adapters import qoder as q
+
+        self.q = q
+        self.tmp = tempfile.mkdtemp(prefix="qoder_uid_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = os.path.join(self.tmp, ".qoder-cn")
+        self.shared = os.path.join(self.root, "shared_client")
+        os.makedirs(self.shared, exist_ok=True)
+
+    def _write(self, rel: str, text: str) -> str:
+        p = os.path.join(self.root, rel.replace("/", os.sep))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text)
+        return p
+
+    def test_uid_from_app_status_avatar_url(self):
+        """一级来源：.qoder-app-status.json 的 avatar_url 里是完整 UUIDv7。"""
+        self._write(
+            ".qoder-app-status.json",
+            json.dumps({"logged_in": True, "product": "qodercn",
+                        "avatar_url": "https://qoder.com.cn/users/%s/default/avatars"
+                                      % self.FULL_UID}),
+        )
+        self.assertEqual(
+            self.q.detect_current_uid(self.root, self.shared), self.FULL_UID
+        )
+
+    def test_uid_from_models_dir(self):
+        """二级来源：.models/<uid>/ 目录名（无 app-status 时）。"""
+        os.makedirs(os.path.join(self.root, ".models", "default"), exist_ok=True)
+        os.makedirs(os.path.join(self.root, ".models", self.FULL_UID), exist_ok=True)
+        self.assertEqual(
+            self.q.detect_current_uid(self.root, self.shared), self.FULL_UID
+        )
+
+    def test_uid_fallback_to_mtime(self):
+        """三级兜底：都取不到时退回「最近活跃」启发式。"""
+        mem = os.path.join(self.root, "memories", self.OLD_UID, "global")
+        os.makedirs(mem, exist_ok=True)
+        with open(os.path.join(mem, "a.md"), "wb") as f:
+            f.write(b"x")
+        self.assertEqual(
+            self.q.detect_current_uid(self.root, self.shared), self.OLD_UID
+        )
+
+    def test_prefix_and_same_user(self):
+        self.assertEqual(self.q._uid_prefix(self.FULL_UID), self.SHORT_UID)
+        self.assertEqual(self.q._uid_prefix(self.OLD_UID), self.OLD_UID)
+        self.assertTrue(self.q._same_user(self.FULL_UID, self.SHORT_UID))
+        self.assertFalse(self.q._same_user(self.FULL_UID, self.OLD_UID))
+
+    def test_resolve_uid_dir_handles_truncated_name(self):
+        """目录名是截断写法时也要解析到真实目录（否则「当前用户记忆区」全部落空）。"""
+        os.makedirs(os.path.join(self.shared, "memories", self.SHORT_UID), exist_ok=True)
+        os.makedirs(os.path.join(self.shared, "memories", self.OLD_UID), exist_ok=True)
+        base = os.path.join(self.shared, "memories")
+        self.assertEqual(
+            self.q._resolve_uid_dir(base, self.FULL_UID), self.SHORT_UID
+        )
+        self.assertIsNone(
+            self.q._resolve_uid_dir(os.path.join(self.root, "memories"), self.FULL_UID)
+        )
+
+    def test_build_items_scopes_memory_by_prefix(self):
+        """截断目录名归入「当前用户」，旧账号目录归入「其他用户」。"""
+        self._write(".qoder-app-status.json",
+                    json.dumps({"avatar_url": "https://qoder.com.cn/users/%s/x/avatars"
+                                              % self.FULL_UID}))
+        os.makedirs(os.path.join(self.shared, "memories", self.SHORT_UID), exist_ok=True)
+        os.makedirs(os.path.join(self.root, "memories", self.OLD_UID), exist_ok=True)
+
+        items = self.q.QoderAdapter().build_items(
+            self.tmp, current_uid=self.FULL_UID
+        )
+        by_key = {i.key: i for i in items}
+        self.assertTrue(by_key["memories_current:shared"].exists,
+                        "当前用户记忆区应落到截断目录名上")
+        self.assertEqual(by_key["memories_current:shared"].path,
+                         os.path.join(self.shared, "memories", self.SHORT_UID))
+        others = [k for k in by_key if k.startswith("memories_others")]
+        self.assertTrue(any(self.OLD_UID in k for k in others))
+        self.assertFalse(any(self.SHORT_UID.split("-")[0] in k and self.OLD_UID not in k
+                             for k in others))
+
+
+class TestQoderExportTransform(unittest.TestCase):
+    """导出脱敏：MCP 的 X-Api-Key（连字符写法）与 headers 内所有值必须被抹掉。"""
+
+    def setUp(self) -> None:
+        from ai_env_clone.adapters.qoder import QoderAdapter
+
+        self.adapter = QoderAdapter()
+        self.transform = self.adapter.export_transform()
+
+    def test_transform_paths_cover_credentials(self):
+        paths = self.adapter.export_transform_paths()
+        for frag in ("mcp.json", "mcp-router.json", "cache/machine_token.json"):
+            self.assertIn(frag, paths)
+        # 身份族是通用文件名（user / id / policy），**必须带目录前缀**，
+        # 否则会误命中归档里恰好同名的其它文件。
+        for frag in ("cache/user", "cache/id", "cache/policy"):
+            self.assertIn(frag, paths)
+        for bare in ("user", "id", "policy"):
+            self.assertNotIn(bare, paths)
+
+    def test_headers_values_all_redacted(self):
+        src = json.dumps({
+            "mcpServers": {"s": {
+                "type": "http",
+                "headers": {"X-Api-Key": "SECRET1", "Authorization": "Bearer SECRET2"},
+            }},
+        }).encode("utf-8")
+        out = json.loads(self.transform(".qoder-cn/mcp.json", src).decode("utf-8"))
+        hdrs = out["mcpServers"]["s"]["headers"]
+        self.assertEqual(hdrs["X-Api-Key"], "***REDACTED***")
+        self.assertEqual(hdrs["Authorization"], "***REDACTED***")
+        self.assertEqual(out["mcpServers"]["s"]["type"], "http")
+
+    def test_sensitive_key_fragments(self):
+        src = json.dumps({"apiKey": "S1", "accessKey": "S2", "theme": "dark",
+                          "nested": {"private_key": "S3"}}).encode("utf-8")
+        out = json.loads(self.transform(".qoder-cn/mcp.json", src).decode("utf-8"))
+        self.assertEqual(out["apiKey"], "***REDACTED***")
+        self.assertEqual(out["accessKey"], "***REDACTED***")
+        self.assertEqual(out["nested"]["private_key"], "***REDACTED***")
+        self.assertEqual(out["theme"], "dark")
+
+    def test_env_ref_and_non_json_preserved(self):
+        src = json.dumps({"apiKey": "${MY_KEY}"}).encode("utf-8")
+        out = json.loads(self.transform(".qoder-cn/mcp.json", src).decode("utf-8"))
+        self.assertEqual(out["apiKey"], "${MY_KEY}")
+
+        raw = b"a1b2c3d4-e5f6"          # installation_id：裸字符串，非 JSON
+        self.assertEqual(self.transform(".qoder-cn/installation_id", raw), raw)
+        policy = b'{"timestamp":1784954656343}'
+        self.assertEqual(self.transform(".qoder-cn/shared_client/cache/policy", policy),
+                         policy)
+
+
+class TestQoderDataRootsAcrossMachines(unittest.TestCase):
+    """数据根探测必须**如实反映存在性**。
+
+    同一工具在不同机器 / 不同版本下，数据根的有无并不相同（设计文档的部分实测采自
+    另一台工作电脑）。缺什么就显示「未找到」，既不能抛异常，也不能据此推断数据丢失。
+    """
+
+    def setUp(self) -> None:
+        from ai_env_clone.adapters.qoder import QoderAdapter
+
+        self.adapter = QoderAdapter()
+
+    def test_rows_cover_work_machine_only_roots(self) -> None:
+        """识别状态区必须列出「工作机有、本机无」的两处：独立 IDE 配置、Lingma。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = self.adapter.detect_data_roots(tmp)
+        self.assertEqual(len(roots), 6)
+        joined = " ".join(r["rel"] for r in roots)
+        self.assertIn("QoderCN", joined)
+        self.assertIn(".lingma", joined)
+
+    def test_missing_dirs_report_exists_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = self.adapter.detect_data_roots(tmp)
+        self.assertTrue(all(r["exists"] is False for r in roots))
+
+    def test_present_dir_reports_exists_true(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".lingma"))
+            roots = {r["rel"]: r["exists"] for r in self.adapter.detect_data_roots(tmp)}
+        self.assertTrue(roots[".lingma"])
+
+    def test_identity_entries_optional_per_machine(self) -> None:
+        """身份族条目按存在性判定：本机有的三项存在、工作机才有的三项缺失且不勾选。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            items = {
+                it.key: it
+                for it in self.adapter.build_items(tmp)
+                if it.key.startswith("legacy_identity:")
+            }
+        self.assertEqual(
+            set(items),
+            {"legacy_identity:" + s for s in
+             ("machine_token", "policy", "user", "id", "status", "app_config")},
+        )
+        for it in items.values():
+            self.assertFalse(it.exists)
+            self.assertFalse(it.recommended)
+            self.assertTrue(it.sensitive)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

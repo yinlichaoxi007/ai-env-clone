@@ -26,7 +26,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 #: manifest 中记录类型的字段值（也用于 ``export_backup`` 的 kind 默认值）
 KIND_BACKUP = "backup"
@@ -75,6 +75,12 @@ DEFAULT_EXCLUDES: tuple[str, ...] = (
     "*/logs/*",
     "*.db-wal",
     "*.db-shm",
+    # 记忆类文件的「旧快照」。云端托管的那份（如 ``memory/<用户 id>_memory.md``）
+    # 由服务端持有权威副本、并在本地留一份 ``.bak``；**该快照可能仍含服务端后续
+    # 已脱掉的明文口令**（本地快照不会随服务端更新而回溯清洗），凭证不入包 ⇒ 排除。
+    # 只针对记忆/规则这类「服务端或本机另有权威副本」的 markdown 快照，不动其它 ``.bak``。
+    "*/memory/*.md.bak",
+    "MEMORY.md.bak",
 )
 
 #: 无论体积多大都必须备份的关键文件（否则会话历史会丢失）
@@ -85,11 +91,39 @@ ALWAYS_INCLUDE: tuple[str, ...] = (
     "*/cache/db/*.sqlite",
     "*/cache/db/*.db-wal",
     "*/cache/db/*.db-shm",
+    # WorkBuddy 的主索引库不在 */cache/db/ 下 —— 它是数据根直属的
+    # ``~/.workbuddy/workbuddy.db``，而 ``-wal`` / ``-shm`` 会被 DEFAULT_EXCLUDES 的
+    # ``*.db-wal`` / ``*.db-shm`` 命中。若不在此豁免，「db + -wal + -shm 三件套
+    # 同批入包」这条不变量对它就不成立：主库受单文件体积上限约束（超限即静默跳过、
+    # 会话列表全丢）、配套文件被静默过滤。
+    # ⚠️ 只写**精确的三条路径**，不要写成 ``*/.workbuddy/*.db-wal`` 之类的通配——
+    #    那会连带命中 ``.workbuddy/workspace/sessions/*/modify_backup/`` 下 WorkBuddy
+    #    自己保存的同名运行态副本（体积大且无迁移价值），实测会平白多打进 90+ 个文件。
+    ".workbuddy/workbuddy.db",
+    ".workbuddy/workbuddy.db-wal",
+    ".workbuddy/workbuddy.db-shm",
+    "*/.workbuddy/workbuddy.db",
+    "*/.workbuddy/workbuddy.db-wal",
+    "*/.workbuddy/workbuddy.db-shm",
 )
 
 
 class BackupError(Exception):
     """备份 / 恢复过程中的可预期错误。"""
+
+
+#: 会话类数据「携带源设备信息」的通用说明（各适配器共用同一措辞，避免各写各的）。
+#:
+#: 背景（2026-09-27 本机实测）：会话/对话正文里**大量**出现当时的文件绝对路径——
+#: 工具调用参数、命令输出、文件快照都会把它记下来。CodeBuddy 侧实测
+#: ``history/**`` 24519 个 JSON 里 20564 个命中、``check-point/**`` 186/218 命中；
+#: Qoder ``project_sessions`` 51/60、WorkBuddy ``workspace_sessions`` 13/60 亦命中。
+#: 这些路径**跨机还原后正是用来把数据归回原本工程工作区的线索**（有用），
+#: 但同时意味着备份包会把源机器的目录结构一并带走（需告知用户）。
+ORIGIN_NOTE_CONVERSATION = "会话正文与命令输出会记录源机器上的文件绝对路径"
+
+#: 会话数据库（SQLite）内的同类说明。
+ORIGIN_NOTE_SESSION_DB = "会话数据库内会记录源机器上的文件绝对路径"
 
 
 @dataclass
@@ -103,6 +137,17 @@ class BackupItem:
     recommended: bool = True
     uid: str | None = None  # 记忆区按 UID 拆分时的用户标识，非记忆项为 None
     sensitive: bool = False  # 含 apiKey 等敏感凭证，备份时需脱敏、恢复需用户手动补填
+    #: 非空 = 该条目会**携带源机器上的路径 / 标识等信息**，值是给用户看的说明。
+    #: 导出时登记进清单的 ``origin_info``，界面在勾选处、备份完成提示与备份包详情里
+    #: 都会明示——目的是让用户在**分享备份包之前**就知道包里有源设备信息，而非事后才知。
+    #: 注意：这里的说明只陈述「包里有」，不含评价；是否分享由用户决定。
+    carries_origin: str = ""
+    #: 非空 = ``(配套条目 key, 说明)``：**勾选了本条目、但未勾选该配套条目**时，
+    #: 备份完成提示里追加这条说明（见 :func:`companion_notes`）。
+    #: 用途是「单独成文件、缺了它数据就不完整」的成对内容。典型（DSH 实测）：
+    #: ``settings.yaml`` 只保存 provider 的密钥**引用**（``apiKeyEnv``），真密钥在同目录
+    #: ``.credentials.yaml``；后者含明文、默认不勾 ⇒ 必须让用户知道要单独备份它。
+    companion: "tuple[str, str] | None" = None
 
     @property
     def exists(self) -> bool:
@@ -111,6 +156,138 @@ class BackupItem:
     @property
     def is_dir(self) -> bool:
         return os.path.isdir(self.path)
+
+
+def origin_info_entries(items: Sequence[BackupItem]) -> list[dict]:
+    """从条目清单里挑出「携带源设备信息」的条目，供写入清单 / 界面展示。
+
+    只认**确实存在**的条目：不存在的内容不会进包，报它会误导（清单里 ``items``
+    字段同样只记存在的条目），故调用方应传入已筛过的列表。
+
+    :return: ``[{"key","label","note"}, ...]``，按 key 排序、按 (key, note) 去重。
+        同一逻辑项在 GUI 里是多行（如 ``ide_ws_records:<hash>`` 一条工作区一个文件），
+        这里按 key 保留各自条目，展示侧再按 (label, note) 合并成一行。
+    """
+    rows: list[dict] = []
+    seen: set = set()
+    for it in items:
+        note = (getattr(it, "carries_origin", "") or "").strip()
+        if not note:
+            continue
+        sig = (it.key, note)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        rows.append({"key": it.key, "label": it.label, "note": note})
+    rows.sort(key=lambda r: r["key"])
+    return rows
+
+
+def companion_notes(items: Sequence[BackupItem]) -> list[str]:
+    """挑出「已勾选、但它的配套条目没勾选」的提醒文案（去重、保序）。
+
+    用于「拆成两个文件、缺一个数据就不完整」的成对内容。典型是 DSH：勾了
+    ``settings.yaml``（只存 provider 的密钥**引用**）却没勾 ``.credentials.yaml``
+    （存真密钥）⇒ 备份包里取不到密钥，还原后模型不可用，必须当场告诉用户。
+
+    :param items: **本次实际勾选**的条目（不是全量清单）。配套条目是否被勾选，
+        就以这份列表里有没有它的 ``key`` 判断。
+    :return: 需要追加到备份完成提示里的说明列表；无则空列表。
+    """
+    selected = {it.key for it in items}
+    out: list[str] = []
+    for it in items:
+        comp = getattr(it, "companion", None)
+        if not comp:
+            continue
+        comp_key, note = comp
+        if note and comp_key not in selected and note not in out:
+            out.append(note)
+    return out
+
+
+def manifest_origin_info(manifest: dict | None) -> list[dict]:
+    """读取清单里的 ``origin_info``；旧备份包没有该字段时返回空列表。
+
+    只做形状收敛（过滤掉空说明 / 非字典项），**不补默认值**——「没有登记」与
+    「登记为空」在这里含义相同：本包没有已知的源设备信息。
+    """
+    if not isinstance(manifest, dict):
+        return []
+    raw = manifest.get("origin_info")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        note = str(row.get("note") or "").strip()
+        if not note:
+            continue
+        out.append({
+            "key": str(row.get("key") or ""),
+            "label": str(row.get("label") or ""),
+            "note": note,
+        })
+    return out
+
+
+def origin_info_lines(manifest: dict | None, indent: str = "  ") -> list[str]:
+    """把「携带的源设备信息」渲染成多行文案（供备份包详情区展示）。
+
+    同一 (label, note) 合并成一行（GUI 里一条逻辑项可能是多个文件条目），
+    末尾附一句「分享前留意」，因为这类信息的风险点不在本机、而在**把包发出去**。
+    """
+    rows = manifest_origin_info(manifest)
+    if not rows:
+        return []
+    merged: list[tuple[str, str]] = []
+    for row in rows:
+        sig = (row["label"] or row["key"], row["note"])
+        if sig not in merged:
+            merged.append(sig)
+    lines = ["", "【携带的源设备信息】备份包会记下源机器上的路径 / 标识（这是数据能还原回"
+                 "原位、会话能被归回原工作区的原因），分享、上传或发送该包前请留意："]
+    for label, note in merged:
+        lines.append("%s· %s：%s" % (indent, label, note))
+    lines.append("%s备份包内的目录结构还会带上源机器的用户名与登录用户标识（如 %s）；"
+                 "跨机还原时工具会按当前机器重映射。" % (indent, r"…\Users\<用户名>"))
+    return lines
+
+
+def session_workspaces_lines(manifest: dict | None, indent: str = "  ") -> list[str]:
+    """把「会话 -> 原始工作区路径」的备份记录渲染成多行文案（详情区展示用）。
+
+    这是**本工具生成**的附加文件（由适配器的 ``export_generated`` 产出，随包携带、
+    还原后落回会话根），记录每条会话原本所属的工程工作区路径。旧备份包没有这段，
+    返回空列表 —— 不显示、也不推断「它是不是坏了」。
+    """
+    if not isinstance(manifest, dict):
+        return []
+    extra = manifest.get("extra")
+    if not isinstance(extra, dict):
+        return []
+    sw = extra.get("session_workspaces")
+    if not isinstance(sw, dict):
+        return []
+    try:
+        total = int(sw.get("total") or 0)
+        resolved = int(sw.get("resolved") or 0)
+        unresolved = int(sw.get("unresolved") or 0)
+    except (TypeError, ValueError):
+        return []
+    if total <= 0:
+        return []
+    return [
+        "",
+        "【会话原始工作区】包内另存有一份「会话 -> 原始工作区路径」映射（%s）："
+        % (sw.get("file") or "session-workspaces.json"),
+        "%s· 共 %d 个工作区：%d 个可还原为具体路径，%d 个只记录了不可逆 id"
+        % (indent, total, resolved, unresolved),
+        "%s· 还原后导入会话时据此把会话放回原工程工作区；推不出路径的会在导入前"
+        "明确提示，不会静默换落点。" % indent,
+        "%s· ⚠ 该文件记录了源机器的工程路径，分享或上传备份包前请留意。" % indent,
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -180,13 +357,22 @@ def _strip_longpath(path: str) -> str:
 
 
 def is_critical(rel_path: str) -> bool:
-    """判断是否为不受体积上限约束的关键数据文件。"""
+    """判断是否为不受体积上限约束、也不受排除规则过滤的关键数据文件。
+
+    匹配口径与 :func:`is_excluded` 保持一致（含试拼前导 ``/``）：``ALWAYS_INCLUDE``
+    的模式都写作 ``*/段/名`` 形式，而归档内相对路径**首段前没有斜杠**（如
+    ``.workbuddy/workbuddy.db``），若不试拼前导斜杠，形如 ``*/.workbuddy/*.db``
+    的规则会永远匹配不上（只对位于中间层的 ``*/cache/db/*.db`` 才恰好生效）。
+    """
     p = _norm_for_match(rel_path)
     name = p.rsplit("/", 1)[-1]
-    return any(
-        fnmatch.fnmatch(p, pat.lower()) or fnmatch.fnmatch(name, pat.lower())
-        for pat in ALWAYS_INCLUDE
-    )
+    for pat in ALWAYS_INCLUDE:
+        pl = pat.replace(os.sep, "/").lower()
+        if fnmatch.fnmatch(p, pl) or fnmatch.fnmatch(name, pl):
+            return True
+        if fnmatch.fnmatch("/" + p, pl):
+            return True
+    return False
 
 
 def scan_items(
@@ -330,11 +516,17 @@ def export_backup(
     kind: str = KIND_BACKUP,
     export_transform: "Callable[[str, bytes], bytes] | None" = None,
     export_transform_paths: "Sequence[str] | None" = None,
+    extra_files: "Mapping[str, bytes] | None" = None,
 ) -> dict:
     """
     导出备份到 zip。
 
     :param tool_name: 来源工具标识（写入 manifest，便于跨工具识别）。
+    :param extra_files: 适配器**生成**的附加文件（``绝对落点路径 -> 字节内容``）。
+        这些文件**不在磁盘上**，由适配器在导出时构造（典型：把「会话 -> 原始工作区
+        路径」映射落成一份 JSON，随包携带，使跨机还原后仍能提醒用户会话原本属于
+        哪个工程）。路径须位于 ``root`` 之下，写入时按 :func:`_arcname` 转成归档内
+        相对路径，因此**还原时会自动落回原位**，无需任何特殊处理。
     :param extra_meta: 适配器可附加的自定义元信息（如版本、子模块说明）。
     :param kind: 包类型，写入 manifest 的 ``kind`` 字段，供还原时校验，
         防止仅改文件名就被误还原。默认 ``"backup"``，回滚快照传 ``"rollback"``。
@@ -351,6 +543,9 @@ def export_backup(
     os.makedirs(os.path.dirname(os.path.abspath(zip_path)) or ".", exist_ok=True)
     tmp_zip = zip_path + ".part"
     selected_keys = [i.key for i in items if i.exists]
+    # 携带源设备信息的条目：与 items 同口径（只记确实存在的），供还原/分享前提示。
+    # 旧版本读本字段会直接忽略（多一个键不影响向下兼容）。
+    origin_info = origin_info_entries([i for i in items if i.exists])
 
     manifest = {
         "version": MANIFEST_VERSION,
@@ -360,6 +555,7 @@ def export_backup(
         "source_root": root,
         "platform": os.name,
         "items": selected_keys,
+        "origin_info": origin_info,
         "file_count": scan.file_count,
         "total_bytes": scan.total_bytes,
         "skipped_count": scan.skipped_count,
@@ -429,6 +625,28 @@ def export_backup(
                             os.remove(snap)
                         except OSError:
                             pass
+
+            # 适配器生成、不在磁盘上的附加文件（如「会话 -> 原始工作区路径」映射）。
+            # 按 _arcname 转归档名后写入，还原时自然回到原位；单独记进 manifest 的
+            # generated 字段，便于详情区展示与「分享前留意」提示。
+            generated: list[str] = []
+            for abs_path, data in (extra_files or {}).items():
+                try:
+                    grel = _arcname(abs_path, root).replace(os.sep, "/")
+                except ValueError:
+                    continue
+                if grel.startswith("..") or not grel:
+                    continue
+                zf.writestr(grel, data)
+                generated.append(grel)
+                manifest["file_count"] += 1
+                manifest["total_bytes"] += len(data)
+                ext = os.path.splitext(grel)[1].lower()
+                manifest["bytes_by_ext"][ext] = (
+                    manifest["bytes_by_ext"].get(ext, 0) + len(data)
+                )
+            if generated:
+                manifest["generated"] = sorted(generated)
 
             zf.writestr(
                 MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False, indent=2)

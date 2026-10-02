@@ -26,18 +26,24 @@ DSH 数据全部位于 ``~/.dsh/`` 目录下（``$DSH_HOME`` 环境变量可覆�
     等同于「用户级规则」，默认勾选。
   - ``settings.yaml``
     用户设置（LLM 提供商、locale、auto-detect 等）。
-    属「设置」类，可从零重新创建，默认不勾。
+    属「设置」类，**默认勾选**（还原后无需重新配置）。
+    ⚠️ 本文件**只保存引用、不含明文密钥**（本机实测为 ``apiKeyEnv: <环境变量名>``，
+    真密钥在同目录 ``.credentials.yaml``）⇒ **不标记为敏感项**（否则会把用户带去
+    本文件里找一个根本不存在的明文密钥）；仅保留导出脱敏作兜底，防手改后误带明文。
   - ``.credentials.yaml``
-    API 密钥等敏感凭证。
-    属「设置」类，默认不勾（用户需谨慎）。
+    ``refs`` 段 = **可移植的 API 密钥**（``settings.yaml`` 的 ``apiKeyEnv`` 指向这里）；
+    ``records`` 段 = 机器绑定的登录态 / 设备标识。
+    属「凭证」类，默认不勾（含明文，随包分享即外泄；登录态换机本就须重新登录）。
+    ⇒ 未勾选它、却勾了 ``settings.yaml`` 时，备份完成提示会提醒用户**单独备份本文件**。
   - ``profiles/``
     配置文件（插件配置、cordis.yml、package.json 等）。
     属「插件/扩展」类，可从零重建，默认不勾。
   - ``.anonymous-user-id``
     匿名用户标识文件，运行态，**不列入备份选项**。
 
-备份哲学（统一标准）：默认勾选无法从零重复创建的——会话、存储索引、用户规则；
-默认不勾可从零重复创建的——设置、凭证、配置文件；
+备份哲学（统一标准，用户 2026-10-01 定策后更新）：默认勾选「无法从零重复创建、或缺失后
+需重新逐项配置」的两类——① 会话、存储索引、用户规则；② 设置（含 LLM 提供商配置）。
+默认不勾**重新获取成本低 / 需重新授权**的——凭证、配置文件（profiles/）；
 程序自身的本地缓存、运行态标识与用户数据无关，不列入备份选项。
 """
 
@@ -47,7 +53,8 @@ import json
 import os
 import sys
 
-from ..core import BackupItem, _longpath
+from ..core import ORIGIN_NOTE_CONVERSATION, BackupItem, _longpath
+from ..redact import redact_config_bytes
 from .base import BaseAdapter, register
 
 
@@ -223,6 +230,23 @@ def _count_session_files(sessions_root: str) -> int:
     return count
 
 
+# --------------------------------------------------------------------------- #
+# 导出脱敏：settings.yaml
+#
+# 背景：``~/.dsh/settings.yaml`` 记录 LLM 提供商（base_url / model 等），自
+# 2026-10-01 起**默认勾选**（用户定策：设置属「还原后立刻能开工」类）。
+#
+# ★ 关键事实（本机实测）：该文件**不含明文密钥** —— provider 下是
+#   ``apiKeyEnv: <环境变量名>`` 这样的**引用**，真密钥在同目录 ``.credentials.yaml``。
+#   ⇒ 正常情况下这段脱敏**不会改动任何一行**，它的作用是兜底：万一用户手改过、
+#     把明文密钥直接写进 settings.yaml，导出时也要抹掉（本工具承诺包内无明文密钥）。
+#   ⇒ 脱敏必须「引用感知」：``ai_env_clone.redact.key_is_reference`` 会跳过
+#     ``apiKeyEnv`` / ``keyFile`` 这类键，否则会把引用名抹成占位符、把配置改坏
+#     （2026-10-01 曾实际引入该 bug 并修复）。
+#
+# 实现见 :mod:`ai_env_clone.redact`（行级脱敏，与 Reasonix config.toml 共用）。
+# --------------------------------------------------------------------------- #
+
 def build_items(
     root: str | None = None,
     dsh_home: str | None = None,
@@ -260,6 +284,7 @@ def build_items(
                 description="DSH 会话事件日志（sessions/）。共 %d 个工作区、%d 个会话。核心，默认勾选。"
                 % (len(workspace_dirs), total_sessions),
                 recommended=True,
+                carries_origin=ORIGIN_NOTE_CONVERSATION,
             )
         )
     else:
@@ -272,6 +297,7 @@ def build_items(
                 uid=None,
                 description="DSH 会话事件日志（sessions/）。未找到会话数据。",
                 recommended=True,
+                carries_origin=ORIGIN_NOTE_CONVERSATION,
             )
         )
 
@@ -315,7 +341,16 @@ def build_items(
         )
     )
 
-    # 4) 用户设置（settings.yaml）。属「设置」类，可从零重新创建，默认不勾。
+    # 4) 用户设置（settings.yaml）。
+    #    默认勾选（用户 2026-10-01 定策：设置属「还原后立刻能开工」类）。
+    #    ⚠️ 本文件**只存引用、不存明文密钥**（本机实测）：provider 下是
+    #    ``apiKeyEnv: <环境变量名>``，真密钥在同目录 ``.credentials.yaml`` 的 ``refs`` 段。
+    #    故**不标 sensitive** —— 标了会让「备份后定位敏感文件」把用户带去 settings.yaml
+    #    找一个根本不存在的明文密钥；引用值反而会被脱敏逻辑抹坏（已实测复现并修复，
+    #    见 :func:`ai_env_clone.redact.key_is_reference`）。
+    #    仍保留 export_transform 作**兜底**：若用户手改过、把明文密钥直接写进本文件，
+    #    导出时会被抹掉 —— 本工具承诺「备份包不含明文密钥」，宁可知情后补填也不外泄。
+    #    再挂 companion：未勾选 .credentials.yaml 时，备份完成提示用户单独备份该文件。
     settings_file = os.path.join(dsh, "settings.yaml")
     items.append(
         BackupItem(
@@ -323,12 +358,27 @@ def build_items(
             label="用户设置（settings.yaml）",
             path=settings_file,
             uid=None,
-            description="DSH 用户设置（LLM 提供商、locale 等）。可从零重新创建，默认不勾。",
-            recommended=False,
+            description="DSH 用户设置（LLM 提供商、locale、auto-detect 等）。默认勾选，"
+                        "还原后无需重新配置。注意：本文件只保存 provider 的密钥**引用**"
+                        "（如 apiKeyEnv 指向的环境变量名），不含明文密钥；"
+                        "真正的密钥在同目录的「凭证（.credentials.yaml）」里。",
+            recommended=True,
+            companion=(
+                "credentials",
+                "「用户设置（settings.yaml）」已勾选，但它的配套文件「凭证（.credentials.yaml）」"
+                "未勾选。DSH 的模型密钥存放在后者（settings.yaml 里只有 apiKeyEnv 这样的引用名），"
+                "不随包携带则还原后模型会因取不到密钥而不可用。"
+                "如需跨机保留密钥，请单独备份该文件；不需要时在新机器重新填写即可"
+                "（该文件含明文密钥，请勿随备份包分享）。",
+            ),
         )
     )
 
-    # 5) 凭证（.credentials.yaml）。属「设置」类，敏感信息，默认不勾。
+    # 5) 凭证（.credentials.yaml）。
+    #    refs 段是**可移植的 API 密钥**（settings.yaml 的 apiKeyEnv 就指向这里）；
+    #    records 段是机器绑定的登录态 / 设备标识（换机须重新登录）。
+    #    默认不勾：含明文，随包分享即外泄；登录态那半本就跨机无意义。
+    #    未勾选时由上面 settings 条目的 companion 在备份完成时提示「单独备份」。
     creds_file = os.path.join(dsh, ".credentials.yaml")
     items.append(
         BackupItem(
@@ -336,7 +386,10 @@ def build_items(
             label="凭证（.credentials.yaml）",
             path=creds_file,
             uid=None,
-            description="DSH API 密钥等凭证。敏感信息，默认不勾。",
+            description="DSH 凭证（.credentials.yaml）。其中 refs 段是可移植的 API 密钥"
+                        "（settings.yaml 的 apiKeyEnv 就指向这里），records 段是机器绑定的"
+                        "登录态/设备标识。默认不勾：含明文，分享备份包会外泄，"
+                        "且登录态换机本就须重新登录；如需把密钥带到新机器，请单独备份本文件。",
             recommended=False,
         )
     )
@@ -454,3 +507,26 @@ class DSHAdapter(BaseAdapter):
     def restore_index_merge(self) -> "Callable[[str, bytes, bytes], bytes] | None":
         """返回 DSH 工作区索引合并回调（见 :func:`_merge_workspace_index_bytes`）。"""
         return _merge_workspace_index_bytes
+
+    # ------------------------------------------------------------------ #
+    # 导出脱敏：settings.yaml —— 兜底用（该文件正常只存引用、无明文密钥）
+    # ------------------------------------------------------------------ #
+    def export_transform_paths(self) -> "Sequence[str] | None":
+        """需要导出脱敏的归档内相对路径后缀：``settings.yaml``。
+
+        该条目自 2026-10-01 起**默认勾选**，而 LLM 提供商配置里理论上可能出现明文
+        apiKey / token（包常被同步到网盘或转发他人）⇒ 保留脱敏作**兜底**。
+
+        注意（本机实测）：DSH 正常写的是 ``apiKeyEnv: <环境变量名>`` 这种**引用**，
+        真密钥在同目录 ``.credentials.yaml``；引用型键由
+        :func:`ai_env_clone.redact.key_is_reference` 跳过，故正常文件**逐字不变**。
+        """
+        return ["settings.yaml"]
+
+    def export_transform(self) -> "Callable[[str, bytes], bytes] | None":
+        """返回 ``settings.yaml`` 的脱敏回调（见 :mod:`ai_env_clone.redact`）。
+
+        只改写「键名像凭证」的值，YAML 结构原样保留 —— 与 ``models.json``
+        口径一致：抹掉明文而不是跳过整个文件（跳过会导致恢复后缺文件、界面报配置缺失）。
+        """
+        return lambda _rel, source: redact_config_bytes(source)

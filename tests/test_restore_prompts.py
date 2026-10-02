@@ -133,6 +133,40 @@ class TestRestorePrompts(unittest.TestCase):
         self.app.restore_from(same_zip, expected_kind="backup")
         self.assertNotIn("已自动重映射登录用户", self._titles("showinfo"))
 
+    def test_origin_info_mentioned_before_restore(self):
+        """包里有源设备信息（路径等）→ 还原确认里先说一句，避免写回 %APPDATA% 后才发现。
+
+        IDE 工作区记录会被还原到本机 ``%APPDATA%/<产品>/User/workspaceStorage/``，
+        属「工具目录之外」的写入；不提前说就属于让用户事后才发现。
+        """
+        z = os.path.join(self.tmp, "with_origin.zip")
+        manifest = {
+            "version": 2, "kind": "backup", "tool": "codebuddy",
+            "created_at": "2026-08-18T00:00:00", "source_root": self.restore_root,
+            "platform": os.name, "items": ["ide_workspace_records:a"], "file_count": 1,
+            "total_bytes": 10, "bytes_by_ext": {}, "bytes_by_ext_compressed": {},
+            "origin_info": [{"key": "ide_workspace_records:a",
+                             "label": "IDE 工作区记录（已打开文件夹）",
+                             "note": "源机器上打开过的工程文件夹绝对路径"}],
+        }
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.writestr(MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False, indent=2))
+            zf.writestr("x/workspace.json", '{"folder": "file:///d%3A/project/x"}')
+        self.app.restore_from(z, expected_kind="backup")
+        confirm = [m for t, m in zip(self._titles("askyesno"), self._msgs("askyesno"))
+                   if t == "确认还原备份包"]
+        self.assertTrue(confirm)
+        self.assertIn("携带", confirm[0])
+        self.assertIn("源机器", confirm[0])
+
+    def test_no_origin_info_no_extra_line(self):
+        """包里没有该信息时不加这句（不做无内容的提醒）。"""
+        self.app.restore_from(self.zip_path, expected_kind="backup")
+        confirm = [m for t, m in zip(self._titles("askyesno"), self._msgs("askyesno"))
+                   if t == "确认还原备份包"]
+        self.assertTrue(confirm)
+        self.assertNotIn("携带", confirm[0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -120,10 +120,38 @@ class TestBuildItems(unittest.TestCase):
         self.assertTrue(items["storages:workspace"].recommended)
         self.assertTrue(items["storages:session_projcache"].recommended)
         self.assertTrue(items["user_agents"].recommended)
-        # 非核心数据默认不勾
-        self.assertFalse(items["settings"].recommended)
+        # 设置默认勾选（用户 2026-10-01 定策：还原后立刻能开工）。
+        # ★ 但**不标 sensitive**：本机实测 settings.yaml 只存 provider 的密钥**引用**
+        #   （``apiKeyEnv: SENSENOVA_API_KEY``），真密钥在同目录 .credentials.yaml。
+        #   标了会让「备份后定位敏感文件」把用户带去 settings.yaml 找一个不存在的明文密钥。
+        self.assertTrue(items["settings"].recommended)
+        self.assertFalse(items["settings"].sensitive)
+        # 但必须带「配套条目」提醒：未勾 .credentials.yaml 时提示用户单独备份
+        comp = items["settings"].companion
+        self.assertIsNotNone(comp)
+        self.assertEqual(comp[0], "credentials")
+        # 凭证 / 配置文件仍默认不勾
         self.assertFalse(items["credentials"].recommended)
         self.assertFalse(items["profiles"].recommended)
+
+    def test_credentials_is_companion_of_settings(self) -> None:
+        """``.credentials.yaml`` 是 ``settings.yaml`` 的配套文件，声明必须落在它身上。"""
+        from ai_env_clone.core import companion_notes
+
+        items = self._items()
+        creds = next(it for it in items if it.key == "credentials")
+        self.assertIsNone(creds.companion, "配套声明应写在触发方（settings）上")
+
+        # 只勾 settings（默认情形）→ 必须提醒
+        only_settings = [it for it in items if it.key in ("settings", "sessions")]
+        notes = companion_notes(only_settings)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("credentials", notes[0])
+        self.assertIn("单独备份", notes[0])
+
+        # settings + credentials 都勾 → 不再提醒
+        both = [it for it in items if it.key in ("settings", "credentials")]
+        self.assertEqual(companion_notes(both), [])
 
     def test_exists_when_present(self) -> None:
         for it in self._items():

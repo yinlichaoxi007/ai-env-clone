@@ -61,6 +61,10 @@ class TempEnv(unittest.TestCase):
         self.session_root = os.path.join(
             self.tmp, "data", self.uuid, "CodeBuddyIDE", self.uuid
         )
+        # IDE 工作区记录根（对应 %APPDATA%/CodeBuddy CN/User/workspaceStorage）
+        self.ws_storage = os.path.join(
+            self.tmp, "appdata", "CodeBuddy CN", "User", "workspaceStorage"
+        )
         self._make_tree()
 
     def _w(self, base: str, rel: str, content: str = "x") -> str:
@@ -92,6 +96,11 @@ class TempEnv(unittest.TestCase):
         self._w(self.session_root, "history/messages/1.json", "{}")
         self._w(self.session_root, "check-point/1.json", "{}")
         self._w(self.session_root, "plan-task/1.json", "{}")
+        # IDE 工作区记录（<User>/workspaceStorage/<hash>/workspace.json）
+        self.ws_record = self._w(
+            self.ws_storage, "abc123/workspace.json",
+            '{"folder": "file:///d%3A/project/demo"}',
+        )
 
         # 让适配器内部探测函数指向临时目录（真实环境里 LOCALAPPDATA 也在 ~ 下，
         # 这里用 monkeypatch 保证所有条目 path 都在 self.tmp 之下，便于断言）。
@@ -126,6 +135,12 @@ class TempEnv(unittest.TestCase):
         )
         patcher6.start()
         self.addCleanup(patcher6.stop)
+        # IDE 工作区记录：真实环境里它在 %APPDATA% 下（也在 ~ 下），这里同样指到临时目录
+        patcher7 = mock.patch.object(
+            cb_mod, "detect_ide_workspace_records", return_value=[self.ws_record]
+        )
+        patcher7.start()
+        self.addCleanup(patcher7.stop)
 
 
 class TestDetect(unittest.TestCase):
@@ -163,23 +178,47 @@ class TestBuildItems(TempEnv):
     def test_no_project_level_codebuddy(self) -> None:
         # 绝不应出现项目级 <project>/.codebuddy 的内容标记（如 memory/ 等）
         self.assertNotIn("memory", self.by_key)
-        self.assertNotIn("settings", self.by_key)  # 项目级 settings 不存在；用户级用的是 user_skill:settings
+        self.assertNotIn("settings", self.by_key)  # 项目级 settings 不存在；用户级用的是 user_settings
 
     def test_expected_prefixes(self) -> None:
         expected = {
             "user_memories",
             "user_rules",
-            "user_skill",
+            "user_settings",
             "user_mcp",
             "global_argv",
             "global_extensions",
             "user_sessions",
+            "ide_workspace_records",
             "user_inspiration",
             "user_expert_history",
             "user_plugins",
             "user_models",
         }
         self.assertEqual(self.prefixes, expected)
+
+    def test_ide_workspace_records_item(self) -> None:
+        """IDE 工作区记录：默认勾选、单文件条目、并声明「携带源设备信息」。
+
+        它是跨机还原后把会话归回原工程工作区的唯一结构化映射，丢了就只剩哈希
+        （不可逆）；同时它内容就是源机器的工程路径，必须让用户知情。
+        """
+        key = [k for k in self.by_key if k.startswith("ide_workspace_records:")][0]
+        it = self.by_key[key]
+        self.assertTrue(it.recommended)
+        self.assertEqual(os.path.normpath(it.path), os.path.normpath(self.ws_record))
+        self.assertIn("打开过的工程文件夹", it.carries_origin)
+        # 聚合前缀只到第一个冒号 -> GUI 里是一行
+        self.assertEqual(key.split(":", 1)[0], "ide_workspace_records")
+
+    def test_session_items_declare_origin_info(self) -> None:
+        """会话/检查点类条目必须声明「携带源机器路径」（实测会话正文含绝对路径）。"""
+        for key in ("user_sessions:history", "user_sessions:checkpoint"):
+            self.assertTrue(self.by_key[key].carries_origin, key)
+
+    def test_plan_task_not_marked(self) -> None:
+        """plan-task 实测不含绝对路径（0/5），不做无根据的标注。"""
+        self.assertEqual(self.by_key["user_sessions:plan_task"].carries_origin, "")
 
     def test_recommended_defaults(self) -> None:
         # 默认勾选：用户记忆 / 用户规则 / 集中会话（history/check-point/plan-task）
@@ -190,25 +229,33 @@ class TestBuildItems(TempEnv):
         self.assertTrue(self.by_key["user_sessions:history"].recommended)
         self.assertTrue(self.by_key["user_sessions:checkpoint"].recommended)
         self.assertTrue(self.by_key["user_sessions:plan_task"].recommended)
-        # 默认不勾：设置类（argv）、skill 设置/本体、mcp、扩展、灵感、专家历史、插件
-        self.assertFalse(self.by_key["global_argv"].recommended)
-        self.assertFalse(self.by_key["user_skill:settings"].recommended)
-        self.assertFalse(self.by_key["user_skill:skills"].recommended)
+        # 默认勾选（用户 2026-10-01 定策：「还原后立刻能开工」类）：
+        # 设置类（argv / 用户级 settings）、灵感、自定义模型配置
+        self.assertTrue(self.by_key["global_argv"].recommended)
+        self.assertTrue(self.by_key["user_settings"].recommended)
+        self.assertTrue(self.by_key["user_inspiration"].recommended)
+        # 默认不勾（重新获取成本低 / 需重新授权）：mcp、扩展、专家历史、插件
         self.assertFalse(self.by_key["user_mcp"].recommended)
         self.assertFalse(self.by_key["global_extensions"].recommended)
-        self.assertFalse(self.by_key["user_inspiration"].recommended)
         self.assertFalse(self.by_key["user_expert_history"].recommended)
         self.assertFalse(self.by_key["user_plugins"].recommended)
-        # 自定义模型配置：默认不勾（含明文 apiKey，属敏感设置类）
-        self.assertFalse(self.by_key["user_models"].recommended)
+        # 自定义模型配置：默认勾选，但含明文 apiKey ⇒ 必须标敏感并导出脱敏
+        self.assertTrue(self.by_key["user_models"].recommended)
         self.assertTrue(self.by_key["user_models"].sensitive)
 
-    def test_user_skill_merged(self) -> None:
-        # settings.json 与 skills-marketplace/ 共享聚合前缀 user_skill（GUI 合成一行）
-        self.assertIn("user_skill:settings", self.by_key)
-        self.assertIn("user_skill:skills", self.by_key)
-        self.assertEqual(self.by_key["user_skill:settings"].label,
-                         self.by_key["user_skill:skills"].label)
+    def test_skill_marketplace_not_backed_up(self) -> None:
+        """skill 只备份本机 skill 数据，不备份市场数据（用户 2026-10-01 明确）。
+
+        ``~/.codebuddy/skills-marketplace/`` 本机实测是**整个技能市场的镜像**
+        （295 个技能目录 ≈ 市场清单全量 + 137 个市场图标 + 目录索引，共 57.1 MB），
+        可重新下载 ⇒ 不得生成备份条目（此前默认勾选，等于每次默认备份白背 57 MB）。
+        """
+        for it in self.items:
+            self.assertNotIn("skills-marketplace", it.path,
+                             "市场镜像不应成为备份条目：%s" % it.key)
+        self.assertNotIn("user_skill:skills", self.by_key)
+        # 本机设置（enabledPlugins 开关清单）仍照常备份
+        self.assertIn("user_settings", self.by_key)
 
     def test_sessions_have_current_uid(self) -> None:
         # 集中会话项必须带当前用户 uid（供 GUI 当前用户下拉与绑定）
@@ -222,8 +269,7 @@ class TestBuildItems(TempEnv):
             "user_rules",
             "global_argv",
             "user_inspiration",
-            "user_skill:settings",
-            "user_skill:skills",
+            "user_settings",
             "user_mcp",
             "user_expert_history",
             "user_plugins",
@@ -242,8 +288,7 @@ class TestBuildItems(TempEnv):
         self.assertEqual(self.by_key["user_memories"].path, self.memories_root)
         self.assertEqual(self.by_key["global_argv"].path,
                          os.path.join(self.global_root, "argv.json"))
-        self.assertTrue(self.by_key["user_skill:settings"].path.endswith("settings.json"))
-        self.assertTrue(self.by_key["user_skill:skills"].path.endswith("skills-marketplace"))
+        self.assertTrue(self.by_key["user_settings"].path.endswith("settings.json"))
         # 集中会话各项指向 session_root 下的子目录
         self.assertEqual(self.by_key["user_sessions:history"].path,
                          os.path.join(self.session_root, "history"))
@@ -507,7 +552,7 @@ class TestStructureStability(unittest.TestCase):
         prefixes = {it.key.split(":", 1)[0] for it in items}
         self.assertIn("user_memories", prefixes)
         self.assertIn("user_rules", prefixes)
-        self.assertIn("user_skill", prefixes)
+        self.assertIn("user_settings", prefixes)
         self.assertIn("user_sessions", prefixes)
         # 路径不存在 -> exists 为 False（GUI 显示未找到、不勾选，但选项不消失）
         self.assertFalse(items[0].exists)
@@ -554,6 +599,187 @@ class TestCrossPlatform(unittest.TestCase):
         )
         self.assertNotIn("CodeBuddyExtension/CodeBuddyExtension",
                          mr.replace("\\", "/"))
+
+
+class TestIdeOpenedWorkspaces(unittest.TestCase):
+    """IDE「已打开文件夹」记录 —— 把 ``workspaceId``（md5，不可逆）还原回项目路径。
+
+    背景：会话目录名是 ``md5(项目路径)``，会话正文里不带 ``cwd``，所以这是**唯一**
+    能反查的线索。反查不到时跨工具迁移会把会话扔进目标工具的默认落点
+    （WorkBuddy 是 ``~/WorkBuddy/<时间戳>``），而不是它原本的工程工作区。
+    """
+
+    def _fake_appdata(self) -> str:
+        """仿 ``%APPDATA%``：``CodeBuddy CN/User/{workspaceStorage,globalStorage}``
+        ＋一个应被排除的 ``CodeBuddyExtension`` 目录。"""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        user = os.path.join(d, "CodeBuddy CN", "User")
+        os.makedirs(os.path.join(user, "workspaceStorage", "hash-a"))
+        with open(os.path.join(user, "workspaceStorage", "hash-a", "workspace.json"),
+                  "w", encoding="utf-8") as f:
+            json.dump({"folder": "file:///d%3A/project/ai-env-clone"}, f)
+        os.makedirs(os.path.join(user, "workspaceStorage", "hash-b"))
+        with open(os.path.join(user, "workspaceStorage", "hash-b", "workspace.json"),
+                  "w", encoding="utf-8") as f:
+            json.dump({"folder": "file:///c%3A/Users/u/WorkBuddy/20260814223250"}, f)
+        with open(os.path.join(user, "workspaceStorage", "hash-b", "state.json"),
+                  "w", encoding="utf-8") as f:
+            json.dump({"ignore": "me"}, f)
+        os.makedirs(os.path.join(user, "globalStorage"))
+        with open(os.path.join(user, "globalStorage", "storage.json"),
+                  "w", encoding="utf-8") as f:
+            json.dump({
+                # 键即 folder URI（实测形态）
+                "profileAssociations": {
+                    "workspaces": {"file:///e%3A/extra%20proj": "__default__profile__"},
+                },
+                "windowsState": {"lastActiveWindow": {
+                    "folder": "file:///d%3A/project/ai-env-clone"}},
+            }, f)
+        # 同名但属另一个产品，必须排除
+        os.makedirs(os.path.join(d, "CodeBuddyExtension", "User"))
+        return d
+
+    def test_detect_user_dirs_filters_extension(self):
+        dirs = cb_mod.detect_ide_user_dirs(self._fake_appdata())
+        self.assertEqual(len(dirs), 1)
+        self.assertTrue(dirs[0].replace("\\", "/").endswith("CodeBuddy CN/User"), dirs)
+
+    def test_uri_decoding(self):
+        if os.name == "nt":
+            # 盘符统一大写（IDE 记的是小写 d:，产品自身记的是 D:）
+            self.assertEqual(cb_mod.file_uri_to_path("file:///d%3A/project/x"),
+                             "D:\\project\\x")
+        else:
+            self.assertEqual(cb_mod.file_uri_to_path("file:///d%3A/project/x"),
+                             "d:/project/x")
+        # 非本地 / 非法输入 -> 空串（远程工作区没有本地路径）
+        self.assertEqual(cb_mod.file_uri_to_path("file://server/share"), "")
+        self.assertEqual(cb_mod.file_uri_to_path("vscode-remote://ssh/x"), "")
+        self.assertEqual(cb_mod.file_uri_to_path(""), "")
+
+    def test_iter_collects_and_dedupes(self):
+        """三个来源（含 globalStorage 的 dict 键）都收到，且按发现顺序去重。"""
+        paths = cb_mod.iter_opened_workspace_paths(
+            cb_mod.detect_ide_user_dirs(self._fake_appdata()))
+        normalized = [p.replace("\\", "/").lower() for p in paths]
+        self.assertIn("d:/project/ai-env-clone", normalized)
+        self.assertIn("c:/users/u/workbuddy/20260814223250", normalized)
+        self.assertIn("e:/extra proj", normalized)          # 百分号编码要解回来
+        self.assertEqual(normalized.count("d:/project/ai-env-clone"), 1)  # 去重
+
+    def test_detect_workspace_record_files(self):
+        """只取 ``workspace.json``，不取 state.vscdb / storage.json（运行态）。
+
+        这一条是「备份内容」的边界：多取一个 state.vscdb 就是把 IDE 运行态打进包，
+        少取一个 workspace.json 就是跨机还原后路径映射丢失。
+        """
+        appdata = self._fake_appdata()
+        # 再塞两个应当被排除的文件
+        user = os.path.join(appdata, "CodeBuddy CN", "User")
+        with open(os.path.join(user, "workspaceStorage", "hash-a", "state.vscdb"),
+                  "w", encoding="utf-8") as f:
+            f.write("runtime-state")
+        recs = cb_mod.detect_ide_workspace_records(
+            cb_mod.detect_ide_user_dirs(appdata))
+        names = [os.path.basename(r) for r in recs]
+        self.assertEqual(names, ["workspace.json", "workspace.json"])
+        for r in recs:
+            joined = r.replace("\\", "/")
+            self.assertNotIn("state.vscdb", joined)
+            self.assertNotIn("globalStorage", joined)
+            self.assertTrue(joined.endswith("/workspaceStorage/hash-a/workspace.json")
+                            or joined.endswith("/workspaceStorage/hash-b/workspace.json"))
+
+    def test_record_item_is_single_file_and_marks_origin(self):
+        """条目 = 单个 workspace.json；key 带 :<hash> 但聚合前缀只有 ``ide_workspace_records``。"""
+        recs = cb_mod.detect_ide_workspace_records(
+            cb_mod.detect_ide_user_dirs(self._fake_appdata()))
+        it = cb_mod.ide_workspace_record_item(recs[0])
+        self.assertTrue(it.path.endswith("workspace.json"))
+        self.assertTrue(it.recommended)
+        self.assertTrue(it.carries_origin)
+        self.assertEqual(it.key.split(":", 1)[0], "ide_workspace_records")
+
+    def test_no_records_returns_empty(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        self.assertEqual(cb_mod.detect_ide_user_dirs(d), [])
+        self.assertEqual(cb_mod.iter_opened_workspace_paths([]), [])
+        self.assertEqual(cb_mod.detect_ide_workspace_records([]), [])
+
+
+class TestSessionPathMining(unittest.TestCase):
+    """会话正文挖掘：正文里的路径线索能不能可靠地捞出来（并滤掉假命中）。
+
+    背景（2026-09-27 实测）：会话 ``index.json`` 里没有结构化路径字段，但正文
+    （``messages/*.json``、``check-point/``）里其实**大量**出现绝对路径；早先
+    「正文不带路径」的判断是错的。这两处都在默认备份范围内，所以跨机还原后
+    线索是随包过来的 —— 但「哪一段前缀是工程根」不可靠，只有 md5 校验对得上才算。
+    """
+
+    def _session(self, *blobs: str) -> str:
+        d = tempfile.mkdtemp(prefix="cb_mine_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        mdir = os.path.join(d, "messages")
+        os.makedirs(mdir, exist_ok=True)
+        for i, text in enumerate(blobs):
+            with open(os.path.join(mdir, "m%d.json" % i), "w", encoding="utf-8") as f:
+                f.write(text)
+        return d
+
+    def test_unescape_and_normalise(self):
+        self.assertEqual(cb_mod.unescape_path_literal(r"d:\\project\\a"), r"d:\project\a")
+        self.assertEqual(cb_mod.unescape_path_literal("d:/project/a"), r"d:\project\a")
+        self.assertEqual(cb_mod.unescape_path_literal(r"d:\\a\\\\b"), r"d:\a\b")
+
+    def test_junk_filter(self):
+        """正文里的转义序列不能被当成路径；正常目录名不能被误杀。"""
+        junk = [r"d:\n", r"d:\n1. Read the file", r"c:\Users\x\AppData\r",
+                r"e:\ ", r"d:\t- item"]
+        for s in junk:
+            with self.subTest(s=s):
+                self.assertTrue(cb_mod.looks_like_junk_path(s))
+        ok = [r"d:\project\a", r"c:\Program Files\nodejs", r"d:\nvidia\bin",
+              r"d:\temp\logs", r"d:\project\ai-env-clone"]
+        for s in ok:
+            with self.subTest(s=s):
+                self.assertFalse(cb_mod.looks_like_junk_path(s))
+
+    def test_mines_escaped_paths_from_messages(self):
+        proj = r"D:\project\Demo"
+        d = self._session(
+            '{"a": "d:\\\\project\\\\Demo\\\\src\\\\a.py", "b": "d:\\\\project\\\\Demo\\\\b.py"}',
+            '{"c": "d:/project/demo/README.md"}',
+        )
+        occ = cb_mod.mine_session_path_occurrences(d)
+        # 挖掘**保留正文里的原始大小写**（只有成对反斜杠被压回单个、/ 归一为 \）；
+        # 大小写不敏感留给哈希比对（md5 前会转小写）。
+        self.assertEqual(occ.get("d:" + "\\project\\Demo" + r"\src\a.py"), 1)
+        self.assertEqual(occ.get("d:" + "\\project\\Demo" + r"\b.py"), 1)
+        self.assertIn("d:\\project\\demo\\README.md", occ)
+        # 反斜杠层数不同但指向同一个文件 -> 聚合到同一个键
+        self.assertEqual(sum(occ.values()), 3)
+
+    def test_hints_ranked_and_thresholded(self):
+        proj = r"D:\project\Demo"
+        d = self._session(
+            '{"f": ["D:\\\\project\\\\Demo\\\\src\\\\a.py",'
+            ' "D:\\\\project\\\\Demo\\\\src\\\\b.py",'
+            ' "D:\\\\project\\\\Demo\\\\README.md"]}',
+        )
+        rows = cb_mod.session_project_root_hints(d, limit=3)
+        roots = [p for p, _n in rows]
+        self.assertIn(proj, roots)
+        # 支持度单调：工程根的出现次数不少于它的子目录
+        got = dict(rows)
+        self.assertGreaterEqual(got[proj], got.get(proj + r"\src", 0))
+
+    def test_hints_empty_when_no_path(self):
+        d = self._session('{"a": "hello", "b": 42}')
+        self.assertEqual(cb_mod.session_project_root_hints(d), [])
+        self.assertEqual(cb_mod.mine_session_path_occurrences(d), {})
 
 
 class TestRegistration(unittest.TestCase):

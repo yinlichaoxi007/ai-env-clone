@@ -115,6 +115,7 @@ class BaseAdapter(ABC):
     ) -> dict:
         if items is None:
             items = self.build_items(root)
+        generated_files, generated_meta = self.export_generated(items, root)
         return export_backup(
             zip_path,
             items,
@@ -125,6 +126,8 @@ class BaseAdapter(ABC):
             compresslevel=compresslevel,
             export_transform=self.export_transform(),
             export_transform_paths=self.export_transform_paths(),
+            extra_files=generated_files,
+            extra_meta=generated_meta,
         )
 
     def inspect(self, zip_path: str) -> dict:
@@ -227,6 +230,24 @@ class BaseAdapter(ABC):
         默认返回 ``None``（不做变换）。
         """
         return None
+
+    def export_generated(self, items: "Sequence[BackupItem]", root: str):
+        """返回 ``(额外生成文件, 额外元信息)``，默认 ``(None, None)``。
+
+        - **额外生成文件**：``{绝对落点路径: 字节内容}``。这些文件**不在磁盘上**，
+          由适配器在导出时按需构造。core 会按「相对 ``root`` 的路径」写入备份包，
+          因此**还原时会自动落回原位**，不需要任何额外的还原逻辑。
+          典型用途：把「会话 -> 它原本所属的工程工作区路径」落成一份 JSON 随包携带
+          —— 这类映射往往只存在于**源机器**的运行态里（如 IDE 的「已打开文件夹」
+          记录），跨机还原后若没有它，就只能给用户一个工具默认落点，连提示
+          「这条会话原本属于哪个工程」都做不到。
+        - **额外元信息**：合并进 manifest 的 ``extra`` 字段，供备份详情区展示
+          （如「本包记录了 N 条会话的原始工作区路径，其中 M 条已确定」）。
+
+        必须**尽力而为**：任何异常都不应让备份失败，探测不到就返回 ``(None, None)``
+        或只返回能拿到的那部分。
+        """
+        return None, None
 
     def restore_post_hook(self) -> "Callable[[str, list[str]], None] | None":
         """

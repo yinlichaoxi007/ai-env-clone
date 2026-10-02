@@ -108,13 +108,26 @@ class TestBuildItems(unittest.TestCase):
         )
 
     def test_recommended_defaults(self) -> None:
+        """默认勾选＝「不可重建 + 还原后立刻能开工」；仅扩展保持不勾。"""
         items = {it.key: it for it in self._items()}
         self.assertTrue(items["global_memory"].recommended)
         self.assertTrue(items["projects"].recommended)
-        self.assertFalse(items["global_config"].recommended)
+        # 设置 / 自定义技能 / 全局 Hook 配置（用户 2026-10-01 定策改为默认勾选）
+        self.assertTrue(items["global_config"].recommended)
+        self.assertTrue(items["skills"].recommended)
+        self.assertTrue(items["global_settings"].recommended)
+        # 扩展仍默认不勾（重新下载成本低）
         self.assertFalse(items["plugins"].recommended)
-        self.assertFalse(items["skills"].recommended)
-        self.assertFalse(items["global_settings"].recommended)
+
+    def test_secret_bearing_items_are_marked_sensitive(self) -> None:
+        """config.toml（含 MCP env 段）与 settings.json 默认勾选 ⇒ 必须标敏感 + 脱敏。"""
+        items = {it.key: it for it in self._items()}
+        self.assertTrue(items["global_config"].sensitive)
+        self.assertTrue(items["global_settings"].sensitive)
+        adapter = rx_mod.ReasonixAdapter()
+        paths = list(adapter.export_transform_paths() or [])
+        self.assertIn("config.toml", paths)
+        self.assertIn("settings.json", paths)
 
     def test_exists_when_present(self) -> None:
         for it in self._items():

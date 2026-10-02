@@ -41,9 +41,11 @@ Reasonix 适配器（自包含，不依赖任何遗留兼容层）。
 path 均在 ``~`` 之下（含 ``AppData/Roaming`` 与 ``AppData/Local``），归档按相对路径
 落回原位，恢复干净。这与 CodeBuddy 适配器「公共根=用户主目录」策略一致。
 
-备份哲学（统一标准）：默认勾选无法从零重复创建的——会话、记忆；默认不勾可从零重复
-创建的——扩展（plugins/）、自定义技能/子智能体（skills/）、设置（config.toml、settings.json）；
-程序自身的本地缓存、运行态、日志不列入备份选项。新增其它工具时，仿照本文件新建
+备份哲学（统一标准，用户 2026-10-01 定策后更新）：默认勾选「无法从零重复创建、或缺失后
+需重新逐项配置」的两类——① 会话、记忆；② 设置（config.toml）、自定义技能/子智能体
+（skills/）、全局 Hook 配置（settings.json）。默认不勾**重新获取成本低**的——扩展（plugins/）；
+程序自身的本地缓存、运行态、日志不列入备份选项。含凭证的条目（config.toml / settings.json）
+导出时一律脱敏。新增其它工具时，仿照本文件新建
 ``ai_env_clone/adapters/<tool>.py``，用 ``@register`` 装饰类，无需改动任何入口代码。
 """
 
@@ -53,6 +55,7 @@ import os
 import sys
 
 from ..core import BackupItem
+from ..redact import redact_config_bytes
 from .base import BaseAdapter, register
 
 
@@ -133,15 +136,21 @@ def build_items(
         )
     )
 
-    # 3) 全局配置（config.toml）。属「设置」类，可从零重复创建，默认不勾。
+    # 3) 全局配置（config.toml）。属「设置」类 ⇒ 默认勾选（还原后立刻能开工）。
+    #    ⚠️ 它同时含 MCP 服务器 ``[[plugins]]`` 段（内联表里常有 ``env = { API_KEY = … }``），
+    #    故标记 sensitive 并在导出时脱敏（见 export_transform_paths / export_transform），
+    #    否则「默认勾选」会把明文密钥打进默认备份包。
     items.append(
         BackupItem(
             key="global_config",
             label="全局配置（config.toml）",
             path=os.path.join(roam, "config.toml"),
             uid=None,
-            description="Reasonix 全局配置（config.toml）。可从零重新创建，默认不勾。",
-            recommended=False,
+            description="Reasonix 全局配置（config.toml，含 MCP 服务器定义与内置技能停用状态）。"
+                        "默认勾选，还原后无需重新配置；其中可能含 apiKey，"
+                        "备份时已脱敏（替换为占位符），恢复后需在目标机手动补填。",
+            recommended=True,
+            sensitive=True,
         )
     )
 
@@ -160,7 +169,7 @@ def build_items(
     # 5) 自定义技能与子智能体（skills/）。实测：用户添加的自定义技能/子智能体
     #    （如 test-sub-agent）以 skill 形式存放在 Roaming/reasonix/skills/<name>/SKILL.md。
     #    内置 explore 等技能停用状态记录在 config.toml（见 global_config 项），不在本目录。
-    #    技能属「可重建」内容，默认不勾。
+    #    属「还原后立刻能开工」类 ⇒ 默认勾选（用户 2026-10-01 定策）。
     items.append(
         BackupItem(
             key="skills",
@@ -168,13 +177,14 @@ def build_items(
             path=os.path.join(roam, "skills"),
             uid=None,
             description="Reasonix 自定义技能/子智能体目录（skills/，如 test-sub-agent）。"
-                        "可重建，默认不勾。",
-            recommended=False,
+                        "默认勾选，避免还原后再逐个重建。",
+            recommended=True,
         )
     )
 
     # 6) 全局 Hook 配置（settings.json）。用户明确：全局 hook 配置存放于
-    #    Roaming/reasonix/settings.json，列入备份、默认不勾；项目级 hook 在项目文件夹内，不列入。
+    #    Roaming/reasonix/settings.json，列入备份、属「设置」类 ⇒ 默认勾选；
+    #    项目级 hook 在项目文件夹内，不列入。
     #    注：本机实测该文件可能尚未落盘（未配置 hook 时不存在），届时该项标「（未找到）」，
     #    待用户实际配置 hook 后生成即生效。
     items.append(
@@ -183,8 +193,9 @@ def build_items(
             label="全局 Hook 配置（settings.json）",
             path=os.path.join(roam, "settings.json"),
             uid=None,
-            description="Reasonix 全局 Hook 配置（settings.json）。默认不勾。",
-            recommended=False,
+            description="Reasonix 全局 Hook 配置（settings.json）。默认勾选，还原后无需重配。",
+            recommended=True,
+            sensitive=True,
         )
     )
 
@@ -262,3 +273,24 @@ class ReasonixAdapter(BaseAdapter):
         ``current_uid`` 为兼容性参数（Reasonix 记忆为单用户扁平结构，无 UID 拆分），忽略。
         """
         return build_items(root_dir, _roaming_root(), _local_root())
+
+    # ------------------------------------------------------------------ #
+    # 导出脱敏：config.toml / settings.json 可能含明文凭证，入库前替换为占位符
+    # ------------------------------------------------------------------ #
+    def export_transform_paths(self) -> "Sequence[str] | None":
+        """需要导出脱敏的归档内相对路径后缀。
+
+        - ``config.toml``：同时含 MCP 服务器 ``[[plugins]]`` 段，内联表里常见
+          ``env = { API_KEY = "…" }`` 这类明文凭证；
+        - ``settings.json``：全局 Hook 配置，hook 命令里可能带令牌。
+        两者自 2026-10-01 起**默认勾选** ⇒ 若不脱敏，等于默认备份就把明文打进包。
+        """
+        return ["config.toml", "settings.json"]
+
+    def export_transform(self) -> "Callable[[str, bytes], bytes] | None":
+        """返回脱敏回调（见 :mod:`ai_env_clone.redact`）。
+
+        只改写「键名像凭证」的值，TOML/JSON 结构、注释与格式原样保留 ——
+        恢复后文件仍在、配置项仍在，仅凭证需在目标机手动补填。
+        """
+        return lambda _rel, source: redact_config_bytes(source)

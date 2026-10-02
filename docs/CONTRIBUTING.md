@@ -13,9 +13,18 @@
 ```
 ai_env_clone/
 ├── core.py            # 通用逻辑：扫描/打包/校验/恢复/SQLite快照/ZipSlip防护
+├── session_migration.py # 跨软件会话解析 / 原生格式写出（导入能力底座）
+├── import_matrix.py   # 「导入到本工具 ← 来源软件 + 实测版本 + 数据范围 + 状态」声明表
 └── adapters/
     ├── base.py        # BaseAdapter 抽象接口 + 注册表
-    └── qoder.py       # Qoder 适配器（参考实现）
+    ├── qoder.py       # Qoder 适配器（参考实现）
+    ├── codebuddy.py   # CodeBuddy
+    ├── reasonix.py    # Reasonix
+    ├── dsh.py         # DeepSeek Harness
+    ├── workbuddy.py   # WorkBuddy
+    ├── trae_cn.py     # TraeCode CN（安装目录 Trae CN）
+    ├── trae_solo_cn.py# TraeWork CN（安装目录 TRAE SOLO CN）
+    └── zcode.py       # ZCode（智谱）
 ```
 
 核心层（`core.py`）与"具体工具"完全解耦，它只认通用的 `BackupItem`：
@@ -112,7 +121,53 @@ python -m unittest tests.test_qoder -v
 
 ---
 
-## 6. PR 规范
+## 6. 声明「跨软件导入」能力（可选）
+
+若你的工具会话是**明文可解析**的（JSONL / JSON / 普通 SQLite），除了整库备份外还可以
+参与「跨软件会话导入」。这需要两处改动：
+
+1. **作为来源**：在 `ai_env_clone/session_migration.py` 的 `SessionParser` 中加一个
+   `parse_<tool>()`，把该工具的原生会话读成统一的 `Session` / `SessionMessage`；
+   并在 `default_source_root()` / `list_source_sessions()` 中登记其会话根与扫描规则。
+2. **作为目标**：同文件 `SessionWriter` 中加一个 `write_<tool>()`，以目标工具的**原生**
+   格式写出。若目标界面靠索引读取（而非目录遍历），必须同时登记其索引
+   （如 WorkBuddy 的 `workbuddy.db`、DSH 的 `workspace.json` / `session_projcache.json`），
+   否则「文件在了但界面看不到」。
+
+随后在 `ai_env_clone/import_matrix.py` 中为该工具补一条能力声明——**这是 GUI
+「数据导入」区的唯一数据源**，界面不硬编码任何来源清单：
+
+```python
+# 目标工具 ← 可导入来源（附实测版本、数据范围、状态、注意事项）
+cap = TargetCapability(
+    target="mytool",
+    sources=[
+        _src("reasonix", scope=("历史会话",), status=SUPPORTED, note="明文 JSONL，无损"),
+        _src("traecn",  status=BACKUP_ONLY, note="会话主库加密，仅整库备份/还原"),
+    ],
+)
+```
+
+- **状态取值**：`SUPPORTED`（支持导入）/ `BACKUP_ONLY`（仅备份还原）/ `PLANNED`（待支持），
+  配色见 `STATUS_COLORS`。
+- **刻意不写来源**：会话正文取不出的工具（Qoder 旧版 `local.db` 的会话正文列、
+  TraeCode CN / TraeWork CN 的 `ModularData/ai-agent/database.db`）只能标 `BACKUP_ONLY`，
+  不要尝试解析。
+- **落点要求要写进 `note`**：例如「需项目路径同源，否则可能不被索引」「需 zstd 后端」。
+
+自检：
+
+```bash
+python -c "from ai_env_clone import import_matrix as im; print(im.format_lines('mytool'))"
+python -m unittest tests.test_import_matrix tests.test_session_migration_formats -v
+```
+
+> 反向导出（本工具 → 其它工具）若写出格式未实测确认，**宁可不做**：写坏对方数据库的
+> 代价远高于「暂不支持」。ZCode 即因此只作为来源、不作为导入目标。
+
+---
+
+## 7. PR 规范
 
 - 一个工具一个适配器文件，命名 `ai_env_clone/adapters/<tool>.py`。
 - 提交信息说明工具名称与支持范围（记忆 / 历史 / 配置 / 索引等）。
@@ -121,7 +176,7 @@ python -m unittest tests.test_qoder -v
 
 ---
 
-## 7. 发布流程（维护者参考，普通贡献者无需关心）
+## 8. 发布流程（维护者参考，普通贡献者无需关心）
 
 版本发布由 GitHub Actions 自动完成，**无需手动在网页上传编译产物**。规则如下：
 
@@ -189,9 +244,18 @@ Adding a new tool only requires adding one adapter module — **no changes to th
 ```
 ai_env_clone/
 ├── core.py            # Common logic: scan / pack / verify / restore / SQLite snapshot / Zip Slip guard
+├── session_migration.py # Cross-tool session parsing / native-format writing (import foundation)
+├── import_matrix.py   # "import into this tool ← source tools + tested versions + scope + status" table
 └── adapters/
     ├── base.py        # BaseAdapter abstract interface + registry
-    └── qoder.py       # Qoder adapter (reference implementation)
+    ├── qoder.py       # Qoder adapter (reference implementation)
+    ├── codebuddy.py   # CodeBuddy
+    ├── reasonix.py    # Reasonix
+    ├── dsh.py         # DeepSeek Harness
+    ├── workbuddy.py   # WorkBuddy
+    ├── trae_cn.py     # TraeCode CN (install dir: Trae CN)
+    ├── trae_solo_cn.py# TraeWork CN (install dir: TRAE SOLO CN)
+    └── zcode.py       # ZCode (Zhipu)
 ```
 
 The core layer (`core.py`) is fully decoupled from any specific tool; it only knows the generic `BackupItem`:
@@ -282,7 +346,42 @@ After adding an adapter, please add corresponding `build_items` unit assertions 
 
 ---
 
-## 6. PR Guidelines
+## 6. Declaring Cross-tool Import Capability (optional)
+
+If your tool stores sessions in a **plaintext, parseable** form (JSONL / JSON / plain SQLite), it can take part in cross-tool session import in addition to whole-archive backup. Two changes are needed:
+
+1. **As a source**: add a `parse_<tool>()` to `SessionParser` in `ai_env_clone/session_migration.py` that reads the tool's native sessions into the shared `Session` / `SessionMessage` model; register its session root and scan rule in `default_source_root()` / `list_source_sessions()`.
+2. **As a target**: add a `write_<tool>()` to `SessionWriter` in the same file that writes the **native** format. If the target UI reads from an index rather than by directory traversal, you must also register the session in that index (e.g. WorkBuddy's `workbuddy.db`, DSH's `workspace.json` / `session_projcache.json`) — otherwise "the file is there but the UI shows nothing".
+
+Then declare one capability entry for the tool in `ai_env_clone/import_matrix.py` — **the sole data source for the GUI's "Data import" area**; the UI hardcodes no source list:
+
+```python
+# target tool ← importable sources (with tested versions, scope, status, notes)
+cap = TargetCapability(
+    target="mytool",
+    sources=[
+        _src("reasonix", scope=("chat history",), status=SUPPORTED, note="plaintext JSONL, lossless"),
+        _src("traecn",  status=BACKUP_ONLY, note="session DB encrypted; whole-archive backup/restore only"),
+    ],
+)
+```
+
+- **Status values**: `SUPPORTED` / `BACKUP_ONLY` / `PLANNED`; colors live in `STATUS_COLORS`.
+- **Deliberately omitted sources**: tools whose main DB is **product-side encrypted** (Qoder `main.sqlite`, TraeCode CN / TraeWork CN `ModularData/ai-agent/database.db`) may only be marked `BACKUP_ONLY` — do not attempt to parse them.
+- **Put landing requirements in `note`**: e.g. "project path must match or the session may not be indexed", "needs a zstd backend".
+
+Self-check:
+
+```bash
+python -c "from ai_env_clone import import_matrix as im; print(im.format_lines('mytool'))"
+python -m unittest tests.test_import_matrix tests.test_session_migration_formats -v
+```
+
+> If the write format for reverse export (this tool → another tool) has not been verified in practice, **it is better not to implement it**: corrupting the other tool's database costs far more than "not supported yet". This is exactly why ZCode is a source only and never an import target.
+
+---
+
+## 7. PR Guidelines
 
 - One tool per adapter file, named `ai_env_clone/adapters/<tool>.py`.
 - Commit messages should state the tool name and supported scope (memory / history / config / index, etc.).
@@ -291,7 +390,7 @@ After adding an adapter, please add corresponding `build_items` unit assertions 
 
 ---
 
-## 7. Release Process (Maintainer Reference — not needed by regular contributors)
+## 8. Release Process (Maintainer Reference — not needed by regular contributors)
 
 Releases are automated by GitHub Actions — **no manual upload of build artifacts on the web**. Rules:
 

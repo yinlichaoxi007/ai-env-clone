@@ -19,7 +19,23 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from ai_env_clone import __main__ as gui  # noqa: E402
 from ai_env_clone.__main__ import QoderBackupApp  # noqa: E402
+
+#: 整个模块期间打开 HEADLESS：自定义报告弹窗会 grab_set()+wait_window() 阻塞等用户
+#: 点击，无头测试里必须让其退化为被 mock 的 messagebox，否则测试永久挂起。
+_ORIG_HEADLESS = None
+
+
+def setUpModule() -> None:
+    global _ORIG_HEADLESS
+    _ORIG_HEADLESS = gui.HEADLESS
+    gui.HEADLESS = True
+
+
+def tearDownModule() -> None:
+    if _ORIG_HEADLESS is not None:
+        gui.HEADLESS = _ORIG_HEADLESS
 
 
 def _make_app(tool: str):
