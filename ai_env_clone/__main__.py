@@ -2616,9 +2616,10 @@ class QoderBackupApp:
                 if locate_sensitive:
                     base_msg += "\n\n已自动打开相关文件并定位到敏感字段，请手动记录后关闭。"
             # 配套条目提醒：勾了某条目、但它「成对存在」的配套条目没勾时明示一次。
-            # 典型是 DSH：settings.yaml 只存密钥**引用**（apiKeyEnv），真密钥在同目录
-            # .credentials.yaml（默认不勾）⇒ 不提醒的话，用户还原后模型直接用不了，
-            # 且完全看不出原因。提示落在「刚拿到包」这一刻，用户才好决定是否单独备份。
+            # 典型是 DSH：实时配置 cordis.patch.yml 只存密钥**引用**（apiKeyEnv），
+            # 真密钥在 .credentials.yaml（默认不勾）⇒ 不提醒的话，用户还原后模型
+            # 直接用不了，且完全看不出原因。提示落在「刚拿到包」这一刻，用户才好
+            # 决定是否单独备份。
             companion = companion_notes(sel_items)
             if companion:
                 base_msg += "\n\n提示：\n" + "\n\n".join(companion)

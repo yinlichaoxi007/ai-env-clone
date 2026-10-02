@@ -72,6 +72,13 @@ class TestBuildItems(unittest.TestCase):
         os.makedirs(storages_dir, exist_ok=True)
         with open(os.path.join(storages_dir, "workspace.json"), "w", encoding="utf-8") as f:
             f.write('{"unit": {"name": "workspace", "version": 2}}')
+        # 会话投影缓存：现行 **per-record 目录树**布局（一条记录一份文件）。
+        sp_dir = os.path.join(storages_dir, "session_projcache", "sessions")
+        os.makedirs(sp_dir, exist_ok=True)
+        with open(os.path.join(sp_dir, "session-abc12345.json"), "w", encoding="utf-8") as f:
+            f.write('{"version": 7, "record": {"identity": {"cwd": "D:\\\\project\\\\test"}}}')
+        # 旧 single 布局的单文件：storage-json 迁移时「保持源文件不变」，故它仍在盘上。
+        # 夹具保留它，是为了让「条目必须指向目录树、不得指向这个死文件」的断言有意义。
         with open(os.path.join(storages_dir, "session_projcache.json"), "w", encoding="utf-8") as f:
             f.write('{"unit": {"name": "session_projcache", "version": 3}}')
 
@@ -79,16 +86,22 @@ class TestBuildItems(unittest.TestCase):
         with open(os.path.join(self.dsh_dir, "AGENTS.md"), "w", encoding="utf-8") as f:
             f.write("# 测试用户全局指令")
 
-        # settings.yaml
-        with open(os.path.join(self.dsh_dir, "settings.yaml"), "w", encoding="utf-8") as f:
-            f.write("locale:\n  preference: zh\n")
+        # profiles/<profile>/cordis.patch.yml —— 实时配置的落点
+        # （2026-10-02 起替代已废弃的 ``settings.yaml``，后者不再生成条目）
+        prof_dir = os.path.join(self.dsh_dir, "profiles", "desktop")
+        os.makedirs(prof_dir, exist_ok=True)
+        with open(os.path.join(prof_dir, "cordis.patch.yml"), "w", encoding="utf-8") as f:
+            f.write("- id: ui-settings-general\n  config:\n    locale: zh\n")
+
+        # 依赖树目录：**不是** profile，枚举时必须跳过（否则会多出一条假条目）
+        pkg_dir = os.path.join(self.dsh_dir, "profiles", "node_modules", "some-pkg")
+        os.makedirs(pkg_dir, exist_ok=True)
+        with open(os.path.join(pkg_dir, "package.json"), "w", encoding="utf-8") as f:
+            f.write('{"name": "some-pkg", "version": "1.0.0"}\n')
 
         # .credentials.yaml
         with open(os.path.join(self.dsh_dir, ".credentials.yaml"), "w", encoding="utf-8") as f:
             f.write("api_key: test\n")
-
-        # profiles/
-        os.makedirs(os.path.join(self.dsh_dir, "profiles", "web"), exist_ok=True)
 
     def _items(self):
         return dsh_mod.build_items(self.tmp, self.dsh_dir)
@@ -104,71 +117,180 @@ class TestBuildItems(unittest.TestCase):
         keys = {it.key for it in self._items()}
         expected_keys = {
             "sessions",
-            "storages:workspace",
-            "storages:session_projcache",
+            "storages_workspace",
+            "storages_session_projcache",
             "user_agents",
-            "settings",
+            "profiles_patch:desktop",
             "credentials",
             "profiles",
         }
         self.assertEqual(keys, expected_keys)
 
+    def test_deprecated_settings_yaml_is_not_an_item(self) -> None:
+        """已废弃的 ``settings.yaml`` **不得**再作为备份条目出现。
+
+        新版 DSH 已移除该文件（源码 ``SettingsForms.importLegacyDocument()`` 里
+        ``if (!existsSync(path)) return`` 是唯一读写点，全仓无写入路径）⇒ 按
+        「当前支持备份的版本中不存在的条目不列为备份选项」的规则移除。
+        这里同时防运行期回归：夹具里连 ``settings.yaml`` 都没建，
+        若哪天有人把条目加回来，本用例会失败。
+        """
+        keys = {it.key for it in self._items()}
+        self.assertNotIn("settings", keys)
+        for it in self._items():
+            self.assertFalse(
+                it.path.endswith("settings.yaml"),
+                "条目 %s 指向了已废弃的 settings.yaml: %s" % (it.key, it.path),
+            )
+
+    def test_projcache_points_at_per_record_tree_not_the_dead_single_file(self) -> None:
+        """投影缓存条目必须指向**现行 per-record 目录树**，不得指向旧的 single 单文件。
+
+        背景：``storages/session_projcache.json`` 是该单元旧的 single 布局文档。
+        storage-json 后端把它迁成 per-record 目录树时「保持源文件不变」⇒ 那个文件会
+        一直留在盘上却不再被写入（本机实测 mtime 冻结在升级那一刻）。若条目仍指向它，
+        备份会「成功但还原出来是空的」，且界面显示「已找到」完全看不出来。
+        夹具里两种形态并存，正是为了让本断言有意义。
+        """
+        items = {it.key: it for it in self._items()}
+        path = items["storages_session_projcache"].path
+        self.assertTrue(
+            os.path.isdir(path),
+            "投影缓存条目应指向目录树，实际指向: %s" % path,
+        )
+        self.assertFalse(
+            path.endswith("session_projcache.json"),
+            "不得指向旧的 single 布局单文件: %s" % path,
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(path, "sessions")),
+            "per-record 布局的记录都在 sessions/ 子目录下: %s" % path,
+        )
+
+    def test_storages_items_do_not_collapse_into_one_gui_row(self) -> None:
+        """两个 storages 单元必须是**两行**，不能被 GUI 聚合成一行。
+
+        回归背景：GUI 按 ``key.split(":", 1)[0]`` 聚合成一行，且该行的默认勾选态取
+        **组内首项**的 ``recommended``。若两个 key 共用 `storages:` 前缀，则
+        「工作区索引默认勾、投影缓存默认不勾」会被合成一个勾选框——首项的 true 胜出，
+        缓存照样被默认带上，且一行代表两种推荐态（自相矛盾）。同 Trae `ui_misc_*` 的处理。
+        本断言不导入 GUI 模块（托管 Python 无 tkinter 也能跑）。
+        """
+        items = self._items()
+        prefixes = {it.key.split(":", 1)[0] for it in items
+                    if it.key.split(":", 1)[0].startswith("storages")}
+        self.assertEqual(
+            sorted(prefixes), ["storages_session_projcache", "storages_workspace"],
+            "两个 storages 条目聚合成了同一前缀（界面只会渲染一行）",
+        )
+        # 二者的默认态必须不同，才能证明「拆开」是有意义的
+        rec = {it.key: it.recommended for it in items
+               if it.key.startswith("storages")}
+        self.assertNotEqual(rec["storages_workspace"],
+                            rec["storages_session_projcache"])
+
+    def test_node_modules_is_not_treated_as_profile(self) -> None:
+        """``profiles/node_modules`` 是依赖树，不是 profile，不得生成条目。"""
+        keys = {it.key for it in self._items()}
+        self.assertNotIn("profiles_patch:node_modules", keys)
+        self.assertEqual(
+            [k for k in keys if k.startswith("profiles_patch:")],
+            ["profiles_patch:desktop"],
+        )
+
     def test_recommended_defaults(self) -> None:
         items = {it.key: it for it in self._items()}
         # 核心数据默认勾选
         self.assertTrue(items["sessions"].recommended)
-        self.assertTrue(items["storages:workspace"].recommended)
-        self.assertTrue(items["storages:session_projcache"].recommended)
+        self.assertTrue(items["storages_workspace"].recommended)
         self.assertTrue(items["user_agents"].recommended)
-        # 设置默认勾选（用户 2026-10-01 定策：还原后立刻能开工）。
-        # ★ 但**不标 sensitive**：本机实测 settings.yaml 只存 provider 的密钥**引用**
-        #   （``apiKeyEnv: SENSENOVA_API_KEY``），真密钥在同目录 .credentials.yaml。
-        #   标了会让「备份后定位敏感文件」把用户带去 settings.yaml 找一个不存在的明文密钥。
-        self.assertTrue(items["settings"].recommended)
-        self.assertFalse(items["settings"].sensitive)
+        # 「会话投影缓存」是**可从会话日志重建**的缓存（官方 README：「日志领先，缓存跟随」）
+        # ⇒ 默认不勾（与 code_index / plugins 同类口径）。
+        self.assertFalse(items["storages_session_projcache"].recommended)
+        # 实时配置默认勾选（承接原 settings 条目「还原后立刻能开工」的定位），
+        # ★ 但**不标 sensitive**：实测 cordis.patch.yml 只存 provider 的密钥**引用**
+        #   （``apiKeyEnv: SENSENOVA_API_KEY``），真密钥在 .credentials.yaml。
+        #   标了会让「备份后定位敏感文件」把用户带去该文件找一个不存在的明文密钥。
+        self.assertTrue(items["profiles_patch:desktop"].recommended)
+        self.assertFalse(items["profiles_patch:desktop"].sensitive)
         # 但必须带「配套条目」提醒：未勾 .credentials.yaml 时提示用户单独备份
-        comp = items["settings"].companion
+        comp = items["profiles_patch:desktop"].companion
         self.assertIsNotNone(comp)
         self.assertEqual(comp[0], "credentials")
         # 凭证 / 配置文件仍默认不勾
         self.assertFalse(items["credentials"].recommended)
         self.assertFalse(items["profiles"].recommended)
 
-    def test_credentials_is_companion_of_settings(self) -> None:
-        """``.credentials.yaml`` 是 ``settings.yaml`` 的配套文件，声明必须落在它身上。"""
+    def test_credentials_is_companion_of_live_config(self) -> None:
+        """``.credentials.yaml`` 是实时配置的配套文件，声明必须落在它身上。"""
         from ai_env_clone.core import companion_notes
 
         items = self._items()
         creds = next(it for it in items if it.key == "credentials")
-        self.assertIsNone(creds.companion, "配套声明应写在触发方（settings）上")
+        self.assertIsNone(creds.companion, "配套声明应写在触发方（profiles_patch:*）上")
 
-        # 只勾 settings（默认情形）→ 必须提醒
-        only_settings = [it for it in items if it.key in ("settings", "sessions")]
-        notes = companion_notes(only_settings)
+        # 只勾实时配置（默认情形）→ 必须提醒
+        only_patch = [it for it in items if it.key in ("profiles_patch:desktop", "sessions")]
+        notes = companion_notes(only_patch)
         self.assertEqual(len(notes), 1)
         self.assertIn("credentials", notes[0])
         self.assertIn("单独备份", notes[0])
 
-        # settings + credentials 都勾 → 不再提醒
-        both = [it for it in items if it.key in ("settings", "credentials")]
+        # 实时配置 + credentials 都勾 → 不再提醒
+        both = [it for it in items if it.key in ("profiles_patch:desktop", "credentials")]
         self.assertEqual(companion_notes(both), [])
 
     def test_exists_when_present(self) -> None:
         for it in self._items():
             self.assertTrue(it.exists, "条目 %s 应存在: %s" % (it.key, it.path))
 
+    def test_patch_and_profiles_items_do_not_double_count(self) -> None:
+        """``profiles_patch:*`` 与 ``profiles/`` 两条目并存时，实时配置只进包一次。
+
+        两者路径重叠（一个是文件、一个是它的父目录），但归档按**相对路径去重**
+        （``core.scan_items`` 的 ``seen``）⇒ 既不重复计数，也不影响「单勾实时配置」
+        时的正确性。这条断言守住适配器注释里的那句「并存不冲突」。
+        """
+        from ai_env_clone import core
+
+        items = self._items()
+        rel_patch = ".dsh/profiles/desktop/cordis.patch.yml"
+
+        # 只勾实时配置 → 文件在包里，依赖树不在
+        only_patch = [it for it in items if it.key == "profiles_patch:desktop"]
+        scan = core.scan_items(only_patch, self.tmp, max_file_mb=None)
+        arcs = [rel for _, rel in scan.files]
+        self.assertEqual(arcs, [rel_patch])
+
+        # 两个都勾 → 该文件仍只出现一次（去重），依赖树额外进来
+        both = [it for it in items if it.key in ("profiles_patch:desktop", "profiles")]
+        scan2 = core.scan_items(both, self.tmp, max_file_mb=None)
+        arcs2 = [rel for _, rel in scan2.files]
+        self.assertEqual(
+            arcs2.count(rel_patch), 1,
+            "实时配置在「两个条目都勾」时被重复计数: %s" % arcs2,
+        )
+        self.assertIn(".dsh/profiles/node_modules/some-pkg/package.json", arcs2,
+                      "勾了 profiles/ 应连带依赖树（便于验证两者确为不同范围）")
+
     def test_missing_root_still_lists_all(self) -> None:
-        """即使 DSH 目录不存在，也应列出全部 7 项（供 GUI 显示未找到）。"""
+        """即使 DSH 目录不存在，也应列出固定路径的全部 6 项（供 GUI 显示未找到）。
+
+        注意：``profiles_patch:*`` 是**按磁盘枚举**出来的（profile 名由启动方决定，
+        无单一默认名），磁盘上一个 profile 都没有时自然没有该条目 —— 这不是
+        「漏项」，而是无可备份内容；固定路径的条目则一律保留以显示「未找到」。
+        """
         items = dsh_mod.build_items(self.tmp, os.path.join(self.tmp, "nope_dsh"))
-        self.assertEqual(len(items), 7)
+        self.assertEqual(len(items), 6)
         self.assertTrue(all(not it.exists for it in items))
+        self.assertFalse([it for it in items if it.key.startswith("profiles_patch:")])
 
     def test_empty_sessions_dir(self) -> None:
-        """sessions 目录为空时仍列出全部条目，仅会话项标记为不存在。"""
+        """sessions 目录为空时仍列出全部固定条目，仅会话项标记为不存在。"""
         empty_dsh = os.path.join(self.tmp, "empty_dsh")
         os.makedirs(empty_dsh, exist_ok=True)
         items = dsh_mod.build_items(self.tmp, empty_dsh)
-        self.assertEqual(len(items), 7)
+        self.assertEqual(len(items), 6)
         sessions_item = next(it for it in items if it.key == "sessions")
         self.assertFalse(sessions_item.exists)
 

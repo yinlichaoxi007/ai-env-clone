@@ -48,8 +48,9 @@ DeepSeek Harness（DSH，Zstandard 压缩 JSONL）
     首行 ``{"type":"session","version":3,"id":"session-<uuid>","createdAt","cwd",…}``；
     事件行 ``{"type":"<事件>","seq","time","data":{…}}``，关键事件
     ``user/message``、``assistant/message``、``session/title``。
-    会话登记：``storages/workspace.json``（工作区 → sessionIds）与
-    ``storages/session_projcache.json``（会话 → identity/title）。
+    会话登记：``storages/workspace.json``（工作区 → sessionIds）；会话标题另存于
+    ``storages/session_projcache*``（旧 ``session_projcache.json`` 单文件 / 现行
+    ``session_projcache/sessions/<id>.json`` 目录树，读的时候两种都要试）。
     读 / 写均依赖 zstd 后端（``zstandard`` / ``pyzstd`` / 系统 ``zstd`` 命令，
     探测逻辑复用 :func:`ai_env_clone.dsh_repair.zstd_backend`）；后端缺失时
     相关操作会明确报错而非静默失败。
@@ -484,7 +485,15 @@ def _register_dsh_session(dsh_home: str, sid: str, workspace_dir: str, cwd: str,
         warn("登记 DSH 工作区索引失败：%s（会话文件已写出）" % exc)
         return
 
-    # 会话统计缓存：尽力更新，失败不影响主流程（DSH 会自行重建）
+    # 会话投影缓存：尽力更新，失败不影响主流程（DSH 会自行重建）。
+    #
+    # ⚠️ 这里写的是该单元的**旧 ``single`` 布局**单文件。按 DSH ``storage-json`` 后端的
+    #    规则，只有当 per-record 目录树**尚不存在**时，这份整单元文档才会在下次打开时被
+    #    用来初始化目录树；若目录树已存在（升级过的机器都如此），本次写入**不生效**。
+    #    之所以只做「尽力而为」而不去手写目录树里的记录：那是**纯缓存**，官方文档明确
+    #    「日志领先，缓存跟随」，记录还须逐条通过 projection 的 stateSchema 校验，手搓一份
+    #    不完整的记录只会被当作不存在（无害但无用）。DSH 自己会从会话日志冷重折叠重建，
+    #    故这里保持不侵入。
     cache_file = os.path.join(storages, "session_projcache.json")
     try:
         cdata = _read_json(cache_file)
@@ -1570,14 +1579,36 @@ def _scan_zcode(root: str) -> list:
     return out
 
 
-def _scan_dsh(root: str) -> list:
-    """扫描 DSH ``<root>/sessions/<workspace_dir>/<session-…>/``。
+def _dsh_projcache_titles(root: str) -> dict:
+    """读取 DSH 会话投影缓存里的 ``会话 ID -> title``（避免解压会话日志）。
 
-    标题取 ``storages/session_projcache.json``（避免解压大文件）。
+    ⚠️ 该缓存有**两种磁盘布局**，都要读，否则升级过的机器上标题会全部落空：
+
+    - ``storages/session_projcache.json`` —— 旧的 ``single`` 布局（整单元一份文件）。
+    - ``storages/session_projcache/sessions/<id>.json`` —— 现行的 ``per-record`` 布局。
+
+    DSH 的 ``storage-json`` 后端把 ``single`` 迁成 ``per-record`` 时**保持源文件不变**，
+    因此旧文件会长期留在盘上**但不再更新**（实测 mtime 冻结在升级那一刻）。只读旧文件会
+    读到过期数据、只读目录树则在更老的机器上什么都读不到 ⇒ 两者都读，目录树优先。
     """
-    out = []
     titles: dict = {}
-    ws_paths: dict = {}   # workspace_dir 名 -> 工作区真实路径
+    tree_dir = os.path.join(root, "storages", "session_projcache", "sessions")
+    if os.path.isdir(tree_dir):
+        try:
+            for name in sorted(os.listdir(tree_dir)):
+                if not name.endswith(".json"):
+                    continue
+                sid = name[: -len(".json")]
+                try:
+                    doc = _read_json(os.path.join(tree_dir, name))
+                except (OSError, ValueError):
+                    continue
+                rows = ((doc or {}).get("record") or {}).get("rows") or {}
+                title = (rows.get("title") or {}).get("val")
+                if title:
+                    titles[sid] = title
+        except OSError:
+            pass
     cache = os.path.join(root, "storages", "session_projcache.json")
     if os.path.isfile(cache):
         try:
@@ -1585,11 +1616,26 @@ def _scan_dsh(root: str) -> list:
             tbl = (data.get("tables") or {}).get("sessions") or {}
             for sid, item in tbl.items():
                 try:
-                    titles[sid] = (item.get("rows") or {}).get("title", {}).get("val") or ""
+                    title = (item.get("rows") or {}).get("title", {}).get("val") or ""
                 except AttributeError:
-                    titles[sid] = ""
+                    title = ""
+                # 目录树里已有更新的值时不覆盖
+                if title and sid not in titles:
+                    titles[sid] = title
         except (OSError, ValueError, AttributeError):
             pass
+    return titles
+
+
+def _scan_dsh(root: str) -> list:
+    """扫描 DSH ``<root>/sessions/<workspace_dir>/<session-…>/``。
+
+    标题取会话投影缓存（``storages/session_projcache*``，两种布局都读；
+    见 :func:`_dsh_projcache_titles`），避免解压大文件。
+    """
+    out = []
+    titles = _dsh_projcache_titles(root)
+    ws_paths: dict = {}   # workspace_dir 名 -> 工作区真实路径
     ws_file = os.path.join(root, "storages", "workspace.json")
     if os.path.isfile(ws_file):
         try:

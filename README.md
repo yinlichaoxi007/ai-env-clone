@@ -23,21 +23,26 @@
 | 工具 | 形态 | 测试版本 | 状态 |
 | --- | --- | --- | --- |
 | Qoder CN（前 Lingma，JetBrains 插件） | 桌面 IDE 插件 | **3.3.3** | ✅ 已支持 |
-| Qoder CN IDE（独立桌面客户端） | 独立 IDE | **0.2.3 / 0.3.4** | ✅ 已支持 |
+| Qoder CN IDE（独立桌面客户端） | 独立 IDE | **0.4.3**（本机）/ **0.2.3 / 0.3.4**（另一台） | ✅ 已支持 |
 | Qoder CN（桌面端 CLI / Agent 运行时） | CLI / 桌面 Agent | CLI **1.1.47 / 1.1.57** | ✅ 已支持 |
 | CodeBuddy CN | 桌面 IDE | **1.106.1**（genie 版本 4.12.0） | ✅ 已支持 |
 | Reasonix | 桌面 IDE | **1.21.5** | ✅ 已支持 |
-| DeepSeek Harness（DSH） | CLI / Web 智能体框架 | **0.1.0-rc.7** | ✅ 已支持 |
+| DeepSeek Harness（DSH） | CLI / Web 智能体框架 | **0.2.0-rc.2** | ✅ 已支持 |
 | WorkBuddy | 桌面 AI 助手 | **5.6.2** | ✅ 已支持 |
 | TraeCode CN（安装目录 `Trae CN`） | 桌面 IDE | **3.3.99**（构建版本 2.3.82600） | ✅ 已支持 |
 | TraeWork CN（安装目录 `TRAE SOLO CN`） | 自主智能体形态 IDE | **0.1.69**（构建版本 2.3.87413） | ✅ 已支持 |
-| ZCode（智谱） | 桌面 IDE / CLI | **3.12.3** | ✅ 已支持 |
+| ZCode（智谱） | 桌面 IDE / CLI | **3.14.4** | ✅ 已支持 |
 | 其他国内可用工具 | — | — | 🚧 规划中，欢迎贡献适配器 |
 
 > ⚠️ **版本说明**：上表仅列出作者**实测通过**的版本，读取方式为各工具本地安装目录中自带的版本清单（如 `resources/app/product.json`、`resources/build-manifest.json`）与系统「应用和功能」里显示的版本，不依赖联网查询。其他更高/更低版本未经测试，数据结构可能变化，使用前请先在本机做一次「导出 → 校验」验证。
 > 部分工具同时存在「构建版本」与「应用版本」两个号（上表已并列标注）；不同形态（如桌面 IDE 与对应插件）可能共用同一套数据目录，本工具按各适配器探测到的数据根统一备份，无需用户区分具体产品形态。
+> **版本表会随实测更新，且必须与代码行为一致**：表中数字取自本机三处可复核的证据——① 安装目录的 `product.json`（Trae 家族的 `version` 是 VS Code 基线号、应用号在 `appVersion`，构建号在 `manifest.json`）、② Windows「应用和功能」注册表登记值、③ 工具自己写出的状态文件（如 Qoder CN 的 `~/.qoder-cn/.qoder-app-status.json`）。**改动适配器时若涉及某版本的数据布局，必须同步本表与下方策略段**，不要留下「文档说 A、代码按 B 做」的错位。
 > 其中 **Reasonix** 条目沿用此前实测记录（本机当前未安装该工具，适配器按官方数据布局实现）。
-> 其中 **Qoder CN** 的版本号为**跨机器**实测并列：`0.3.4` / CLI `1.1.57` 与 `0.2.3` / CLI `1.1.47` 分别采自两台不同电脑。**不同版本下同一数据根里的内容并不相同**——例如 `~/.qoder-cn` 根下的「新版产物族」（`projects/<key>/*.jsonl`、`plans/`、`tasks/`、`file-history/`、`canvas/`、`mcp.json`、`AppData/Roaming/QoderCN`）在一台机器上齐备、在另一台上可能一个都没有。这属正常现象，本工具一律**按存在性如实探测**（缺什么就显示「未找到」），不会因为某台机器缺少某目录而误判为数据丢失或探测失败；备份清单也只在目录存在时才勾选。
+> 其中 **Qoder CN** 的版本号为**跨机器**实测并列：桌面客户端 `0.4.3` 采自本机（另有旧残留登记项 `0.1.2`），`0.3.4` 与 `0.2.3` 采自另一台电脑；CLI 号（`1.1.57` / `1.1.47`）为两台机器的既有记录，本机未再复采。**不同版本下同一数据根里的内容并不相同**——例如 `~/.qoder-cn` 根下的「新版产物族」（`projects/<key>/*.jsonl`、`plans/`、`tasks/`、`file-history/`、`canvas/`、`mcp.json`、`AppData/Roaming/QoderCN`）在一台机器上齐备、在另一台上可能一个都没有。这属正常现象，本工具一律**按存在性如实探测**（缺什么就显示「未找到」），不会因为某台机器缺少某目录而误判为数据丢失或探测失败；备份清单也只在目录存在时才勾选。
+>
+> ⚠️ **DSH `0.2.0-rc.2` 起有一处数据布局变更，直接影响备份条目**：旧版的全局设置文件 `$DSH_HOME/settings.yaml` **已被移除**（改为把配置存进各 profile 的 `profiles/<profile>/cordis.patch.yml`；旧文件在首次启动时被一次性导入后改名为 `settings.yaml.imported`，**干净安装则根本不会生成它**）。因此本工具**不再把 `settings.yaml` 列为备份条目**，改为备份 `profiles/<profile>/cordis.patch.yml`；判定依据与源码位置见 [`docs/local/新增工具适配核查.md`](docs/local/新增工具适配核查.md)。
+>
+> ⚠️ **DSH 同一版本内还有一处「存储布局升级」，旧文件会留在盘上不删**：会话投影缓存从**单文件** `storages/session_projcache.json` 改为**一条记录一份文件**的目录树 `storages/session_projcache/sessions/<id>.json`。DSH 的 `storage-json` 后端在迁移时**保持源文件不变**，因此那台机器上会长期并存「一个不再更新的旧单文件 + 一棵在写的目录树」——只按文件名找文件会**备份到那个死文件**（大小非零、界面显示「已找到」，备份看起来完全成功，还原出来却是空的）。本工具已改为指向目录树，并把它列为**默认不勾**项：它是**可从会话日志重建的纯缓存**（官方文档：「日志领先，缓存跟随」）。若在其它工具的数据根里也见到「同名单文件 + 同名目录并存」，按同一思路先比 `mtime` 再决定指向谁。
 >
 > 📛 **产品名以「用户看到的」为准，不是安装目录名**：Trae 家族的两个安装目录分别叫 `Trae CN` 与 `TRAE SOLO CN`，但产品自身向用户展示的名字是 `TraeCode CN` 与 `TraeWork CN`（`product.json` 的 `win32NameVersion`，与系统「应用和功能」列表一致）。本工具统一展示后者；适配器内部标识（`trae-cn` / `trae-solo-cn`）保持不变，因此既有备份包与偏好缓存不受影响。
 
@@ -68,6 +73,20 @@
   2. **缺失后需要重新逐项配置、才能开始工作**的**设置类**：**设置、skill、灵感、自定义模型配置**——这类理论上能重建，但重建成本高，故一并默认勾选，让还原后**立刻能开工**。
 - ⬜ **默认不勾选（可选）**：**插件、扩展、MCP、索引、编排记录（任务/团队）**——重新下载或重新授权即可恢复，且往往体积大；默认不勾，按需自行勾选。
 - 🚫 **不列入备份选项**：**本地缓存、运行态记录、日志、凭证**——缓存/运行态/日志纯属程序自身的临时数据，与用户数据无关，不生成备份条目；**凭证**（登录态、机器绑定令牌）跨机本就要重新登录，带入无意义。
+
+**条目取舍的总规则（2026-10-02 定，适用于所有已支持的工具）：**
+
+1. **当前支持备份的版本中不存在的条目，不列为备份选项。** 典型是 DSH `0.2.0-rc.2` 起移除的 `settings.yaml`：它在**当前新版的任何机器上都不存在**（不是「某台机器缺」），故不生成条目。
+2. **仅当满足下列之一时，才列为条目，且一律默认不勾选**：
+   - **(a)** 明确「**旧版本迁移后仍然需要**」的——例如各工具的**迁移标记**必须与数据同进同出，否则产品会认为「已迁移」而跳过导入；
+   - **(b)** 「**把新版的备份还原到旧版产品、为保证数据正确必须依赖**」的。
+3. **默认勾选的门槛更高：必须同时满足「对当前支持的版本是必需的」且「能正确还原」。** 只满足一半就不算推荐项——例如「内容必需、但还原侧尚未实现合并、直接覆盖会破坏目标机已有数据」的条目，在还原逻辑补齐前不应默认勾选。
+
+> ⚠️ **必须区分两种「不存在」，处置完全相反**：
+> - **版本已移除**（产品新版不再产生、也不再读取该文件）⇒ 按规则 1 **删条目**；
+> - **本机未使用该功能 / 该工具未安装**（产品当前版本仍有该文件）⇒ **保留条目**，由界面按存在性显示「未找到」，既不报错也不推断数据丢失。
+>
+> 判定「属于哪一种」必须有**可复核的证据**（产品源码、官方设计记录、版本清单），**不能只看本机磁盘有没有**——否则会把「用户没启用」误判成「版本没了」，删掉本来有用的备份项。
 
 > 注：不同工具内部目录命名不同（如「设置」可能是 `argv.json` / `config.toml` / `settings.json`），但均按上述类别归入对应勾选状态。
 
@@ -194,7 +213,7 @@ python -m ai_env_clone --restore --in ./my-backup.zip
   2. 换电脑前，先在当前电脑**导出备份**；
   3. 到新电脑后，先**还原该备份**再开始使用；
   4. 切勿在两台电脑上交叉使用同一个工作区/会话后互相还原——覆盖会丢失其中一侧的增量，融合则可能产生冲突数据。
-  - harness 自身的设置（含自定义模型配置，如 DSH 的 `settings.yaml`）理论上可按 key 融合，但**没必要**：设置本就应随会话一起串行修改、随备份整体迁移，恢复时同样整体覆盖同名文件即可，避免跨机器设置漂移。
+  - harness 自身的设置（含自定义模型配置，如 DSH 的 `profiles/<profile>/cordis.patch.yml`）理论上可按 key 融合，但**没必要**：设置本就应随会话一起串行修改、随备份整体迁移，恢复时同样整体覆盖同名文件即可，避免跨机器设置漂移。
   - 若某台电脑上已经产生了新数据（还原目标里已有备份之外的会话/记忆），还原前请先手动导出该电脑的备份（或直接使用自动生成的回滚快照），确保新旧数据各有一份可回退的副本，再决定保留哪一侧。
 
 ### 跨软件会话导入
@@ -243,7 +262,7 @@ python -m ai_env_clone --restore --in ./my-backup.zip
 实现要点：
 
 - **不覆盖目标已有会话**：新会话一律使用全新生成的 id（WorkBuddy / CodeBuddy 为 UUID，DSH 为 `session-<uuid>`，Reasonix 为时间戳 id），天然避开碰撞。
-- **写「原生落点」而非只写文件**：部分工具界面按索引读取，只落文件是看不到的。因此 WorkBuddy 会同时把会话登记进 `workbuddy.db` 的 `sessions` 表（`insert or ignore`，绝不改写既有行）；DSH 会同时把会话登记进 `storages/workspace.json` 的工作区索引与 `storages/session_projcache.json` 的会话缓存。CodeBuddy / Reasonix 则遵循其「项目路径 / 工作区」派生规则，落点不一致会明确提示。
+- **写「原生落点」而非只写文件**：部分工具界面按索引读取，只落文件是看不到的。因此 WorkBuddy 会同时把会话登记进 `workbuddy.db` 的 `sessions` 表（`insert or ignore`，绝不改写既有行）；DSH 会同时把会话登记进 `storages/workspace.json` 的工作区索引（**界面列表靠的就是它**），并尽力在新的 `session_projcache*` 缓存里补一条标题记录（该缓存可由 DSH 自行从日志重建，且换布局后旧单文件的写入只在目录树尚不存在时生效，故属「尽力而为」）。CodeBuddy / Reasonix 则遵循其「项目路径 / 工作区」派生规则，落点不一致会明确提示。
 - **只读解析来源**：ZCode 的 `db.sqlite` 一律以 `mode=ro` 只读打开，绝不写入来源库。
 - **中文/长文本安全**：DSH 的会话文件是**多帧** Zstandard 流，本工具按多帧语义整体解压（早期实现只解首帧，会把 4MB 的会话误判为「无消息」，已修复）。
 - **DSH 需要 zstd 后端**：读 / 写 DSH 会话都依赖 `zstandard` / `pyzstd` 模块或系统 `zstd` 命令；缺失时导入会明确报错（而非静默产生坏数据）。
@@ -320,7 +339,7 @@ python -m ai_env_clone.dsh_repair repair-data <文件或目录> --apply --fix-du
 > - **环境变量引用**（`apiKey: "${MY_API_KEY}"` 形式）：**原样保留**——它本身不在配置文件里存明文，跨电脑只需保证目标机存在同名环境变量即可，无需改动配置。
 > - **引用型键名一律不脱敏**：`apiKeyEnv: MY_KEY_ENV`、`keyFile: …\keys\id_rsa` 这类键的值是**名称或路径**，本身不是密钥——抹掉它等于把配置改坏（还原后指向一个不存在的变量名，模型静默失效）。所以凡键名含 `Env` / `File` / `Path` / `Var` / `Dir` / `Name` 的，值原样保留。
 > - 勾选了含敏感凭证的备份项时，备份完成界面会**额外弹出安全提醒**，提示你需在源机器单独记下这些凭证、并在目标机手动补填，否则还原后对应功能虽可见却无法使用。
-> - **密钥存放在独立文件里的工具，会提醒你单独备份那个文件**：DSH 就是这种设计——`~/.dsh/settings.yaml` 里只写 `apiKeyEnv`（引用名），真密钥在同目录 `.credentials.yaml` 的 `refs` 段。该文件默认不勾（含明文，随包分享会外泄），因此只勾了 `settings.yaml` 而没勾它时，备份完成提示会明确告诉你「模型密钥在哪个文件、要不要单独备份」。
+> - **密钥存放在独立文件里的工具，会提醒你单独备份那个文件**：DSH 就是这种设计——`~/.dsh/profiles/<profile>/cordis.patch.yml` 里只写 `apiKeyEnv`（引用名），真密钥在 `~/.dsh/.credentials.yaml` 的 `refs` 段。该文件默认不勾（含明文，随包分享会外泄），因此只勾了实时配置而没勾它时，备份完成提示会明确告诉你「模型密钥在哪个文件、要不要单独备份」。
 
 需注意：本工具**不备份环境变量本身**（它存在于系统/Shell 配置中，不属任何工具数据目录），因此即便凭证用了环境变量引用，目标机若没有对应环境变量，仍需你手动在目标机配置一次。这是「安全（备份包不含凭证）」与「方便（跨电脑即取即用）」之间必要的权衡：凭证始终只存在于你掌控的环境里。
 
@@ -421,21 +440,26 @@ build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 /
 | Tool | Form | Tested version | Status |
 | --- | --- | --- | --- |
 | Qoder CN (formerly Lingma, JetBrains plugin) | Desktop IDE plugin | **3.3.3** | ✅ Supported |
-| Qoder CN IDE (standalone desktop client) | Standalone IDE | **0.2.3 / 0.3.4** | ✅ Supported |
+| Qoder CN IDE (standalone desktop client) | Standalone IDE | **0.4.3** (this machine) / **0.2.3 / 0.3.4** (other machine) | ✅ Supported |
 | Qoder CN (desktop CLI / agent runtime) | CLI / desktop agent | CLI **1.1.47 / 1.1.57** | ✅ Supported |
 | CodeBuddy CN | Desktop IDE | **1.106.1** (genie version 4.12.0) | ✅ Supported |
 | Reasonix | Desktop IDE | **1.21.5** | ✅ Supported |
-| DeepSeek Harness (DSH) | CLI / Web agent framework | **0.1.0-rc.7** | ✅ Supported |
+| DeepSeek Harness (DSH) | CLI / Web agent framework | **0.2.0-rc.2** | ✅ Supported |
 | WorkBuddy | Desktop AI assistant | **5.6.2** | ✅ Supported |
 | TraeCode CN (install dir `Trae CN`) | Desktop IDE | **3.3.99** (build 2.3.82600) | ✅ Supported |
 | TraeWork CN (install dir `TRAE SOLO CN`) | Autonomous-agent IDE | **0.1.69** (build 2.3.87413) | ✅ Supported |
-| ZCode (Zhipu) | Desktop IDE / CLI | **3.12.3** | ✅ Supported |
+| ZCode (Zhipu) | Desktop IDE / CLI | **3.14.4** | ✅ Supported |
 | Other China-usable tools | — | — | 🚧 Planned — adapters welcome |
 
 > ⚠️ **Version note**: only author-tested versions are listed above, read from each tool's own local version manifest (e.g. `resources/app/product.json`, `resources/build-manifest.json`) and the version shown in Windows "Apps & features" — no online lookup involved. Untested higher/lower versions may have changed data layouts — do an Export→Verify on your machine first.
 > Some tools expose both a *build* version and an *app* version (both listed above); a single tool may also ship multiple forms (e.g. a desktop IDE and its plugin) that share one data directory — each adapter backs up whatever data roots it detects, so users need not distinguish product forms.
+> **This table is updated as machines are re-measured and must stay consistent with the code.** Each number is traceable to one of three checkable local sources: ① the install directory's `product.json` (for the Trae family, `version` is the VS Code baseline while the app number sits in `appVersion` and the build number in `manifest.json`), ② the Windows "Apps & features" registry entry, ③ a status file the tool itself writes (e.g. Qoder CN's `~/.qoder-cn/.qoder-app-status.json`). **If an adapter change depends on a version's data layout, update this table and the policy section below in the same change** — never leave the docs saying one thing while the code does another.
 > The **Reasonix** row carries forward an earlier test record (the tool is not installed on this machine at the moment; the adapter follows its official data layout).
-> The **Qoder CN** version numbers are measured **across machines**: `0.3.4` / CLI `1.1.57` and `0.2.3` / CLI `1.1.47` come from two different PCs. **The same data root does not hold the same content across versions** — e.g. the "new-generation artifact family" under `~/.qoder-cn` (`projects/<key>/*.jsonl`, `plans/`, `tasks/`, `file-history/`, `canvas/`, `mcp.json`, `AppData/Roaming/QoderCN`) may be fully present on one machine and entirely absent on another. That is normal: this tool always probes by existence and reports "not found" for whatever is missing, never treating an absent directory as data loss or a detection failure. Backup entries are checked only when the path exists.
+> The **Qoder CN** versions are measured **across machines**: desktop client `0.4.3` comes from this machine (a stale `0.1.2` registration also remains), while `0.3.4` and `0.2.3` come from another PC; the CLI numbers (`1.1.57` / `1.1.47`) are the existing records from both machines and were not re-measured here. **The same data root does not hold the same content across versions** — e.g. the "new-generation artifact family" under `~/.qoder-cn` (`projects/<key>/*.jsonl`, `plans/`, `tasks/`, `file-history/`, `canvas/`, `mcp.json`, `AppData/Roaming/QoderCN`) may be fully present on one machine and entirely absent on another. That is normal: this tool always probes by existence and reports "not found" for whatever is missing, never treating an absent directory as data loss or a detection failure. Backup entries are checked only when the path exists.
+>
+> ⚠️ **DSH has a data-layout change from `0.2.0-rc.2` that directly affects backup entries**: the old global settings file `$DSH_HOME/settings.yaml` **has been removed** (settings now live per profile in `profiles/<profile>/cordis.patch.yml`; the legacy file is imported once on first launch and then renamed to `settings.yaml.imported` — a **clean install never creates it at all**). This tool therefore **no longer offers `settings.yaml` as a backup entry** and backs up `profiles/<profile>/cordis.patch.yml` instead; see [`docs/local/新增工具适配核查.md`](docs/local/新增工具适配核查.md) for the source-level evidence.
+>
+> ⚠️ **Within the same DSH version there is also a storage-layout upgrade whose old file is left behind**: the session projection cache moved from a **single file** `storages/session_projcache.json` to a **one-document-per-record** tree at `storages/session_projcache/sessions/<id>.json`. DSH's `storage-json` backend **leaves the source file untouched** when migrating, so that machine keeps both "a stale single file" and "a live directory tree" side by side — resolving the name alone means **backing up the dead file** (non-zero size, shown as "found", the backup looks perfectly successful, yet the restore comes out empty). This tool now points at the tree and lists it as **off by default**: it is a **pure cache rebuildable from the session log** (official docs: "the log leads, the cache follows"). If you see a same-named file and directory coexisting in other tools' data roots, apply the same reasoning — compare `mtime` first, then decide what to point at.
 >
 > 📛 **Product names follow what the user actually sees, not the install directory**: the Trae family's install directories are `Trae CN` and `TRAE SOLO CN`, but the products present themselves to users as `TraeCode CN` and `TraeWork CN` (`win32NameVersion` in `product.json`, matching the Windows "Apps & features" list). This tool shows the latter. Internal adapter ids (`trae-cn` / `trae-solo-cn`) are unchanged, so existing backups and preference caches keep working.
 
@@ -465,6 +489,20 @@ The criterion is **how costly an item is to re-obtain**, not merely "can it be r
   2. **Settings-class content you would have to re-configure item by item before you can work**: **settings, skills, inspiration, custom model config** — technically rebuildable, but expensive to rebuild, so checked by default to make the restored machine **productive immediately**.
 - ⬜ **Unchecked by default (optional)**: **plugins, extensions, MCP, index, orchestration records (tasks/teams)** — recovered by re-downloading or re-authorizing, and often large; unchecked by default, tick as needed.
 - 🚫 **Not listed as a backup item**: **local cache, runtime/state records, logs, credentials** — cache/runtime/logs are purely the program's own transient data, unrelated to user data, so no item is generated; **credentials** (login state, machine-bound tokens) must be re-established on another machine anyway, so carrying them over is pointless.
+
+**Overarching item-selection rules (set 2026-10-02, applying to every supported tool):**
+
+1. **An item that does not exist in the currently supported versions is not offered as a backup item.** The canonical case is DSH's `settings.yaml`, removed as of `0.2.0-rc.2`: it exists on **no machine** running the current version (this is not "missing on this machine"), so no item is generated.
+2. **An item is listed only when one of the following holds, and it is always unchecked by default**:
+   - **(a)** it is explicitly **still needed after migrating from an older version** — e.g. a tool's **migration marker** must travel together with the data, or the product considers the migration done and skips the import;
+   - **(b)** restoring a **new-version** backup into an **older-version** product depends on it *for data correctness*.
+3. **Checked by default has a higher bar: the item must be both necessary for the currently supported version *and* correctly restorable.** Meeting only one half does not qualify — e.g. an item whose content is necessary but whose restore-side merge is not implemented yet (a plain overwrite would destroy the target machine's existing data) must not be checked by default until that restore logic lands.
+
+> ⚠️ **Two kinds of "not present" must be told apart — their handling is opposite**:
+> - **Removed by the product** (the new version neither produces nor reads the file any more) ⇒ per rule 1, **drop the item**;
+> - **Unused on this machine / tool not installed** (the current version still ships that file) ⇒ **keep the item** and let the UI show "not found" by existence probing — no error, and no inference of data loss.
+>
+> Deciding which case applies requires **checkable evidence** (product source, official design notes, version manifests), **never just "is it on this disk"** — otherwise "the user never enabled this feature" gets misread as "the version dropped it", deleting a genuinely useful backup item.
 
 > Note: different tools name their directories differently (e.g. "settings" may be `argv.json` / `config.toml` / `settings.json`), but each is mapped to the appropriate selection state by category above.
 
@@ -596,7 +634,7 @@ python -m ai_env_clone --restore --in ./my-backup.zip
   3. On the new computer, **restore that backup first**, then start using the tool;
   4. Never use the same workspace/session concurrently on two computers and then restore back and forth — overwriting loses one side's increments, while merging can produce conflicting data.
   - **Exception (safe index merge)**: for "global index files" that are **plain JSON with a fully parseable structure and unambiguous merge semantics**, the tool **merges instead of overwriting** so the target machine's existing same-named entries are preserved. The typical case is DSH's `storages/workspace.json` (see next section).
-  - Harness settings themselves (including custom model configs, e.g. DSH's `settings.yaml`) could theoretically be merged by key, but there is **no need**: settings should travel with the sessions — modify them serially on one machine, let them migrate with the backup, and restore them by whole-file overwrite like everything else, avoiding cross-machine settings drift.
+  - Harness settings themselves (including custom model configs, e.g. DSH's `profiles/<profile>/cordis.patch.yml`) could theoretically be merged by key, but there is **no need**: settings should travel with the sessions — modify them serially on one machine, let them migrate with the backup, and restore them by whole-file overwrite like everything else, avoiding cross-machine settings drift.
   - If the restore target already has new data (sessions/memories beyond the backup), first export that computer's own backup manually (or keep the auto-generated rollback snapshot) so both old and new data each have a revertible copy, then decide which side to keep.
 
 ### Cross-tool session import
@@ -645,7 +683,7 @@ Writing a session into a target tool **requires deciding which workspace it belo
 Implementation notes:
 
 - **Never overwrites existing target sessions**: new sessions always get a freshly generated id (UUID for WorkBuddy / CodeBuddy, `session-<uuid>` for DSH, timestamp id for Reasonix), so collisions are impossible by construction.
-- **Writes the "native landing spot", not just files**: some UIs read from an index, so dropping files alone is invisible. WorkBuddy therefore also registers the session in `workbuddy.db`'s `sessions` table (`insert or ignore`, never rewriting existing rows); DSH also registers it in `storages/workspace.json`'s workspace index and `storages/session_projcache.json`'s session cache. CodeBuddy / Reasonix follow their "project path / workspace" derivation rules, and a mismatch is reported explicitly.
+- **Writes the "native landing spot", not just files**: some UIs read from an index, so dropping files alone is invisible. WorkBuddy therefore also registers the session in `workbuddy.db`'s `sessions` table (`insert or ignore`, never rewriting existing rows); DSH also registers it in `storages/workspace.json`'s workspace index (**this is what the UI list reads**) and best-effort adds a title record to the `session_projcache*` cache (DSH can rebuild that cache from the log itself, and after the layout change the legacy single-file write only takes effect when the per-record tree does not yet exist — hence "best effort"). CodeBuddy / Reasonix follow their "project path / workspace" derivation rules, and a mismatch is reported explicitly.
 - **Read-only source parsing**: ZCode's `db.sqlite` is always opened `mode=ro` — the source DB is never written to.
 - **CJK / long-text safe**: DSH session files are **multi-frame** Zstandard streams; this tool decompresses the whole stream with multi-frame semantics (an early implementation decoded only the first frame and misjudged a 4 MB session as "no messages" — fixed).
 - **DSH needs a zstd backend**: reading / writing DSH sessions requires the `zstandard` / `pyzstd` module or a system `zstd` binary; when missing, import fails loudly (instead of silently producing corrupt data).
@@ -722,7 +760,7 @@ To address this, the tool **redacts at export time**: for such a file, any field
 > - **Environment-variable reference** (`apiKey: "${MY_API_KEY}"` form): **kept as-is** — it does not store the plaintext in the config file itself; across machines you only need the same-named env var present on the target, no config change needed.
 > - **Reference-style keys are never redacted**: keys such as `apiKeyEnv: MY_KEY_ENV` or `keyFile: …\keys\id_rsa` hold a **name or a path**, not a secret — redacting them would break the config (after restore it would point at a variable that does not exist, and the model would silently stop working). So when the key name contains `Env` / `File` / `Path` / `Var` / `Dir` / `Name`, the value is left untouched.
 > - When you tick a backup item containing sensitive credentials, the backup-complete screen **shows an extra security notice** reminding you to note these credentials down separately on the source machine and refill them manually on the target, otherwise the feature will appear but not work after restore.
-> - **If a tool keeps its keys in a separate file, you are reminded to back that file up separately**: DSH is exactly this design — `~/.dsh/settings.yaml` only contains `apiKeyEnv` (a reference name), while the real keys live in the `refs` section of `.credentials.yaml` in the same directory. That file is unchecked by default (plaintext; sharing the archive would leak it), so if you tick `settings.yaml` without ticking it, the backup-complete notice tells you plainly *which file holds the model keys and whether to back it up separately*.
+> - **If a tool keeps its keys in a separate file, you are reminded to back that file up separately**: DSH is exactly this design — `~/.dsh/profiles/<profile>/cordis.patch.yml` only contains `apiKeyEnv` (a reference name), while the real keys live in the `refs` section of `~/.dsh/.credentials.yaml`. That file is unchecked by default (plaintext; sharing the archive would leak it), so if you tick the live config without ticking it, the backup-complete notice tells you plainly *which file holds the model keys and whether to back it up separately*.
 
 Note: this tool **does not back up environment variables themselves** (they live in system/Shell config, outside any tool's data directory). So even with the env-var form, if the target lacks that variable, you must still configure it once on the target. This is the necessary trade-off between **security (no keys in the backup)** and **convenience (plug-and-play across machines)**: keys always remain only in an environment you control.
 

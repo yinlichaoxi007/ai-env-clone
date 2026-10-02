@@ -145,8 +145,9 @@ class BackupItem:
     #: 非空 = ``(配套条目 key, 说明)``：**勾选了本条目、但未勾选该配套条目**时，
     #: 备份完成提示里追加这条说明（见 :func:`companion_notes`）。
     #: 用途是「单独成文件、缺了它数据就不完整」的成对内容。典型（DSH 实测）：
-    #: ``settings.yaml`` 只保存 provider 的密钥**引用**（``apiKeyEnv``），真密钥在同目录
-    #: ``.credentials.yaml``；后者含明文、默认不勾 ⇒ 必须让用户知道要单独备份它。
+    #: 实时配置 ``profiles/<profile>/cordis.patch.yml`` 只保存 provider 的密钥**引用**
+    #: （``apiKeyEnv``），真密钥在 ``.credentials.yaml``；后者含明文、默认不勾
+    #: ⇒ 必须让用户知道要单独备份它。
     companion: "tuple[str, str] | None" = None
 
     @property
@@ -186,9 +187,10 @@ def origin_info_entries(items: Sequence[BackupItem]) -> list[dict]:
 def companion_notes(items: Sequence[BackupItem]) -> list[str]:
     """挑出「已勾选、但它的配套条目没勾选」的提醒文案（去重、保序）。
 
-    用于「拆成两个文件、缺一个数据就不完整」的成对内容。典型是 DSH：勾了
-    ``settings.yaml``（只存 provider 的密钥**引用**）却没勾 ``.credentials.yaml``
-    （存真密钥）⇒ 备份包里取不到密钥，还原后模型不可用，必须当场告诉用户。
+    用于「拆成两个文件、缺一个数据就不完整」的成对内容。典型是 DSH：勾了实时配置
+    ``profiles/<profile>/cordis.patch.yml``（只存 provider 的密钥**引用**）却没勾
+    ``.credentials.yaml``（存真密钥）⇒ 备份包里取不到密钥，还原后模型不可用，
+    必须当场告诉用户。
 
     :param items: **本次实际勾选**的条目（不是全量清单）。配套条目是否被勾选，
         就以这份列表里有没有它的 ``key`` 判断。

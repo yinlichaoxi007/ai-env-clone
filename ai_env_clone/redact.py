@@ -1,10 +1,10 @@
 """
 备份导出脱敏的**共享文本工具**：把配置文件里「键名像凭证」的值替换为占位符。
 
-为什么不放在各适配器里：DSH 的 ``settings.yaml``、Reasonix 的 ``config.toml``
-都是「设置类」条目，自 2026-10-01 起**默认勾选**（用户定策：设置属「还原后立刻能
-开工」类），而它们都可能带明文 apiKey / token（前者是 LLM 提供商配置，后者含
-MCP 服务器 ``[[plugins]]`` 段）。备份包常被同步到网盘或转发他人 ⇒ 默认备份**绝
+为什么不放在各适配器里：DSH 的 ``profiles/<profile>/cordis.patch.yml``、Reasonix
+的 ``config.toml`` 都是「设置类」条目，自 2026-10-01 起**默认勾选**（用户定策：设置属
+「还原后立刻能开工」类），而它们都可能带明文 apiKey / token（前者是 LLM 提供商配置，
+后者含 MCP 服务器 ``[[plugins]]`` 段）。备份包常被同步到网盘或转发他人 ⇒ 默认备份**绝
 不能**带明文密钥，故导出前统一脱敏。
 
 设计取舍（为什么是「行内正则」而不是 YAML/TOML 解析器）：
@@ -15,8 +15,8 @@ MCP 服务器 ``[[plugins]]`` 段）。备份包常被同步到网盘或转发�
   用户原稿一致，不产生「格式被重排」的副作用。
 - 命中判据只看**键名**（不扫值内容）⇒ 不会误伤 ``base_url`` / ``model`` 这类正常配置。
 - **引用型键名一律跳过**（见 :data:`REFERENCE_KEY_HINTS`）：值若是「环境变量名 / 文件名 /
-  路径」，它本身**不是密钥**，抹掉等于把配置改坏。典型来自 DSH ``settings.yaml``——
-  那里只有 ``apiKeyEnv: SENSENOVA_API_KEY``，真密钥在同目录 ``.credentials.yaml``。
+  路径」，它本身**不是密钥**，抹掉等于把配置改坏。典型来自 DSH 的实时配置 ——
+  那里只有 ``apiKeyEnv: SENSENOVA_API_KEY``，真密钥在 ``.credentials.yaml``。
 - 但键名含 ``token`` 时 ``max_tokens: 4096`` 也会命中 ⇒ 对**纯数字 / 布尔 / 空值**跳过
   （凭证几乎不会是裸数字，而把整数换成字符串会让目标产品解析配置失败 —— 宁可少脱敏，
   也不弄坏用户的配置）。
@@ -27,7 +27,7 @@ MCP 服务器 ``[[plugins]]`` 段）。备份包常被同步到网盘或转发�
 
 .. code-block:: yaml
 
-    # YAML（DSH settings.yaml）
+    # YAML（DSH 的实时配置 cordis.patch.yml）
     apiKeyEnv: MY_KEY_ENV    # 引用型 ⇒ 原样保留（DSH 实测只存引用，真密钥在 .credentials.yaml）
     api_key: sk-xxx          # 明文 ⇒ 脱敏
     providers:
@@ -74,8 +74,9 @@ SENSITIVE_HINTS: tuple[str, ...] = (
 #: 不是密钥本身 ⇒ **必须原样保留**。抹掉引用等于把用户的配置改坏：
 #: 还原后 provider 会指向一个不存在的变量名，模型静默失效，且用户完全看不出原因。
 #:
-#: 实测来源（本机 DSH）：``settings.yaml`` 里是 ``apiKeyEnv: SENSENOVA_API_KEY``
-#: —— DSH **只把引用写进设置**，真密钥在同目录 ``.credentials.yaml`` 的 ``refs`` 段。
+#: 实测来源（DSH）：实时配置 ``profiles/<profile>/cordis.patch.yml`` 里是
+#: ``apiKeyEnv: SENSENOVA_API_KEY``
+#: —— DSH **只把引用写进设置**，真密钥在 ``.credentials.yaml`` 的 ``refs`` 段。
 #: 若按「键名含 apikey 就脱敏」一刀切，就会把 ``apiKeyEnv`` 的值换成占位符（已实测复现）。
 #:
 #: ⚠️ 刻意**不含** ``ref``：``refresh_token`` / ``refreshToken`` 是**真凭证**，

@@ -131,7 +131,7 @@ python -m unittest tests.test_qoder -v
    并在 `default_source_root()` / `list_source_sessions()` 中登记其会话根与扫描规则。
 2. **作为目标**：同文件 `SessionWriter` 中加一个 `write_<tool>()`，以目标工具的**原生**
    格式写出。若目标界面靠索引读取（而非目录遍历），必须同时登记其索引
-   （如 WorkBuddy 的 `workbuddy.db`、DSH 的 `workspace.json` / `session_projcache.json`），
+   （如 WorkBuddy 的 `workbuddy.db`、DSH 的 `workspace.json` / `session_projcache*` (legacy single file / current per-record tree — both may coexist)），
    否则「文件在了但界面看不到」。
 
 随后在 `ai_env_clone/import_matrix.py` 中为该工具补一条能力声明——**这是 GUI
@@ -351,7 +351,7 @@ After adding an adapter, please add corresponding `build_items` unit assertions 
 If your tool stores sessions in a **plaintext, parseable** form (JSONL / JSON / plain SQLite), it can take part in cross-tool session import in addition to whole-archive backup. Two changes are needed:
 
 1. **As a source**: add a `parse_<tool>()` to `SessionParser` in `ai_env_clone/session_migration.py` that reads the tool's native sessions into the shared `Session` / `SessionMessage` model; register its session root and scan rule in `default_source_root()` / `list_source_sessions()`.
-2. **As a target**: add a `write_<tool>()` to `SessionWriter` in the same file that writes the **native** format. If the target UI reads from an index rather than by directory traversal, you must also register the session in that index (e.g. WorkBuddy's `workbuddy.db`, DSH's `workspace.json` / `session_projcache.json`) — otherwise "the file is there but the UI shows nothing".
+2. **As a target**: add a `write_<tool>()` to `SessionWriter` in the same file that writes the **native** format. If the target UI reads from an index rather than by directory traversal, you must also register the session in that index (e.g. WorkBuddy's `workbuddy.db`, DSH's `workspace.json` / `session_projcache*` (legacy single file / current per-record tree — both may coexist)) — otherwise "the file is there but the UI shows nothing".
 
 Then declare one capability entry for the tool in `ai_env_clone/import_matrix.py` — **the sole data source for the GUI's "Data import" area**; the UI hardcodes no source list:
 

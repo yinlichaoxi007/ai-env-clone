@@ -1,15 +1,18 @@
 """导出脱敏：``ai_env_clone/redact.py`` 的 YAML / TOML 行级脱敏。
 
 背景（用户 2026-10-01 定策）：设置类条目改为**默认勾选**（
-「还原后立刻能开工」），而 DSH 的 ``settings.yaml``（LLM 提供商）与 Reasonix 的
-``config.toml``（含 MCP ``[[plugins]]`` 段）一旦含明文 apiKey / token 就有外泄风险。
-备份包常被同步到网盘或转发他人 ⇒ 默认备份**绝不能**带明文密钥。
+「还原后立刻能开工」），而 DSH 的实时配置 ``profiles/<profile>/cordis.patch.yml``
+（LLM 提供商）与 Reasonix 的 ``config.toml``（含 MCP ``[[plugins]]`` 段）一旦含明文
+apiKey / token 就有外泄风险。备份包常被同步到网盘或转发他人 ⇒ 默认备份**绝不能**带明文密钥。
 
-★ 但**引用 ≠ 密钥**：本机实测 DSH ``settings.yaml`` 里写的是
-``apiKeyEnv: SENSENOVA_API_KEY``（真密钥在同目录 ``.credentials.yaml``）。
+★ 但**引用 ≠ 密钥**：实测 DSH 的实时配置里写的是
+``apiKeyEnv: SENSENOVA_API_KEY``（真密钥在 ``.credentials.yaml``）。
 按「键名含 apikey 就脱敏」一刀切会把**引用名抹成占位符**，还原后 provider 指向
 一个不存在的变量名、模型静默失效 —— 这是 2026-10-01 实际引入过并修复的 bug，
 本模块用 ``test_reference_keys_*`` / ``test_dsh_real_settings_untouched`` 锁住。
+
+注：DSH 旧版的 ``settings.yaml`` 已随新版移除（不再有对应备份条目），
+但脱敏后缀表**仍保留**该名字作旧版机器上的安全网，故下面仍有它的用例。
 
 本模块只测「脱敏本身」；「条目默认勾选」的断言在各适配器自己的测试里。
 """
@@ -253,17 +256,43 @@ class TestRedactConfigBytes(unittest.TestCase):
 
 
 class TestAdapterWiring(unittest.TestCase):
-    """两个「设置默认勾选且可能含密钥」的条目必须真的挂上了脱敏回调。"""
+    """「设置默认勾选且可能含密钥」的条目必须真的挂上了脱敏回调。"""
 
-    def test_dsh_settings_yaml_is_redacted(self) -> None:
+    def _dsh_items(self):
+        """用临时目录造一份 ``.dsh``，避免依赖真实主目录（否则用例随机器而变）。"""
+        import tempfile
+
+        tmp = tempfile.mkdtemp(prefix="redact_dsh_")
+        dsh_home = os.path.join(tmp, ".dsh")
+        prof = os.path.join(dsh_home, "profiles", "desktop")
+        os.makedirs(prof, exist_ok=True)
+        with open(os.path.join(prof, "cordis.patch.yml"), "w", encoding="utf-8") as f:
+            f.write("- id: llm-deepseek\n  config:\n    providers:\n      x:\n"
+                    "        apiKeyEnv: MY_KEY\n")
+        with open(os.path.join(dsh_home, ".credentials.yaml"), "w", encoding="utf-8") as f:
+            f.write("api_key: test\n")
+        return {i.key: i for i in dsh.build_items(tmp, dsh_home)}
+
+    def test_dsh_live_config_is_redacted(self) -> None:
+        """当前版本实时配置（``cordis.patch.yml``）必须挂上脱敏回调。"""
         adapter = dsh.DSHAdapter()
-        paths = adapter.export_transform_paths() or []
-        self.assertIn("settings.yaml", list(paths))
+        paths = list(adapter.export_transform_paths() or [])
+        self.assertIn("cordis.patch.yml", paths)
         fn = adapter.export_transform()
         self.assertIsNotNone(fn)
-        out = fn("C__Users_x/.dsh/settings.yaml", b"api_key: sk-dsh\n")
+        out = fn("C__Users_x/.dsh/profiles/desktop/cordis.patch.yml",
+                 b"api_key: sk-dsh\n")
         self.assertNotIn(b"sk-dsh", out)
         self.assertIn(redact.REDACTED.encode(), out)
+
+    def test_dsh_legacy_settings_yaml_still_redacted(self) -> None:
+        """旧版 ``settings.yaml`` 已无条目，但后缀表仍保留作安全网（旧机器可能还在）。"""
+        adapter = dsh.DSHAdapter()
+        paths = list(adapter.export_transform_paths() or [])
+        self.assertIn("settings.yaml", paths)
+        fn = adapter.export_transform()
+        out = fn("C__Users_x/.dsh/settings.yaml", b"api_key: sk-legacy\n")
+        self.assertNotIn(b"sk-legacy", out)
 
     def test_reasonix_config_toml_is_redacted(self) -> None:
         adapter = reasonix.ReasonixAdapter()
@@ -276,23 +305,24 @@ class TestAdapterWiring(unittest.TestCase):
                  b'env = { API_KEY = "sk-reasonix" }\n')
         self.assertNotIn(b"sk-reasonix", out)
 
-    def test_dsh_settings_recommended_but_not_sensitive(self) -> None:
-        """设置默认勾选，但**不标敏感** —— 明文密钥不在该文件里。
+    def test_dsh_live_config_recommended_but_not_sensitive(self) -> None:
+        """实时配置默认勾选，但**不标敏感** —— 明文密钥不在该文件里。
 
-        标了 sensitive 会让「备份后定位敏感文件」把用户带到 ``settings.yaml``，
+        标了 sensitive 会让「备份后定位敏感文件」把用户带到 ``cordis.patch.yml``，
         去找一个根本不存在的明文密钥；真正的密钥在 ``.credentials.yaml``。
         """
-        items = {i.key: i for i in dsh.build_items()}
-        self.assertTrue(items["settings"].recommended)
-        self.assertFalse(items["settings"].sensitive)
+        items = self._dsh_items()
+        key = "profiles_patch:desktop"
+        self.assertTrue(items[key].recommended)
+        self.assertFalse(items[key].sensitive)
         # 凭证本身仍不进默认备份
         self.assertFalse(items["credentials"].recommended)
 
-    def test_dsh_settings_carries_credentials_companion(self) -> None:
+    def test_dsh_live_config_carries_credentials_companion(self) -> None:
         """未勾 ``.credentials.yaml`` 时必须提醒「单独备份该文件」。"""
-        items = {i.key: i for i in dsh.build_items()}
-        comp = items["settings"].companion
-        self.assertIsNotNone(comp, "settings.yaml 应声明配套条目")
+        items = self._dsh_items()
+        comp = items["profiles_patch:desktop"].companion
+        self.assertIsNotNone(comp, "实时配置条目应声明配套条目")
         comp_key, note = comp
         self.assertEqual(comp_key, "credentials")
         self.assertIn("credentials", note)
@@ -302,8 +332,12 @@ class TestAdapterWiring(unittest.TestCase):
         """归档成员名带根占位前缀，后缀判定必须仍然命中（core 的匹配语义）。"""
         adapter = dsh.DSHAdapter()
         fn = adapter.export_transform()
-        out = fn("D__home/.dsh/settings.yaml", b"token: sk-z\n")
-        self.assertNotIn(b"sk-z", out)
+        for rel in (
+            "D__home/.dsh/profiles/desktop/cordis.patch.yml",
+            "D__home/.dsh/settings.yaml",
+        ):
+            out = fn(rel, b"token: sk-z\n")
+            self.assertNotIn(b"sk-z", out, "后缀判定未命中: %s" % rel)
 
 
 if __name__ == "__main__":

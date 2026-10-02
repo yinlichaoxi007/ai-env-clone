@@ -7,14 +7,19 @@
 - ``describe()`` 返回结构完整（界面直接消费，字段缺失会渲染异常）；
 - ``format_lines()`` 能产出非空文本（弹窗消费）；
 - 标注为 SUPPORTED 的来源，其 ``parser`` 在 session_migration 中确实存在；
-  且其 ``writer``（若非空）同样存在。
+  且其 ``writer``（若非空）同样存在；
+- **版本号与 README 的「支持的工具」版本表一致**（防「界面说 A、文档说 B」）。
 """
 
+import os
+import re
 import unittest
 
 from ai_env_clone import import_matrix as im
 from ai_env_clone import session_migration
 from ai_env_clone.adapters import list_adapters
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class TestMatrixCoverage(unittest.TestCase):
@@ -122,6 +127,67 @@ class TestDescribeAndFormat(unittest.TestCase):
         for st in (im.SUPPORTED, im.BACKUP_ONLY, im.PLANNED):
             self.assertIn(st, im.STATUS_LABELS)
             self.assertIn(st, im.STATUS_COLORS)
+
+
+class TestVersionStringsMatchReadme(unittest.TestCase):
+    """版本号必须与 README「支持的工具」版本表一致（用户 2026-10-02 定的要求）。
+
+    版本号是**承诺**：README 说支持某版本、界面又显示另一个号，用户就无法判断
+    「这个包到底是在哪个版本上测的」。两处口径必须同一来源（见 README 版本说明段
+    与 ``import_matrix`` 顶部的取值口径注释），故用测试把漂移钉死。
+
+    判定方式刻意选「宽松但有效」：取每个 ``V_*`` 常量的**首个版本号形态**
+    （如 ``1.106.1`` / ``0.2.0-rc.2``），断言它出现在 README 里 ——
+    既不要求两处字符串完全等同（README 用 Markdown 加粗、常量带补充说明），
+    又能捕捉「改了常量忘了改 README」这类真实漂移。
+    """
+
+    VER_RE = re.compile(r"\d+\.\d+(?:\.\d+)?(?:-[\w.]+)?")
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.readme = os.path.join(ROOT, "README.md")
+        with open(cls.readme, encoding="utf-8") as fh:
+            cls.text = fh.read()
+
+    def _version_constants(self):
+        return {
+            name: value
+            for name, value in vars(im).items()
+            if name.startswith("V_") and isinstance(value, str)
+        }
+
+    def test_readme_exists(self) -> None:
+        self.assertTrue(os.path.isfile(self.readme), "README.md 缺失，无法校验版本一致性")
+
+    def test_every_version_constant_appears_in_readme(self) -> None:
+        consts = self._version_constants()
+        self.assertTrue(consts, "未找到任何 V_* 版本常量（口径变了就更新本用例）")
+        missing = []
+        for name, value in sorted(consts.items()):
+            m = self.VER_RE.search(value)
+            self.assertIsNotNone(m, "%s=%r 里没有版本号形态，无法校验" % (name, value))
+            token = m.group(0)
+            if token not in self.text:
+                missing.append((name, token, value))
+        self.assertEqual(
+            missing, [],
+            "以下版本号只存在于代码、README 版本表里没有（改了一处要同步另一处）: %s"
+            % missing,
+        )
+
+    def test_dsh_version_reflects_settings_yaml_removal(self) -> None:
+        """DSH 版本号必须 ≥ 移除 ``settings.yaml`` 的那一版，且 README 讲清后果。
+
+        ``0.2.0-rc.2`` 起 ``$DSH_HOME/settings.yaml`` 被移除 ⇒ 备份条目随之变化。
+        若有人把版本号改回旧值（或 README 不提这件事），这条会失败。
+        """
+        self.assertIn("settings.yaml", im.V_DSH + self.text,
+                      "DSH 条目与 README 都应交代 settings.yaml 的处置")
+        self.assertIn("0.2.0-rc.2", im.V_DSH)
+        self.assertIn("0.2.0-rc.2", self.text)
+        # README 必须写明「不再把 settings.yaml 当备份条目」
+        self.assertIn("不再把 `settings.yaml` 列为备份条目", self.text)
 
 
 if __name__ == "__main__":

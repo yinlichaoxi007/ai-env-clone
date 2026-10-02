@@ -331,6 +331,42 @@ class TestDsh(unittest.TestCase):
         self.assertTrue(sid)
         self.assertTrue(warns)
 
+    def test_projcache_titles_reads_per_record_tree(self) -> None:
+        """投影缓存换成 per-record 目录树后，标题仍须能读到。
+
+        DSH 的 ``storage-json`` 后端把 ``single`` 迁移成 ``per-record`` 时**保持源文件
+        不变**，所以升级过的机器上「旧单文件 + 活目录树」并存，而旧文件 mtime 冻结在升级
+        那一刻。只读旧单文件会读到过期/空数据 ⇒ 两种布局都要读，目录树优先。
+        """
+        root = os.path.join(self.tmp, "dsh2")
+        tree = os.path.join(root, "storages", "session_projcache", "sessions")
+        os.makedirs(tree)
+        with open(os.path.join(tree, "session-new.json"), "w", encoding="utf-8") as f:
+            json.dump({"version": 7,
+                       "record": {"identity": {"cwd": "D:\\p"},
+                                  "rows": {"title": {"ver": 1, "seq": 9,
+                                                     "val": "目录树里的标题"}}}}, f)
+        # 旧单文件里同一会话是**过期**标题，另一会话只有单文件里有
+        with open(os.path.join(root, "storages", "session_projcache.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"unit": {"name": "session_projcache", "version": 3},
+                       "tables": {"sessions": {
+                           "session-new": {"rows": {"title": {"val": "过期标题"}}},
+                           "session-old": {"rows": {"title": {"val": "仅单文件有"}}},
+                       }}}, f)
+
+        titles = sm._dsh_projcache_titles(root)
+        self.assertEqual(titles["session-new"], "目录树里的标题",
+                         "目录树的值应优先于旧单文件")
+        self.assertEqual(titles["session-old"], "仅单文件有",
+                         "旧单文件里独有的会话仍须读到（更老的机器只有它）")
+
+    def test_projcache_titles_tolerates_missing_everything(self) -> None:
+        """两种布局都不存在时返回空 dict，不抛异常。"""
+        root = os.path.join(self.tmp, "dsh3")
+        os.makedirs(os.path.join(root, "storages"))
+        self.assertEqual(sm._dsh_projcache_titles(root), {})
+
 
 # --------------------------------------------------------------------------- #
 # migrate_session 调度

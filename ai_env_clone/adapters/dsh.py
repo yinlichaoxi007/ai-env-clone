@@ -16,35 +16,56 @@ DSH 数据全部位于 ``~/.dsh/`` 目录下（``$DSH_HOME`` 环境变量可覆�
     会话事件日志（Zstandard 压缩的 JSONL），每会话独立文件。
     这是 DSH 的**核心会话历史**，不可从零重建，默认勾选。
   - ``storages/workspace.json``
-    工作区与关联会话的索引（会话 ID → 所属工作区）。
-    与 ``sessions/`` 配套，核心数据，默认勾选。
-  - ``storages/session_projcache.json``
-    会话统计缓存（turn 数、token 用量等摘要）。
-    与 ``sessions/`` 配套，核心数据，默认勾选。
+    工作区与关联会话的索引（会话 ID → 所属工作区），single 布局（整单元一份文件）。
+    与 ``sessions/`` 配套，核心数据，默认勾选；还原时走**并集合并**（不覆盖目标机已有工作区）。
+  - ``storages/session_projcache/sessions/<id>.json``
+    逐会话投影缓存（列表标题、统计、goal 快照），per-record 布局（一条记录一份文件）。
+    ⚠️ 同级单文件 ``storages/session_projcache.json`` 是本单元**旧的 single 布局**：
+    storage-json 后端把它迁成目录树时会「保持源文件不变」，故它会一直留在盘上但不再写入
+    （本机实测单文件 mtime 停在 2026-09-20 23:07，与 ``settings.yaml`` 被导入同一刻）。
+    **备份必须指向目录树**，指向单文件等于「备份成功了、还原出来却是空的」。
+    ⚠️ 本单元是**纯缓存**（官方 README：「日志领先，缓存跟随」，缺失时消费方从会话日志
+    冷重折叠即可重建）⇒ 属「可重建」，默认**不**勾选。
   - ``AGENTS.md``
     用户全局指令（AI 助手工作准则，跨项目、跨会话自动加载）。
     等同于「用户级规则」，默认勾选。
-  - ``settings.yaml``
-    用户设置（LLM 提供商、locale、auto-detect 等）。
-    属「设置」类，**默认勾选**（还原后无需重新配置）。
-    ⚠️ 本文件**只保存引用、不含明文密钥**（本机实测为 ``apiKeyEnv: <环境变量名>``，
-    真密钥在同目录 ``.credentials.yaml``）⇒ **不标记为敏感项**（否则会把用户带去
+  - ``profiles/<profile>/cordis.patch.yml``
+    实时配置的落点（profile 编辑器写入的配置覆盖：LLM 提供商、locale、reasoningEffort、
+    agent-loop 等）。属「设置」类，**默认勾选**（还原后无需重新配置）。
+    ⚠️ 本文件**只保存引用、不含明文密钥**（实测为 ``apiKeyEnv: <环境变量名>``，
+    真密钥在 ``.credentials.yaml``）⇒ **不标记为敏感项**（否则会把用户带去
     本文件里找一个根本不存在的明文密钥）；仅保留导出脱敏作兜底，防手改后误带明文。
   - ``.credentials.yaml``
-    ``refs`` 段 = **可移植的 API 密钥**（``settings.yaml`` 的 ``apiKeyEnv`` 指向这里）；
+    ``refs`` 段 = **可移植的 API 密钥**（``cordis.patch.yml`` 的 ``apiKeyEnv`` 指向这里）；
     ``records`` 段 = 机器绑定的登录态 / 设备标识。
     属「凭证」类，默认不勾（含明文，随包分享即外泄；登录态换机本就须重新登录）。
-    ⇒ 未勾选它、却勾了 ``settings.yaml`` 时，备份完成提示会提醒用户**单独备份本文件**。
-  - ``profiles/``
-    配置文件（插件配置、cordis.yml、package.json 等）。
-    属「插件/扩展」类，可从零重建，默认不勾。
+    ⇒ 未勾选它、却勾了 ``cordis.patch.yml`` 时，备份完成提示会提醒用户**单独备份本文件**。
+  - ``profiles/``（其余内容）
+    ``cordis.patch.yml`` 之外的 ``cordis.yml``（实测为**纯注释模板**）、``package.json``、
+    ``pnpm-workspace.yaml`` 与 ``node_modules/`` 依赖树。属「插件/扩展」类，可从零重建，
+    默认不勾。它与上面 ``cordis.patch.yml`` 的条目**并存不冲突**：归档按相对路径去重
+    （``core.scan_items`` 的 ``seen``），故只有勾了 ``profiles/`` 才会连带把依赖树打进包。
+  - ``settings.yaml``（**已废弃，不列入备份选项**）
+    新版 DSH 已移除该全局设置文件：源码 ``packages/settings/settings/src/index.ts`` 的
+    ``SettingsForms.importLegacyDocument()`` 里 ``if (!existsSync(path)) return`` 是它
+    **唯一**的读写点，全仓没有任何写入路径 ⇒ **干净安装不会生成**它，旧版升级上来的机器上
+    也只是被一次性导入 profile 后改名为 ``settings.yaml.imported``。
+    故按「当前支持备份的版本中不存在的条目不列为备份选项」的规则**移除条目**
+    （判定过程见 ``docs/local/新增工具适配核查.md``）。
   - ``.anonymous-user-id``
     匿名用户标识文件，运行态，**不列入备份选项**。
 
 备份哲学（统一标准，用户 2026-10-01 定策后更新）：默认勾选「无法从零重复创建、或缺失后
-需重新逐项配置」的两类——① 会话、存储索引、用户规则；② 设置（含 LLM 提供商配置）。
-默认不勾**重新获取成本低 / 需重新授权**的——凭证、配置文件（profiles/）；
-程序自身的本地缓存、运行态标识与用户数据无关，不列入备份选项。
+需重新逐项配置」的两类——① 会话、存储索引、用户规则；② 实时配置（``cordis.patch.yml``，
+含 LLM 提供商配置）。默认不勾**重新获取成本低 / 需重新授权 / 可重建**的——凭证、配置文件
+（``profiles/`` 其余内容）、会话投影缓存（``storages/session_projcache/``）；程序自身的
+本地缓存、运行态标识与用户数据无关，不列入备份选项。
+
+★ 条目取舍的总规则（用户 2026-10-02 定）：**当前支持备份的版本中不存在的条目，不列为
+备份选项**；仅当 (a) 明确「旧版本迁移后仍然需要」（如迁移标记必须与数据同进同出），或
+(b)「备份新版还原到旧版、为保证数据正确必须依赖」时，才列为条目且 ``recommended=False``。
+注意区分「版本已移除」（可删条目）与「本机未使用该功能 / 工具未装」（**保留**条目，
+按存在性探测，缺失由界面显示「未找到」，不推断数据丢失）。
 """
 
 from __future__ import annotations
@@ -84,6 +105,30 @@ def _dsh_storages_root() -> str:
 def _dsh_profiles_root() -> str:
     """DSH 配置文件目录：``<dsh_home>/profiles``。"""
     return os.path.join(_dsh_home(), "profiles")
+
+
+def _list_dsh_profiles(profiles_root: str) -> list[str]:
+    """列出 ``profiles/`` 下的 profile 名（排除 ``node_modules``），按名排序。
+
+    profile 名由**启动方**决定（``dsh --profile <name>``），DSH 并不存在单一默认名
+    —— 随附的 profile 就有 ``desktop`` / ``web`` / ``sdk`` / ``sdk-minimal`` /
+    ``headless`` 等（见源码 ``packages/boot/app-boot/src/profile.ts`` 的
+    ``resolveProfileDir``）。故只能**按磁盘枚举**，不能写死某一个名字，
+    否则换个 profile 启动的用户会漏掉自己的实时配置。
+
+    :param profiles_root: ``<dsh_home>/profiles`` 路径（可能不存在）。
+    :return: 子目录名列表；目录不存在或无子目录时返回空列表。
+    """
+    try:
+        names = os.listdir(profiles_root)
+    except OSError:
+        return []
+    return sorted(
+        n
+        for n in names
+        if n != "node_modules"
+        and os.path.isdir(os.path.join(profiles_root, n))
+    )
 
 
 def _detect_workspace_session_dirs() -> list[str]:
@@ -231,18 +276,23 @@ def _count_session_files(sessions_root: str) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# 导出脱敏：settings.yaml
+# 导出脱敏：实时配置 cordis.patch.yml（+ 旧版 settings.yaml 兜底）
 #
-# 背景：``~/.dsh/settings.yaml`` 记录 LLM 提供商（base_url / model 等），自
-# 2026-10-01 起**默认勾选**（用户定策：设置属「还原后立刻能开工」类）。
+# 背景：DSH 的实时设置落在 ``<dsh_home>/profiles/<profile>/cordis.patch.yml``
+# （profile 编辑器写入），自 2026-10-02 起**默认勾选**（承接原 settings.yaml 条目的
+# 「设置属还原后立刻能开工」定位；后者已随新版 DSH 一并移除，见文件头说明）。
 #
-# ★ 关键事实（本机实测）：该文件**不含明文密钥** —— provider 下是
-#   ``apiKeyEnv: <环境变量名>`` 这样的**引用**，真密钥在同目录 ``.credentials.yaml``。
+# ★ 关键事实（实测）：该文件**不含明文密钥** —— provider 下是
+#   ``apiKeyEnv: <环境变量名>`` 这样的**引用**，真密钥在上层 ``.credentials.yaml``。
 #   ⇒ 正常情况下这段脱敏**不会改动任何一行**，它的作用是兜底：万一用户手改过、
-#     把明文密钥直接写进 settings.yaml，导出时也要抹掉（本工具承诺包内无明文密钥）。
+#     把明文密钥直接写进 cordis.patch.yml，导出时也要抹掉（本工具承诺包内无明文密钥）。
 #   ⇒ 脱敏必须「引用感知」：``ai_env_clone.redact.key_is_reference`` 会跳过
 #     ``apiKeyEnv`` / ``keyFile`` 这类键，否则会把引用名抹成占位符、把配置改坏
 #     （2026-10-01 曾实际引入该 bug 并修复）。
+#
+# ``settings.yaml`` 仍留在后缀表里：新版已无该文件（不生成、不读取），但**旧版机器**
+# 上它可能还在（迁移前的形态），且是纯文本配置文件 —— 留着只是**零成本的安全网**，
+# 不构成任何一个备份条目。
 #
 # 实现见 :mod:`ai_env_clone.redact`（行级脱敏，与 Reasonix config.toml 共用）。
 # --------------------------------------------------------------------------- #
@@ -301,13 +351,20 @@ def build_items(
             )
         )
 
-    # 2) 存储数据（storages/workspace.json + session_projcache.json）。
-    #    工作区索引与会话统计缓存，与会话配套，核心数据，默认勾选。
-    #    两文件用不同 key 后缀区分，GUI 按前缀聚合。
+    # 2) 存储数据（storages/）下的两个单元。二者性质不同（一核心索引、一可重建缓存），
+    #    因此 key **刻意不共用冒号前缀**：GUI 按 key.split(":",1)[0] 聚合成一行，
+    #    若都用 `storages:` 前缀就会被合成**一个勾选框**，默认态取组内首项 ⇒
+    #    「缓存默认不勾」会被首项的 true 吞掉、且一行代表两种推荐态（自相矛盾）。
+    #    ⚠️ 这是「界面塌陷」类坑（同 Trae 的 ui_misc_* 处理），改 key 前先想清楚。
+    #
+    #    (a) workspace.json —— 工作区与会话关联索引（single 布局，整单元一份文件）。
+    #        与会话配套、还原后产品才能列出历史会话，属核心数据 ⇒ 默认勾选。
+    #        还原侧由 restore_index_merge 做**并集合并**（不覆盖目标机已有工作区），
+    #        满足「默认勾选必须能正确还原」的要求。
     ws_file = os.path.join(storages_root, "workspace.json")
     items.append(
         BackupItem(
-            key="storages:workspace",
+            key="storages_workspace",
             label="存储数据（storages/）",
             path=ws_file,
             uid=None,
@@ -315,15 +372,30 @@ def build_items(
             recommended=True,
         )
     )
-    sp_file = os.path.join(storages_root, "session_projcache.json")
+    #
+    #    (b) session_projcache/ —— 会话投影缓存（per-record 布局，一条记录一份
+    #        ``sessions/<id>.json``）。
+    #        ⚠ 本条目曾长期指向同级单文件 ``storages/session_projcache.json``，
+    #          那是该单元**旧的 single 布局**：storage-json 后端把它迁成 per-record
+    #          目录树时「保持源文件不变」，故那个文件会一直留在盘上、且不再被写入
+    #          （本机实测：单文件 mtime 停在 2026-09-20 23:07，与 settings.yaml 被
+    #          导入的同一刻；此后新增的会话只写进目录树）。
+    #          ⇒ 备份必须指向目录树，否则「备份到了、还原却是空的」而无人察觉。
+    #        ⚠ 该单元是**纯缓存**：官方 README 明确「日志领先，缓存跟随」，缺缓存时
+    #          消费方从会话日志冷重折叠即可重建，坏记录也只被当作不存在。
+    #          ⇒ 不属于「无法从零重建」，按统一口径默认**不**勾选（与 code_index、
+    #          plugins 同类）。用户若想连列表加速数据一起带走，可手动勾选。
+    sp_dir = os.path.join(storages_root, "session_projcache")
     items.append(
         BackupItem(
-            key="storages:session_projcache",
-            label="存储数据（storages/）",
-            path=sp_file,
+            key="storages_session_projcache",
+            label="会话投影缓存（storages/session_projcache/）",
+            path=sp_dir,
             uid=None,
-            description="会话统计缓存（session_projcache.json）。核心，默认勾选。",
-            recommended=True,
+            description="逐会话投影缓存（列表标题、统计、goal 快照）。可从会话日志"
+                        "冷重折叠重建，故默认不勾；勾选可省去目标机首次列表演算。"
+                        "不含明文密钥。",
+            recommended=False,
         )
     )
 
@@ -341,44 +413,57 @@ def build_items(
         )
     )
 
-    # 4) 用户设置（settings.yaml）。
-    #    默认勾选（用户 2026-10-01 定策：设置属「还原后立刻能开工」类）。
-    #    ⚠️ 本文件**只存引用、不存明文密钥**（本机实测）：provider 下是
-    #    ``apiKeyEnv: <环境变量名>``，真密钥在同目录 ``.credentials.yaml`` 的 ``refs`` 段。
-    #    故**不标 sensitive** —— 标了会让「备份后定位敏感文件」把用户带去 settings.yaml
-    #    找一个根本不存在的明文密钥；引用值反而会被脱敏逻辑抹坏（已实测复现并修复，
-    #    见 :func:`ai_env_clone.redact.key_is_reference`）。
+    # 4) 实时配置（profiles/<profile>/cordis.patch.yml）。
+    #    ★ 2026-10-02 起**替换**原「用户设置（settings.yaml）」条目。
+    #      DSH 新版已移除 $DSH_HOME/settings.yaml —— 源码
+    #      packages/settings/settings/src/index.ts 的 importLegacyDocument() 里
+    #      ``if (!existsSync(path)) return`` 是它**唯一**的读写点，全仓没有任何写入路径
+    #      ⇒ 「干净安装不会生成、旧版升级机只是被消费一次后改名为 .imported」，
+    #      即它在**当前支持的版本中不存在**（不是「本机缺失」）⇒ 按规则移除条目；
+    #      也**不**适用例外——迁移早已把内容并入 profile，旧版/新版都不再读它。
+    #    profile 编辑器写入的 cordis.patch.yml 才是实时设置的落点：用户手改出来的
+    #    配置覆盖（LLM 提供商、locale、reasoningEffort、agent-loop 等），**不可从零重建**
+    #    ⇒ 默认勾选（承接原 settings 条目的「还原后立刻能开工」定位）。
+    #    ⚠️ 只存 provider 的密钥**引用**：provider 下是 ``apiKeyEnv: <环境变量名>``，
+    #    真密钥在 ``.credentials.yaml`` 的 ``refs`` 段 ⇒ **不标 sensitive**（标了会让
+    #    「备份后定位敏感文件」把用户带去本文件找一个根本不存在的明文密钥；引用值反而
+    #    会被脱敏逻辑抹坏，见 :func:`ai_env_clone.redact.key_is_reference`）。
     #    仍保留 export_transform 作**兜底**：若用户手改过、把明文密钥直接写进本文件，
-    #    导出时会被抹掉 —— 本工具承诺「备份包不含明文密钥」，宁可知情后补填也不外泄。
+    #    导出时会被抹掉 —— 本工具承诺「备份包不含明文密钥」。
     #    再挂 companion：未勾选 .credentials.yaml 时，备份完成提示用户单独备份该文件。
-    settings_file = os.path.join(dsh, "settings.yaml")
-    items.append(
-        BackupItem(
-            key="settings",
-            label="用户设置（settings.yaml）",
-            path=settings_file,
-            uid=None,
-            description="DSH 用户设置（LLM 提供商、locale、auto-detect 等）。默认勾选，"
-                        "还原后无需重新配置。注意：本文件只保存 provider 的密钥**引用**"
-                        "（如 apiKeyEnv 指向的环境变量名），不含明文密钥；"
-                        "真正的密钥在同目录的「凭证（.credentials.yaml）」里。",
-            recommended=True,
-            companion=(
-                "credentials",
-                "「用户设置（settings.yaml）」已勾选，但它的配套文件「凭证（.credentials.yaml）」"
-                "未勾选。DSH 的模型密钥存放在后者（settings.yaml 里只有 apiKeyEnv 这样的引用名），"
-                "不随包携带则还原后模型会因取不到密钥而不可用。"
-                "如需跨机保留密钥，请单独备份该文件；不需要时在新机器重新填写即可"
-                "（该文件含明文密钥，请勿随备份包分享）。",
-            ),
+    #    profile 名由启动方决定（``dsh --profile <name>``，无单一默认名）⇒ 按磁盘枚举，
+    #    每个 profile 一条；key 用 ``profiles_patch:<profile>``，GUI 按前缀聚合为一行。
+    for _prof_name in _list_dsh_profiles(profiles_root):
+        items.append(
+            BackupItem(
+                key="profiles_patch:%s" % _prof_name,
+                label="实时配置（cordis.patch.yml）",
+                path=os.path.join(profiles_root, _prof_name, "cordis.patch.yml"),
+                uid=None,
+                description="DSH 当前 profile 的实时配置（LLM 提供商、locale、"
+                            "reasoningEffort、agent-loop 等，profile 为 %s）。默认勾选，"
+                            "还原后无需重新配置。注意：本文件只保存 provider 的密钥**引用**"
+                            "（如 apiKeyEnv 指向的环境变量名），不含明文密钥；"
+                            "真正的密钥在同目录上游的「凭证（.credentials.yaml）」里。"
+                            % _prof_name,
+                recommended=True,
+                companion=(
+                    "credentials",
+                    "「实时配置（cordis.patch.yml）」已勾选，但它的配套文件「凭证"
+                    "（.credentials.yaml）」未勾选。DSH 的模型密钥存放在后者"
+                    "（cordis.patch.yml 里只有 apiKeyEnv 这样的引用名），"
+                    "不随包携带则还原后模型会因取不到密钥而不可用。"
+                    "如需跨机保留密钥，请单独备份该文件；不需要时在新机器重新填写即可"
+                    "（该文件含明文密钥，请勿随备份包分享）。",
+                ),
+            )
         )
-    )
 
     # 5) 凭证（.credentials.yaml）。
-    #    refs 段是**可移植的 API 密钥**（settings.yaml 的 apiKeyEnv 就指向这里）；
+    #    refs 段是**可移植的 API 密钥**（cordis.patch.yml 的 apiKeyEnv 就指向这里）；
     #    records 段是机器绑定的登录态 / 设备标识（换机须重新登录）。
     #    默认不勾：含明文，随包分享即外泄；登录态那半本就跨机无意义。
-    #    未勾选时由上面 settings 条目的 companion 在备份完成时提示「单独备份」。
+    #    未勾选时由上面 cordis.patch.yml 条目的 companion 在备份完成时提示「单独备份」。
     creds_file = os.path.join(dsh, ".credentials.yaml")
     items.append(
         BackupItem(
@@ -387,22 +472,28 @@ def build_items(
             path=creds_file,
             uid=None,
             description="DSH 凭证（.credentials.yaml）。其中 refs 段是可移植的 API 密钥"
-                        "（settings.yaml 的 apiKeyEnv 就指向这里），records 段是机器绑定的"
+                        "（cordis.patch.yml 的 apiKeyEnv 就指向这里），records 段是机器绑定的"
                         "登录态/设备标识。默认不勾：含明文，分享备份包会外泄，"
                         "且登录态换机本就须重新登录；如需把密钥带到新机器，请单独备份本文件。",
             recommended=False,
         )
     )
 
-    # 6) 配置文件（profiles/）。属「插件/扩展」类，可从零重建，默认不勾。
+    # 6) 配置文件（profiles/）。`cordis.patch.yml` 之外的都属于「插件/扩展」类：
+    #    `cordis.yml`（实测为**纯注释模板**）、`package.json`、`pnpm-workspace.yaml`
+    #    与 `node_modules/` 依赖树，均可从零重建 ⇒ 默认不勾。
+    #    注意与上面 `profiles_patch:*` 条目**并存不冲突**：归档按相对路径去重
+    #    （`core.scan_items` 的 `seen`），故只有勾了这一项才会把依赖树一并打进包。
     items.append(
         BackupItem(
             key="profiles",
-            label="配置文件（profiles/）",
+            label="配置文件（profiles/ 其余内容）",
             path=profiles_root,
             uid=None,
-            description="DSH 配置文件（profiles/，含插件配置、cordis.yml 等）。"
-                        "可从零重建，默认不勾。",
+            description="DSH 配置目录（profiles/，含 cordis.yml、package.json、"
+                        "pnpm-workspace.yaml、node_modules/ 依赖树）。可从零重建，默认不勾。"
+                        "注意：实时配置 cordis.patch.yml 已单独成一个条目（默认勾选），"
+                        "勾本项会额外带上依赖树（体积大），一般不需要。",
             recommended=False,
         )
     )
@@ -421,7 +512,7 @@ class DSHAdapter(BaseAdapter):
     #: DSH 专属压缩经验系数（档位 -> 类别 -> 压缩后/源 占比）。
     #:
     #: 备份数据构成（据此归类）：
-    #:   - text   : ``AGENTS.md``、``settings.yaml``、``.credentials.yaml`` 文本（高度可压，≈0.12）
+    #:   - text   : ``AGENTS.md``、``cordis.patch.yml``、``.credentials.yaml`` 文本（高度可压，≈0.12）
     #:   - db     : 暂无本地 SQLite，按通用经验 ≈0.5
     #:   - struct : ``storages/*.json`` 结构化数据（≈0.4）
     #:   - binary : 通用已压缩/二进制（≈0.99，几乎压不动）
@@ -509,22 +600,27 @@ class DSHAdapter(BaseAdapter):
         return _merge_workspace_index_bytes
 
     # ------------------------------------------------------------------ #
-    # 导出脱敏：settings.yaml —— 兜底用（该文件正常只存引用、无明文密钥）
+    # 导出脱敏：cordis.patch.yml（+ 旧版 settings.yaml 兜底）
     # ------------------------------------------------------------------ #
     def export_transform_paths(self) -> "Sequence[str] | None":
-        """需要导出脱敏的归档内相对路径后缀：``settings.yaml``。
+        """需要导出脱敏的归档内相对路径后缀：``cordis.patch.yml`` 与 ``settings.yaml``。
 
-        该条目自 2026-10-01 起**默认勾选**，而 LLM 提供商配置里理论上可能出现明文
-        apiKey / token（包常被同步到网盘或转发他人）⇒ 保留脱敏作**兜底**。
+        ``cordis.patch.yml`` 是当前版本实时配置的落点，其条目**默认勾选**，而 LLM
+        提供商配置里理论上可能出现明文 apiKey / token（包常被同步到网盘或转发他人）
+        ⇒ 保留脱敏作**兜底**。
 
-        注意（本机实测）：DSH 正常写的是 ``apiKeyEnv: <环境变量名>`` 这种**引用**，
-        真密钥在同目录 ``.credentials.yaml``；引用型键由
+        ``settings.yaml`` 是**旧版**遗留文件名（新版不生成也不读取，故已无对应条目）：
+        留在这里只是零成本安全网 —— 旧版机器上它可能仍存在，纯文本配置一旦进包同样
+        需要抹掉明文。
+
+        注意（实测）：DSH 正常写的是 ``apiKeyEnv: <环境变量名>`` 这种**引用**，
+        真密钥在 ``.credentials.yaml``；引用型键由
         :func:`ai_env_clone.redact.key_is_reference` 跳过，故正常文件**逐字不变**。
         """
-        return ["settings.yaml"]
+        return ["cordis.patch.yml", "settings.yaml"]
 
     def export_transform(self) -> "Callable[[str, bytes], bytes] | None":
-        """返回 ``settings.yaml`` 的脱敏回调（见 :mod:`ai_env_clone.redact`）。
+        """返回配置文件的脱敏回调（见 :mod:`ai_env_clone.redact`）。
 
         只改写「键名像凭证」的值，YAML 结构原样保留 —— 与 ``models.json``
         口径一致：抹掉明文而不是跳过整个文件（跳过会导致恢复后缺文件、界面报配置缺失）。
