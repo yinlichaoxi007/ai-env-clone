@@ -1,12 +1,15 @@
-"""DPI 适配与备份内容区/主窗高度统一单元测试。
+"""DPI 适配与备份内容区/主窗高度单元测试。
 
 覆盖两点：
 1. 进程 DPI 感知声明（Windows Per-Monitor v2）不抛异常，确保高分屏
    （缩放 > 100%）下 tk 几何/字体缩放与系统一致，窗口相对屏幕大小
    恒定、不再被虚化放大导致显示不全。
-2. 备份内容区（canvas）高度统一为固定值 285（不贴合 reqheight，与项数无关），
-   切换工具时内容区高度不变；主窗口总高固定为屏幕高度的 75%（与内容无关），
-   三工具完全一致——修复"主窗总高随内容自动变化、三工具不一致"的问题。
+2. 备份内容区（canvas）在**量不到窗口可用高度**时（headless / 未映射）
+   退回自然高度 285，不随内容 reqheight 变化——这条是「三工具观感一致」
+   的兜底契约。真实窗口下的等比缩放与按需滚动条行为另见
+   ``tests/test_window_fit.py``。
+3. 首次打开的默认窗口高度 = 屏幕高 × 0.75（``TestDefaultWindowHeight``），
+   与内容多少、工具类型都无关，且按比例取值故任意 DPI 缩放下占屏恒定。
 """
 import os
 import sys
@@ -70,13 +73,9 @@ class TestFitLayoutCaps(unittest.TestCase):
             canvas_h = int(app._canvas.cget("height"))
             self.assertEqual(canvas_h, 285,
                              "canvas 高度应统一为固定值 285，与项数/请求高度无关")
-            # 主窗口总高应封顶到屏 75% 以内（headless 下 geometry 不生效，
-            # win_h 恒为 560；实机下 geometry 生效、固定为 screen*0.75）。
-            # 此处只断言封顶（<=），实机统一高度由用户截图确认。
-            geo = root.geometry().split("+")[0]
-            wh = int(geo.split("x")[1])
-            self.assertLessEqual(wh, int(1080 * 0.75),
-                                 "主窗口总高应封顶到屏 75% 以内")
+            # 主窗口默认高度（屏幕比例取值 / 三工具一致 / DPI 无关）见
+            # TestDefaultWindowHeight——那里用注入的屏幕高做精确断言，
+            # 不依赖运行测试这台机器的真实分辨率。
         finally:
             app._cancel_after()
             root.destroy()
@@ -112,6 +111,135 @@ class TestFitLayoutCaps(unittest.TestCase):
         try:
             self.assertEqual(int(app._canvas.cget("height")), 285,
                              "canvas 初始高度必须固定为 285")
+        finally:
+            app._cancel_after()
+            root.destroy()
+
+
+class TestDefaultWindowHeight(unittest.TestCase):
+    """首次打开的默认窗口高度 = 屏幕高的固定比例（三工具一致、与 DPI 无关）。
+
+    历史教训：曾把默认高度做成「贴合内容自然高」，结果内容少的工具（如 Qoder）
+    默认窗口过矮、观感与其它工具不一致。现契约：默认高度只取决于屏幕高度，
+    与内容多少、工具类型都无关；内容装不下时由内容区自己的滚动条承载
+    （滚动与等比缩放行为见 ``tests/test_window_fit.py``）。
+    """
+
+    def _make_app(self):
+        import tkinter as tk
+        from ai_env_clone.__main__ import QoderBackupApp
+
+        # 隔离真实数据目录：本用例只关心窗口几何，不需要扫描本机产品数据。
+        fake_root = os.path.join(ROOT, "tests", "_fake_data_root")
+        with mock.patch("ai_env_clone.__main__._load_last_tool", return_value=None), \
+             mock.patch("ai_env_clone.__main__._save_last_tool", return_value=None), \
+             mock.patch.object(QoderBackupApp, "_detect_root",
+                               return_value=fake_root):
+            root = tk.Tk()
+            root.withdraw()
+            app = QoderBackupApp(root)
+        return root, app
+
+    def _autosize_with(self, app, root, screen, natural_h=None):
+        """以注入的屏幕高（可再注入内容自然高）跑一次 autosize，返回设入的高度。"""
+        captured = []
+        with mock.patch.object(root, "winfo_screenheight", return_value=screen), \
+             mock.patch.object(root, "geometry",
+                               side_effect=lambda *a: captured.append(a[0])):
+            if natural_h is None:
+                app._autosize_window()
+            else:
+                # 刻意注入内容自然高：断言默认高度**不受**它影响
+                with mock.patch.object(root, "winfo_reqheight",
+                                       return_value=natural_h):
+                    app._autosize_window()
+        self.assertTrue(captured, "autosize 应至少设置一次 geometry")
+        return int(captured[-1].split("x")[1])
+
+    def test_default_height_is_fraction_of_screen(self):
+        """默认高 = 屏幕高 × _WINDOW_H_DEFAULT_RATIO（比例恒定 → 任意 DPI 一致）。"""
+        root, app = self._make_app()
+        try:
+            for screen in (768, 1080, 1440, 2160):
+                got = self._autosize_with(app, root, screen)
+                self.assertEqual(
+                    got, int(screen * m._WINDOW_H_DEFAULT_RATIO),
+                    "屏幕 %dpx 时默认高度应为屏高的固定比例" % screen,
+                )
+        finally:
+            app._cancel_after()
+            root.destroy()
+
+    def test_default_height_independent_of_content(self):
+        """与内容多少无关：内容自然高从 320 到 5000 得到同一默认高度。"""
+        root, app = self._make_app()
+        try:
+            heights = {
+                self._autosize_with(app, root, 1080, natural_h=nat)
+                for nat in (320, 700, 5000)
+            }
+            self.assertEqual(
+                len(heights), 1,
+                "默认高度不应随内容自然高变化（三工具一致）：%r" % sorted(heights),
+            )
+        finally:
+            app._cancel_after()
+            root.destroy()
+
+    def test_default_height_floored_on_tiny_screen(self):
+        """屏幕极矮时退到下限，保证操作区仍可用。"""
+        root, app = self._make_app()
+        try:
+            got = self._autosize_with(app, root, 500)  # 500*0.75=375 < _WINDOW_H_MIN
+            self.assertEqual(got, m._WINDOW_H_MIN)
+        finally:
+            app._cancel_after()
+            root.destroy()
+
+    def test_default_height_never_exceeds_hard_cap(self):
+        """任何屏幕高下都不越过硬上限（防被任务栏 / 屏幕边缘遮挡）。"""
+        root, app = self._make_app()
+        try:
+            for screen in (600, 1080, 4320):
+                got = self._autosize_with(app, root, screen)
+                self.assertLessEqual(got, int(screen * m._WINDOW_H_SCREEN_RATIO))
+        finally:
+            app._cancel_after()
+            root.destroy()
+
+    def test_default_height_identical_across_tools(self):
+        """各工具默认高度完全一致：逐个切换工具，同一屏幕高下取值相同。"""
+        root, app = self._make_app()
+        try:
+            fake_root = os.path.join(ROOT, "tests", "_fake_data_root")
+            heights = {}
+            with mock.patch.object(type(app), "_detect_root",
+                                   return_value=fake_root), \
+                 mock.patch("ai_env_clone.__main__._save_last_tool",
+                            return_value=None):
+                for disp in list(app._tool_display.keys()):
+                    app.tool_var.set(disp)
+                    app._on_switch_tool()
+                    heights[disp] = self._autosize_with(app, root, 1080)
+            self.assertGreaterEqual(len(heights), 2, "至少应覆盖两个工具")
+            self.assertEqual(
+                len(set(heights.values())), 1,
+                "各工具默认高度必须完全一致：%r" % heights,
+            )
+        finally:
+            app._cancel_after()
+            root.destroy()
+
+    def test_autosize_only_on_first_build(self):
+        """常规重排（autosize=False）不改窗口尺寸——用户手调过的尺寸不被弹回。"""
+        root, app = self._make_app()
+        try:
+            captured = []
+            with mock.patch.object(root, "geometry",
+                                   side_effect=lambda *a: captured.append(a[0])):
+                app._fit_layout()
+                app._fit_layout(autosize=False)
+            self.assertEqual(captured, [], "非首次构建的重排不得改写 geometry")
         finally:
             app._cancel_after()
             root.destroy()

@@ -4,8 +4,10 @@
 均不可靠（withdraw 窗口不真正映射），故本测试：
 - 直接 mock 内容请求高度与 _detect_max_h，验证「内容超过最大高度才显示
   滚动条、否则收起」的分支逻辑（实机下 winfo_reqheight 准确）；
-- 用 winfo_manager()（headless 下仍可靠）判断 scrollbar 是否被 pack
-  （"pack"=显示，""=已 pack_forget 收起）。
+- 用 winfo_manager()（headless 下仍可靠）判断 scrollbar 是否被 grid
+  （"grid"=显示，""=已 grid_remove 收起）。识别区已从 pack(side=LEFT) 改为
+  grid：pack 下 canvas 只按请求宽（tk.Canvas 默认 378px）占位，识别区只用掉
+  面板一半宽度、长路径行右侧被裁。
 """
 import os
 import sys
@@ -43,7 +45,8 @@ def _fake_roots(n):
 
 
 def _packed(sb):
-    return sb.winfo_manager() == "pack"
+    """滚动条是否处于「显示」状态（识别区用 grid 布局，收起即 grid_remove）。"""
+    return sb.winfo_manager() == "grid"
 
 
 class TestDetectRowsScroll(unittest.TestCase):

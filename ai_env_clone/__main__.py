@@ -53,6 +53,38 @@ from ai_env_clone.core import (
 APP_TITLE_TPL = "%s 备份迁移工具"  # % (tool_display_name,)
 BROWSER_TITLE_TPL = "还原备份/快照"
 
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    """把 ``v`` 夹到 ``[lo, hi]``（弹性高度的上下限保护）。"""
+    return lo if v < lo else (hi if v > hi else v)
+
+
+# --------------------------------------------------------------------------- #
+# 布局常量：主窗口高度自适应（见 QoderBackupApp._relayout）
+# --------------------------------------------------------------------------- #
+#: 备份项列表区的弹性高度范围（px）。自然值 = 默认观感高度；窗口富余时按比例
+#: 向上放大（上限避免一屏只剩列表），窗口不足时按比例向下收缩（下限保证仍能
+#: 看清约 4~5 行），再不足则由内容区竖向滚动条兜底。
+_LIST_H_NATURAL = 285
+_LIST_H_MIN = 150
+_LIST_H_MAX = 560
+#: 数据导入说明区（只读文本）的弹性行数范围。基准 4 行，随窗口高度在 2~8 行间伸缩。
+_IMP_ROWS_NATURAL = 4
+_IMP_ROWS_MIN = 2
+_IMP_ROWS_MAX = 8
+#: 主窗口**首次打开**时的默认高度 = 屏幕高的该比例。用「比例」而非固定像素，
+#: 因此任意 DPI 缩放（100% / 125% / 150% …）下窗口占屏幕的视觉比例恒定；
+#: 三工具（Qoder / CodeBuddy / Reasonix …）默认高度完全一致，不随内容多少变化
+#: ——内容少的工具不会出现「窗口缩成一小条」的观感。之后窗口尺寸完全由用户
+#: 与窗口管理器控制（见 `_autosize_window`）。
+_WINDOW_H_DEFAULT_RATIO = 0.75
+#: 硬上限保护：任何情况下默认高度都不超过屏幕高的该比例（避免被任务栏/屏幕
+#: 边缘遮挡）。当前 `_WINDOW_H_DEFAULT_RATIO < _WINDOW_H_SCREEN_RATIO`，此项
+#: 只在将来调大默认比例时起兜底作用。
+_WINDOW_H_SCREEN_RATIO = 0.92
+#: 默认高度的下限（px）：屏幕极矮时也要保证操作区可用。
+_WINDOW_H_MIN = 460
+
 # 无头开关：单元测试置 True 时隐藏备份浏览器子窗口，避免测试闪窗（仅影响测试）。
 HEADLESS = False
 
@@ -106,8 +138,18 @@ class QoderBackupApp:
         self.root = root
         # 宽度固定、高度动态：初始仅给个合理高度，构建完成后由 _fit_layout()
         # 按实际内容自适应（保证状态栏等完整区域始终可见，不写死过大/过小）。
-        root.geometry("960x560")
-        root.minsize(940, 460)
+        # 宽度按屏幕宽收窄：常规屏 960，窄屏（如 1024/800）不让窗口超出屏幕，
+        # 下限 720 —— 再窄时内容区会出现横向滚动条兜底，被挤出的部分仍可查看。
+        try:
+            _sw = int(root.winfo_screenwidth())
+        except Exception:
+            _sw = 1280
+        _init_w = max(720, min(960, _sw - 80))
+        root.geometry("%dx560" % _init_w)
+        # 最小宽度只保证主要按钮行排得开，**不再按内容请求宽卡死 940**：
+        # 需要更窄时，内容区自动出现横向滚动条（各区域内容完整可查看），
+        # 否则小屏用户既拖不窄、又被裁掉右侧，反而没法用。
+        root.minsize(min(680, _init_w), 460)
 
         # 工具切换下拉列出所有已注册适配器（新增适配器后自动出现）。
         # 默认工具：优先沿用用户上次选择（缓存），无缓存/失效时按注册顺序取第一个。
@@ -126,10 +168,17 @@ class QoderBackupApp:
         self._worker: threading.Thread | None = None
 
         self._after_id = None
+        # DSH 修复完成后自动复检的那一次 after：**必须单独记住句柄**，否则窗口
+        # 在它触发前被关闭 ⇒ Tk 报 "invalid command name ..._dsh_check"（实测残留
+        # 噪音就是这么来的）。_after_id 被 _drain_queue 自己占用，不能复用。
+        self._dsh_check_job = None
         self._build_ui()
         self._refresh_items()
         self._refresh_uid_combo()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # 兜底：无论窗口被谁销毁（关窗 / 外部 destroy / 测试拆卸），都清掉待触发的
+        # after 回调，避免 Tk 报 "invalid command name ..." 噪音（见 _on_root_destroy）。
+        self.root.bind("<Destroy>", self._on_root_destroy, add="+")
         self._after_id = self.root.after(80, self._drain_queue)
 
     # ------------------------------------------------------------------ UI --
@@ -168,11 +217,138 @@ class QoderBackupApp:
         # 仅特定工具显示的行（DSH 会话健康行 / Qoder 历史诊断行）随工具刷新
         self._update_tool_rows_visibility()
 
+    # ------------------------------------------------------- 内容区滚动容器 --
+    def _build_scroll_body(self) -> None:
+        """构建内容区滚动容器（canvas + 按需竖向滚动条）与内嵌内容 frame。
+
+        除进度条与状态栏外的全部区域都挂在 ``self.content`` 下：
+
+        - 窗口高度不足时，canvas 只呈现可视部分，内容超出即出现竖向滚动条，
+          因此再矮的窗口也不会「底部被裁掉且无法看到」；
+        - 窗口高度富余时，``_relayout()`` 把多出的高度按比例分给有弹性余量的
+          区域（备份列表区、数据导入说明区），界面铺满、不留大片空白。
+
+        内嵌窗口的宽度始终跟随 canvas 可视宽度（否则内容会被压成一条竖线）。
+        """
+        body_outer = ttk.Frame(self.root)
+        body_outer.grid(row=0, column=0, sticky="nsew")
+        body_outer.rowconfigure(0, weight=1)
+        body_outer.columnconfigure(0, weight=1)
+
+        self._content_canvas = tk.Canvas(body_outer, highlightthickness=0)
+        self._content_sb = ttk.Scrollbar(
+            body_outer, orient="vertical", command=self._content_canvas.yview
+        )
+        # 横向兜底滚动条：内容请求宽度大于可视宽度时出现（例如某行的说明文字 /
+        # 按钮组在最窄窗口下排不开）。窗宽通常远大于内容请求宽，故极少出现；
+        # 一旦出现，保证被挤出的部分仍可横向看到，而不是「显示不全且无从查看」。
+        self._content_hsb = ttk.Scrollbar(
+            body_outer, orient="horizontal", command=self._content_canvas.xview
+        )
+        self._content_canvas.configure(
+            yscrollcommand=self._content_sb.set,
+            xscrollcommand=self._content_hsb.set,
+        )
+        self._content_canvas.grid(row=0, column=0, sticky="nsew")
+        # 滚动条先占位再 grid_remove：内容完整可见时不显示、也不留白条；
+        # 需要时再 grid() 放回（见 _relayout）。
+        self._content_sb.grid(row=0, column=1, sticky="ns")
+        self._content_sb.grid_remove()
+        self._content_hsb.grid(row=1, column=0, sticky="ew")
+        self._content_hsb.grid_remove()
+        self._content_scrollable = False
+        self._content_hscrollable = False
+        # 弹性布局的两个缓存（见 _measure_fixed / _invalidate_fixed）：
+        # _fixed_cache = 「非弹性部分」总高；_fixed_cache_w = 量它时的可视宽。
+        # 初值 -1 保证首次重排必定走一次完整测量。
+        self._fixed_cache = None
+        self._fixed_cache_w = -1
+        # 跟随内容区宽度自动折行的「长说明」label（按钮下方的用途说明等），
+        # 构建时 append，宽度变化时由 _sync_hint_wrap 统一更新 wraplength。
+        self._hint_labels: list = []
+
+        self.content = ttk.Frame(self._content_canvas)
+        self._content_canvas.create_window(
+            (0, 0), window=self.content, anchor="nw", tags="__ct__"
+        )
+        self.content.bind(
+            "<Configure>",
+            lambda e: self._content_canvas.configure(
+                scrollregion=self._content_canvas.bbox("all")
+            ),
+        )
+
+        def _sync_content_width(evt=None):
+            """内嵌内容窗口宽度 = max(可视宽, 内容请求宽)，并据此显隐横向滚动条。
+
+            宽度**不做上限裁剪**：把内嵌窗口压得比内容请求宽更窄，只会让各区域
+            按 pack 顺序把排在最后的控件挤出可视区（表现为「右侧显示不全」）。
+            这里反过来——需要多宽就给多宽，超出可视宽的部分交给横向滚动条。
+
+            返回**「折行宽是否因此失效」**：折行宽是按内容区**实际宽**算的，只有当
+            实际宽将随本次设置而改变时才需要重刷。用「实际宽 vs 目标宽」比较，
+            而不是用「内嵌窗宽度有没有被改写」——竖向滚动条一显隐，内嵌窗宽度
+            会从旧可视宽改到新可视宽（内容区实际宽其实没变），按前者判会白多刷
+            一次整屏（实测单次 700~1100ms）。
+            """
+            w = self._content_canvas.winfo_width()
+            if w <= 1:
+                return False
+            try:
+                req = self.content.winfo_reqwidth()
+            except Exception:
+                req = 0
+            try:
+                actual = int(self.content.winfo_width())
+            except Exception:
+                actual = 0
+            target = max(w, req)
+            self._content_canvas.itemconfig("__ct__", width=target)
+            self._set_hscroll(req > w + 1)
+            return actual > 1 and abs(actual - target) > 0.5
+
+        self._content_canvas.bind("<Configure>", _sync_content_width)
+        self._sync_content_width = _sync_content_width
+
+        # 滚轮：仅在内容区确实超出可视高时才接管。鼠标落在自带滚动能力的控件上
+        # （备份项列表 canvas / 识别结果 canvas / 导入说明 Text）时放行，交给它们
+        # 各自处理，避免「外层抢走滚轮、内层滚不动」。
+        def _on_content_wheel(event):
+            if not self._content_scrollable:
+                return
+            if isinstance(
+                event.widget, (tk.Text, tk.Listbox, tk.Canvas, ttk.Treeview)
+            ):
+                return
+            if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+                delta = -1
+            else:
+                delta = 1
+            self._content_canvas.yview_scroll(delta, "units")
+            return "break"
+
+        self._on_content_wheel = _on_content_wheel
+        self.root.bind("<MouseWheel>", _on_content_wheel)
+        self.root.bind("<Button-4>", _on_content_wheel)
+        self.root.bind("<Button-5>", _on_content_wheel)
+
     def _build_ui(self) -> None:
         pad = {"padx": 12, "pady": 6}
 
+        # 根布局改用 grid 分三行：内容区（row 0，吸收全部剩余高度）/ 进度条 / 状态栏。
+        # 之前全用 pack：pack 在空间不足时是「按顺序砍掉排在后面的控件」——进度条与
+        # 状态栏正好排在最后，于是窗口一调矮就先被裁掉看不见。grid 的 row 0 带
+        # weight=1 且 minsize=0，剩余高度先满足 row 1/2 的请求高度，再分给 row 0，
+        # 因此底部两行在任何窗口高度下都完整可见；内容区自身超出部分由滚动条承载。
+        self.root.rowconfigure(0, weight=1, minsize=0)
+        self.root.rowconfigure(1, weight=0)
+        self.root.rowconfigure(2, weight=0)
+        self.root.columnconfigure(0, weight=1)
+
+        self._build_scroll_body()
+
         # 工具切换：维护者实现新适配器后，下拉即可切换当前 AI 工具
-        tool_row = ttk.Frame(self.root)
+        tool_row = ttk.Frame(self.content)
         tool_row.pack(fill=tk.X, padx=12, pady=(6, 0))
         ttk.Label(tool_row, text="AI 工具：").pack(side=tk.LEFT)
         self.tool_var = tk.StringVar(value=self.adapter.display_name)
@@ -189,7 +365,7 @@ class QoderBackupApp:
 
         # 数据目录
         self.dir_frame = ttk.LabelFrame(
-            self.root, text="%s 数据目录" % self.adapter.display_name
+            self.content, text="%s 数据目录" % self.adapter.display_name
         )
         self.dir_frame.pack(fill=tk.X, **pad)
         self.root_var = tk.StringVar(value=self.root_dir)
@@ -244,11 +420,19 @@ class QoderBackupApp:
             yscrollcommand=self.detect_rows_sb.set
         )
 
-        # 内嵌窗口宽度跟随 canvas 可视宽，否则内容被压成竖线
+        # 内嵌窗口宽度跟随 canvas 可视宽，否则内容被压成竖线；
+        # 同时把各行的折行宽度同步过去——数据根的相对路径可能很长，不折行
+        # 就会被 canvas 裁掉右半（canvas 只有竖向滚动，横向不会自动换行）。
         def _sync_detect_width(evt=None):
             w = self.detect_rows_canvas.winfo_width()
             if w > 1:
                 self.detect_rows_canvas.itemconfig("__drf__", width=w)
+                wrap = max(160, w - 6)
+                for child in self.detect_rows_frame.winfo_children():
+                    try:
+                        child.configure(wraplength=wrap)
+                    except Exception:
+                        pass
 
         self.detect_rows_canvas.bind("<Configure>", _sync_detect_width)
         self._sync_detect_width = _sync_detect_width
@@ -294,10 +478,16 @@ class QoderBackupApp:
         # 滚轮以「行」为单位平滑滚动（值=单行高），小幅超限也能逐行滚动手感自然
         self.detect_rows_canvas.configure(yscrollincrement=line_h)
         # canvas 高度自适应：刷新时设为 min(内容高, 最大两行高)，不固定为两行。
-        # 不要 expand=True，否则父容器若有额外垂直空间会把 canvas 拉高。
         self.detect_rows_canvas.configure(height=self._detect_max_h)  # 初始默认两行高，刷新时再按内容收
-        self.detect_rows_canvas.pack(side=tk.LEFT, fill=tk.X)
-        self.detect_rows_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        # 布局用 grid（而非 pack(side=LEFT)）：pack 下 canvas 只按**请求宽**占位，
+        # 而 tk.Canvas 的默认请求宽只有 378px —— 结果是识别区只用了面板一半宽度，
+        # 长路径行右侧被裁（实测：可见宽 378 / 可用 895）。grid + column weight=1
+        # 让 canvas 横向撑满，宽度由 detect_body 决定。高度仍由 configure(height=…)
+        # 控制，故不会因额外垂直空间被拉高（原来不用 expand 的顾虑在此不存在）。
+        self.detect_body.columnconfigure(0, weight=1)
+        self.detect_rows_canvas.grid(row=0, column=0, sticky="ew")
+        self.detect_rows_sb.grid(row=0, column=1, sticky="ns")
+        self.detect_rows_sb.grid_remove()  # 默认收起，内容溢出时才显示
         # detect_body 紧跟 summary 之后垂直堆叠（grid row=1，与 summary row=0 严格按序）
         self.detect_body.grid(row=1, column=0, sticky="ew")
         # 当前登录用户 UID（记忆区默认备份对象，下拉切换）
@@ -348,12 +538,16 @@ class QoderBackupApp:
             variable=self.dsh_fix_dup_var,
         )
         self.dsh_fix_dup_check.pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Label(
-            health_row,
+        # 说明文字另起一行：与三个按钮挤在同一行时整行请求宽达 1122px（可用仅 899），
+        # 末位说明被挤出可视区。独立成行后独占宽度、按宽度自动折行。
+        dsh_hint = ttk.Label(
+            self.dsh_health_frame,
             text="检测 DSH 会话是否「未分组」（磁盘存在但索引未登记）或属旧格式无法加载"
             "（扁平 replayState / 同一步重复调用 ID）",
-            foreground="#666",
-        ).pack(side=tk.LEFT, padx=(8, 0))
+            foreground="#666", anchor="w", justify="left", wraplength=760,
+        )
+        dsh_hint.pack(fill=tk.X, pady=(4, 0))
+        self._hint_labels.append(dsh_hint)
         # 默认隐藏；选中 dsh 工具时由 _update_dsh_health_visibility 显示
         # 是否已检测且存在未分组会话：None=未检测、True/False=已检测结论，
         # 供修复按钮置灰判断（无未分组会话时禁用，避免无谓点击）。
@@ -364,26 +558,31 @@ class QoderBackupApp:
         # （Electron，数据根 %APPDATA%/com.qodercn.app.stable，会话主库 main.sqlite），
         # 旧数据在 ~/.qoder-cn；应用内「导入旧版数据」只搬它认识的那部分，
         # 常见「导入成功但历史仍不可见」。此处给出结构化诊断（见 adapters.qoder.diagnose_history）。
-        self.qoder_diag_frame = ttk.LabelFrame(self.root, text="历史会话诊断")
+        self.qoder_diag_frame = ttk.LabelFrame(self.content, text="历史会话诊断")
         diag_row = ttk.Frame(self.qoder_diag_frame)
         diag_row.pack(fill=tk.X, pady=(2, 0))
         self.qoder_diag_btn = ttk.Button(
             diag_row, text="检测历史会话", command=self._qoder_diag, width=14
         )
         self.qoder_diag_btn.pack(side=tk.LEFT)
-        ttk.Label(
-            diag_row,
+        # 说明文字另起一行：原先与按钮挤在同一行时整行请求宽达 1016px（可视仅 939），
+        # 于是内容区常年出现横向滚动条、右侧被挤出可视区；且每次切换工具宽度都要在
+        # 「够/不够」之间反复，白多刷一遍整屏。独立成行后按宽度自动折行。
+        qoder_hint = ttk.Label(
+            self.qoder_diag_frame,
             text="诊断「新版导入数据后仍看不到历史会话」：对比新旧两处数据根"
             "（新版 main.sqlite / 旧版 local.db）与导入账本，给出成因结论",
-            foreground="#666",
-        ).pack(side=tk.LEFT, padx=(8, 0))
+            foreground="#666", anchor="w", justify="left", wraplength=760,
+        )
+        qoder_hint.pack(fill=tk.X, pady=(4, 0))
+        self._hint_labels.append(qoder_hint)
         self.qoder_diag_frame.pack_forget()
 
         # 备份内容
-        # mid 不 expand：高度由内部（bar + 锁高 inner 285）自然决定，不吸收主窗
-        # 剩余竖向空间——否则识别区较矮的 qoder 会把大量空白灌到 mid 内 inner
-        # 下方，显得「列表区高度偏大」。mid 自然高三工具一致（inner 锁 285）。
-        mid = ttk.LabelFrame(self.root, text="备份内容（勾选即生效）")
+        # mid 不 expand：本区域的高度弹性由内部 inner 的**显式高度**承担
+        # （_relayout 按窗口可用高度在 MIN_LIST_H~MAX_LIST_H 之间设定），
+        # 不依赖 pack 的 expand 分配——那样在窗口变矮时只会被裁而不收缩。
+        mid = ttk.LabelFrame(self.content, text="备份内容（勾选即生效）")
         mid.pack(fill=tk.X, expand=False, **pad)
         self._mid = mid
 
@@ -417,23 +616,22 @@ class QoderBackupApp:
             side=tk.LEFT, padx=8
         )
 
-        # 锁高容器 inner：ttk.Frame 尊重 height 配置，pack_propagate(False) +
-        # expand=False 后高度严格锁定 285，不吸收 mid 多余竖向空间（否则 expand
-        # 分配的额外空间会覆盖锁定高度、把 canvas 撑大）；canvas 在其中 fill=BOTH
-        # 横向撑满（解决说明列被压到靠左）+ 纵向占满固定的 285，三工具一致。
+        # 锁高容器 inner：ttk.Frame 尊重 height 配置，pack_propagate(False) 后高度
+        # 严格等于显式设定值（既不吸收 mid 的多余空间，也不会被内容请求高度撑大）。
+        # 这个高度就是本界面最主要的**弹性高度**：_relayout 按窗口可用高度在
+        # _LIST_H_MIN~_LIST_H_MAX 之间设定它——窗口调大则列表区同步变大（一屏能看
+        # 到更多备份项），调小则同步收缩，为下方区域让出空间。
         inner = ttk.Frame(mid)
         inner.pack(fill=tk.X, expand=False, padx=8, pady=4)
         inner.pack_propagate(False)
-        inner.configure(height=285)
+        inner.configure(height=_LIST_H_NATURAL)
         self._list_inner = inner
 
         canvas = tk.Canvas(inner, highlightthickness=0)
-        # 初始即固定高度：避免 pack(fill=BOTH, expand) 在 _fit_layout 设高前
-        # 把 canvas 撑成 list_frame 的请求高度（CodeBuddy 项多可达 500+），
-        # 导致 mid/主窗随内容变高、三工具主窗高度不一致。固定后 mid 自然高
-        # 三工具一致，统一观感由 _fit_layout 把主窗总高定到屏 3/4 收口。
-        canvas.configure(height=285)
-        # 高度动态：内容少时收缩、内容多时给足并启用滚动条（见 _fit_layout）。
+        # 显式给初始高度：避免 pack(fill=BOTH, expand) 在 _relayout 设高前把 canvas
+        # 撑成 list_frame 的请求高度（CodeBuddy 项多可达 500+），导致 mid/主窗随内容
+        # 变高、三工具观感不一致。
+        canvas.configure(height=_LIST_H_NATURAL)
         sb = ttk.Scrollbar(inner, orient="vertical", command=canvas.yview)
         # 备份项列表：每行一个 Frame，内部左=勾选+标题(权重3) / 右=说明(权重7)，
         # 同行 grid 保证标题与说明行严格对齐（双独立列堆叠会导致累计错位）。
@@ -465,15 +663,39 @@ class QoderBackupApp:
         self._wrap_labels: list = []  # 说明列 Label，随宽度自动换行
 
         # canvas 在 inner 内 fill=BOTH：横向撑满 inner 宽（说明列不靠左），
-        # 纵向占满 inner 锁定的 285，三工具列表区高度严格一致。
+        # 纵向占满 inner 锁定/弹性设定的高度。
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 0), pady=0)
         sb.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 0), pady=0)
+
+        # 列表区滚轮：内容超出一屏时，鼠标停在列表任意位置都能滚动列表自身；
+        # 未超出则放行给外层内容区滚动（否则鼠标一进列表区，外层就滚不动了）。
+        # Tk 的 <MouseWheel> 不会从子 widget 自动传播，故 canvas 与逐行控件都要绑。
+        def _on_list_wheel(event):
+            try:
+                box = canvas.bbox("all")
+            except Exception:
+                box = None
+            if not box or (box[3] - box[1]) <= canvas.winfo_height():
+                return
+            if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+                delta = -1
+            else:
+                delta = 1
+            canvas.yview_scroll(delta, "units")
+            return "break"
+
+        self._on_list_wheel = _on_list_wheel
+        for _w in (canvas, self.list_frame):
+            _w.bind("<MouseWheel>", _on_list_wheel)
+            _w.bind("<Button-4>", _on_list_wheel)
+            _w.bind("<Button-5>", _on_list_wheel)
 
         # 数据导入：在**当前所选工具**的备份窗口内，提示「可导入的软件 + 版本 +
         # 数据范围 + 状态」，并提供导入入口（把其它软件的会话以本工具原生格式写出）。
         # 内容随工具切换刷新（见 _refresh_import_matrix）。
         self.imp_frame = ttk.LabelFrame(
-            self.root, text="数据导入（把其它软件的会话导入到「%s」）" % self.adapter.display_name
+            self.content,
+            text="数据导入（把其它软件的会话导入到「%s」）" % self.adapter.display_name,
         )
         self.imp_frame.pack(fill=tk.X, **pad)
 
@@ -491,9 +713,11 @@ class QoderBackupApp:
 
         imp_body = ttk.Frame(self.imp_frame)
         imp_body.pack(fill=tk.X, padx=8, pady=(0, 8))
-        # 只读 Text：固定 4 行高 + 滚动条，避免来源条目多时把主窗口撑高。
+        # 只读 Text：行数随窗口高度弹性伸缩（_relayout 在 _IMP_ROWS_MIN~MAX 之间
+        # 设定），默认 4 行；自带滚动条，不因来源条目多而把主窗口撑高。
         self.imp_text = tk.Text(
-            imp_body, height=4, wrap="word", relief=tk.FLAT, highlightthickness=0,
+            imp_body, height=_IMP_ROWS_NATURAL, wrap="word", relief=tk.FLAT,
+            highlightthickness=0,
             background=self.root.cget("background"), cursor="arrow",
         )
         imp_sb = ttk.Scrollbar(imp_body, orient="vertical", command=self.imp_text.yview)
@@ -508,7 +732,7 @@ class QoderBackupApp:
         self.imp_text.configure(state="disabled")
 
         # 选项
-        opt = ttk.LabelFrame(self.root, text="选项")
+        opt = ttk.LabelFrame(self.content, text="选项")
         opt.pack(fill=tk.X, **pad)
         # 恢复默认：把选项区域各参数复位到初始默认值，防用户改乱后无从恢复
         btn_row = ttk.Frame(opt)
@@ -538,12 +762,16 @@ class QoderBackupApp:
         ttk.Checkbutton(
             orow, text="恢复前生成回滚快照", variable=self.rollback_var
         ).pack(side=tk.LEFT, padx=16)
+        # 第二行：整齐排开剩余选项，避免全部挤在一行后被挤出可视区（实测一行
+        # 8 个控件的请求宽 943 > 可用 899，「压缩方式」下拉被压窄、右侧显示不全）。
+        orow2 = ttk.Frame(opt)
+        orow2.pack(fill=tk.X, padx=8, pady=(0, 8))
         # 严格校验模式：即使带清单也强制扫描内部结构指纹，防伪造声明文件
         self.strict_var = tk.BooleanVar(value=False)
         strict_cb = ttk.Checkbutton(
-            orow, text="严格校验模式", variable=self.strict_var
+            orow2, text="严格校验模式", variable=self.strict_var
         )
-        strict_cb.pack(side=tk.LEFT, padx=8)
+        strict_cb.pack(side=tk.LEFT)
         _Tooltip(
             strict_cb,
             "勾选后，即使压缩包带有声明文件，也会强制扫描内部数据结构指纹并"
@@ -554,9 +782,9 @@ class QoderBackupApp:
         # 并尝试定位到敏感字段（如 apiKey / 令牌等）行，方便用户手动记录凭证。默认勾选。
         self.locate_sensitive_var = tk.BooleanVar(value=True)
         locate_cb = ttk.Checkbutton(
-            orow, text="备份后定位敏感文件", variable=self.locate_sensitive_var
+            orow2, text="备份后定位敏感文件", variable=self.locate_sensitive_var
         )
-        locate_cb.pack(side=tk.LEFT, padx=8)
+        locate_cb.pack(side=tk.LEFT, padx=16)
         _Tooltip(
             locate_cb,
             "勾选后（默认），若本次备份包含「含敏感凭证的项」（如 CodeBuddy 的"
@@ -567,16 +795,19 @@ class QoderBackupApp:
             "不跳行。\n不勾选则只弹出文字提醒，不自动打开文件。\n注意：备份包本身不含明文"
             "凭证，请务必在源机器记下、并在目标机器手动补填。",
         )
-        # 压缩方式：置于选项区域，与导出行为相关
-        ttk.Label(orow, text="压缩方式：").pack(side=tk.LEFT, padx=(8, 2))
+        # 压缩方式：置于选项区域，与导出行为相关。宽度按最长候选项实测取值
+        # （中文按 2 个字符宽估算），避免固定 width=26 时被挤窄导致文字显示不全。
+        ttk.Label(orow2, text="压缩方式：").pack(side=tk.LEFT, padx=(0, 2))
+        _cvals = list(self._compress_levels.keys())
+        _cwidth = max(10, max((len(v) * 2 for v in _cvals), default=10))
         self.compress_combo = ttk.Combobox(
-            orow, textvariable=self.compress_var, width=26, state="readonly"
+            orow2, textvariable=self.compress_var, width=_cwidth, state="readonly"
         )
-        self.compress_combo["values"] = list(self._compress_levels.keys())
+        self.compress_combo["values"] = _cvals
         self.compress_combo.pack(side=tk.LEFT)
 
         # 操作
-        act = ttk.Frame(self.root)
+        act = ttk.Frame(self.content)
         act.pack(fill=tk.X, **pad)
         ttk.Button(act, text="导出备份", command=self.on_export).pack(
             side=tk.LEFT, ipadx=14, ipady=4
@@ -586,82 +817,509 @@ class QoderBackupApp:
         )
 
         self.pbar = ttk.Progressbar(self.root, mode="determinate")
-        self.pbar.pack(fill=tk.X, padx=12)
+        self.pbar.grid(row=1, column=0, sticky="ew", padx=12)
         self.status = ttk.Label(
             self.root, text="就绪", relief=tk.SUNKEN, anchor=tk.W, padding=4
         )
-        self.status.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status.grid(row=2, column=0, sticky="ew")
 
         # 构建完成后按实际内容自适应窗口高度（保证状态栏等完整区域默认可见）
         self._refresh_import_matrix()
-        self._fit_layout()
-        # dsh 工具显示「会话健康」行；其他工具隐藏（含 Qoder 历史诊断行）
+        # 行显隐先定，再自适应高度——否则按含隐藏行的高度算出来的窗口高会偏大
         self._update_tool_rows_visibility()
+        self._fit_layout(autosize=True)
+        # 首次重排发生在窗口映射之前（那时量不到可用高度），故窗口尺寸定下来后
+        # 再排一次：让首屏**一次到位**落到最终布局，而不是先摆一版、几十毫秒后
+        # 再跳一次（那一跳肉眼可见，也容易被当成「界面还没稳定」）。
+        self._fit_layout()
+        # 窗口尺寸变化（用户拖动 / 最大化 / 不同分辨率屏幕）时重排内容区：
+        # 富余则按比例放大各弹性区域，不足则按比例压缩，压缩到底再出现竖向滚动条。
+        self.root.bind("<Configure>", self._on_root_configure)
 
     # ------------------------------------------------------------- helpers --
-    def _fit_layout(self) -> None:
-        """按实际内容自适应窗口高度与备份列表区高度，保证状态栏等完整区域可见。
+    def _avail_body_height(self) -> int:
+        """内容区（滚动容器）当前可视高度；量不到时返回 0（无头 / 尚未映射）。
 
-        - 备份列表区（canvas）：内容少则收缩、内容多则给足并启用滚动条，
-          不写死固定高度（避免内容少时大片空白、内容多时被裁剪）。
-        - 主窗口：构建完成后按各区块请求高度设定窗口高度（宽度不变），
-          不超出屏幕可用高度，确保默认即可看到窗口内全部区域。
-        HEADLESS 测试下同样安全（只计算几何、不弹出可见窗口）。
+        单独抽成方法便于测试注入：headless（窗口 withdraw）下 ``winfo_height``
+        恒为 1，无法反映真实窗口高度。
+        """
+        try:
+            h = int(self._content_canvas.winfo_height())
+        except Exception:
+            return 0
+        return h if h > 1 else 0
+
+    def _content_height(self) -> int:
+        """内嵌内容 frame 的请求高度（= 各区域按当前弹性尺寸排布后的总高）。
+
+        ⚠️ 父容器的请求高度是**惰性**的：改完子控件尺寸后不刷一次几何就读，
+        拿到的还是上一轮的值（实测叶子控件即时、父容器要等 idle）。故只在
+        ``_measure_fixed`` / ``_refresh_geometry`` 之后取值才有意义。
+        """
+        try:
+            return int(self.content.winfo_reqheight())
+        except Exception:
+            return 0
+
+    def _content_width(self) -> int:
+        """内容区当前可视宽度（量不到时 0）。
+
+        用滚动容器的宽度而不是内嵌 frame 的宽度**作为「宽度是否变化」的判据**：
+        竖向滚动条一出现，可视宽先变、内嵌宽后变，取前者更早发现变化、也避免
+        用「滚动条占位后再量、再判定」这类会自我循环的口径。
+        """
+        try:
+            w = int(self._content_canvas.winfo_width())
+        except Exception:
+            return 0
+        return w if w > 1 else 0
+
+    def _current_flex(self) -> tuple:
+        """从控件读回**当前生效**的弹性尺寸 (列表区像素高, 导入说明行数)。
+
+        不另存一份 Python 状态：控件值才是唯一事实来源，二者一旦不同步，
+        就会出现「以为没变、其实要重排」或反之的误判。
+        """
+        try:
+            list_h = int(self._list_inner.cget("height"))
+        except Exception:
+            list_h = _LIST_H_NATURAL
+        try:
+            rows = int(self.imp_text.cget("height"))
+        except Exception:
+            rows = _IMP_ROWS_NATURAL
+        return list_h, rows
+
+    def _invalidate_fixed(self) -> None:
+        """让「非弹性部分高度」缓存失效（内容结构变化后调用，下次重排重测）。
+
+        只在这两类时机需要：① 区域增减（换工具 / 识别行重填 / UID 区展开收起）；
+        ② 宽度变化（文案折行数变了）。**窗口高度变化时一律不需要**——这正是
+        拖动窗口能零重绘的关键。
+        """
+        self._fixed_cache = None
+        self._fixed_cache_w = -1
+
+    def _measure_fixed(self, fresh: bool = False) -> float:
+        """量出「非弹性部分」的总高度并缓存（默认内含一次几何刷新）。
+
+        非弹性高度 = 内容总高 − 当前两个弹性区的显式高度。因此**不必**先把
+        弹性区复位到自然值再量：复位那一下会让用户看见「先弹回自然尺寸、再压
+        回去」的中间态，正是拖动窗口时界面闪烁的来源。
+
+        ``fresh=True`` 表示调用方刚刚刷过几何且其后没有再改动任何影响高度的
+        东西，可直接读值——少刷一次就是少一次整屏重绘（实测单次 180~650ms）。
+        """
+        if not fresh:
+            self._refresh_geometry()
+        list_h, rows = self._current_flex()
+        h = self._content_height()
+        fixed = max(0.0, h - list_h - self._imp_block_px(rows))
+        self._fixed_cache = fixed
+        self._fixed_cache_w = self._content_width()
+        return fixed
+
+    def _imp_metrics(self) -> tuple:
+        """标定数据导入说明区的高度模型 ``(每行像素, 常量像素, 最小像素)``。
+
+        该区高度对行数**不是**纯线性：说明框里与文字并排放着一条竖向滚动条，
+        它的最小请求高度（实测 51px）在行数很少时会反过来决定整块高度——
+        实测 2 行与 3 行的高度**完全相同**，到第 4 行才开始随行数增长。只按
+        「行数 × 行高」线性建模，会在压缩到 2 行时低估该区约 20px，从而把竖向
+        滚动条误判出来（内容明明装得下却出现滚动条）。
+
+        故按 ``max(行数 × 每行 + 常量, 最小高)`` 三点标定：2 行取被最小高主导
+        的点、8 行取纯线性点，即可解出常量项。行高与 Text 自身内距直接量叶子
+        控件（即时值，不必刷几何）；整块的两个点各需一次刷新（父容器的请求高
+        是惰性值），故本方法只在首次调用时刷新两次，之后全程走缓存。
+        """
+        cached = getattr(self, "_imp_metrics_cache", None)
+        if cached:
+            return cached
+        row_px, pad, floor = 13.0, 70.0, 117.0
+        orig = None
+        try:
+            orig = int(self.imp_text.cget("height")) or _IMP_ROWS_NATURAL
+            self.imp_text.configure(height=2)
+            t2 = float(self.imp_text.winfo_reqheight())
+            self.imp_text.configure(height=8)
+            t8 = float(self.imp_text.winfo_reqheight())
+            row_px = max(1.0, (t8 - t2) / 6.0)
+            pad_text = t2 - 2.0 * row_px
+            self.imp_text.configure(height=2)
+            self._refresh_geometry()
+            h2 = float(self.imp_frame.winfo_reqheight())
+            self.imp_text.configure(height=8)
+            self._refresh_geometry()
+            h8 = float(self.imp_frame.winfo_reqheight())
+            if h8 > h2:
+                pad = (h8 - 8.0 * row_px - pad_text) + pad_text
+                floor = h2
+        except Exception:
+            pass
+        finally:
+            try:
+                if orig is not None:
+                    # 复原行数即回到调用前的状态；无需再刷几何（调用方紧接着
+                    # 就会按目标值重设尺寸）。
+                    self.imp_text.configure(height=orig)
+            except Exception:
+                pass
+        self._imp_metrics_cache = (row_px, pad, floor)
+        return self._imp_metrics_cache
+
+    def _imp_block_px(self, rows: float) -> float:
+        """数据导入说明区在给定行数下占用的像素高（含其滚动条的最小高度）。"""
+        row_px, pad, floor = self._imp_metrics()
+        return max(rows * row_px + pad, floor)
+
+    def _apply_flex(self, list_h: int, imp_rows: int) -> None:
+        """把两个弹性区域的显式尺寸设为给定值（列表区像素高 / 导入说明行数）。
+
+        值没变时直接返回：拖动窗口时绝大多数帧算出来的目标尺寸与当前一致
+        （尤其被上下限夹紧的区间），跳过可以省掉一次全内容区重排+重绘。
+        """
+        list_h = int(list_h)
+        imp_rows = int(imp_rows)
+        if (list_h, imp_rows) == self._current_flex():
+            return
+        try:
+            self._list_inner.configure(height=list_h)
+            self._canvas.configure(height=list_h)
+        except Exception:
+            pass
+        try:
+            self.imp_text.configure(height=imp_rows)
+        except Exception:
+            pass
+
+    def _bind_list_wheel(self, widget=None) -> None:
+        """递归给备份列表区内的控件绑定滚轮处理。
+
+        Tk 的 ``<MouseWheel>`` 不会从子 widget 冒泡到父容器，所以「鼠标停在
+        某一行的文字上滚不动」是必然的——必须逐层绑定。行是动态重建的，故每次
+        重建后统一重绑一次（控件量级很小，成本可忽略）。
+        """
+        handler = getattr(self, "_on_list_wheel", None)
+        if handler is None:
+            return
+        node = widget if widget is not None else getattr(self, "list_frame", None)
+        if node is None:
+            return
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                node.bind(seq, handler)
+            except Exception:
+                pass
+        try:
+            children = node.winfo_children()
+        except Exception:
+            return
+        for child in children:
+            self._bind_list_wheel(child)
+
+    def _target_flex(self, k: float) -> tuple:
+        """把缩放系数 k 变成**最终会应用到控件上**的整数尺寸 (列表区高, 说明行数)。
+
+        应用的是取整并夹紧后的值，求内容高时也必须用同一组值——否则「算出来的
+        高度」与「实际排出来的高度」会差几个像素，临界尺寸下就会误判滚动条。
+        """
+        list_h = _clamp(round(_LIST_H_NATURAL * k), _LIST_H_MIN, _LIST_H_MAX)
+        imp_rows = _clamp(round(_IMP_ROWS_NATURAL * k), _IMP_ROWS_MIN, _IMP_ROWS_MAX)
+        return int(list_h), int(imp_rows)
+
+    def _content_h_at(self, k: float, fixed: float) -> int:
+        """给定缩放系数时内容区的总高（解析式，不触发任何真实重排）。"""
+        list_h, imp_rows = self._target_flex(k)
+        return int(round(fixed + list_h + self._imp_block_px(imp_rows)))
+
+    def _solve_scale(self, avail: int, fixed: float) -> float:
+        """求缩放系数 k，使内容总高最接近 avail（纯算术，不触发任何重排）。
+
+        内容高度对 k 是分段单调函数::
+
+            h(k) = fixed + 列表区高(k) + 说明区高(k)
+
+        其中 ``fixed`` 是「非弹性部分」的高度（见 ``_measure_fixed``）。二分
+        30 轮即可收敛到 1px 以内，全程不重排、不重绘一次——拖动窗口时正是靠
+        这一点做到「只改一次尺寸、只重排一次」。
+        """
+
+        def h_at(kk: float) -> float:
+            return self._content_h_at(kk, fixed)
+
+        lo, hi = 0.05, 6.0
+        if h_at(hi) <= avail:
+            return hi
+        for _ in range(30):
+            mid = (lo + hi) / 2.0
+            if h_at(mid) < avail:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2.0
+
+    def _set_scroll(self, need: bool) -> None:
+        """按需显隐内容区竖向滚动条（状态未变时不动作，避免无谓重排）。"""
+        if need == getattr(self, "_content_scrollable", None):
+            return
+        self._content_scrollable = need
+        try:
+            if need:
+                self._content_sb.grid()
+            else:
+                self._content_sb.grid_remove()
+                self._content_canvas.yview_moveto(0)
+        except Exception:
+            pass
+
+    def _set_hscroll(self, need: bool) -> None:
+        """按需显隐内容区横向滚动条（状态未变时不动作，避免无谓重排）。"""
+        if need == getattr(self, "_content_hscrollable", None):
+            return
+        self._content_hscrollable = need
+        try:
+            if need:
+                self._content_hsb.grid()
+            else:
+                self._content_hsb.grid_remove()
+                self._content_canvas.xview_moveto(0)
+        except Exception:
+            pass
+
+    def _set_content_window_height(self, h: int) -> None:
+        """设定内嵌内容窗口的高度：至少撑满可视区，内容更高时用内容自身高度。"""
+        if h <= 0:
+            return
+        try:
+            self._content_canvas.itemconfig("__ct__", height=h)
+        except Exception:
+            pass
+
+    def _sync_hint_wrap(self) -> None:
+        """让「长说明」label 的折行宽度跟随内容区宽度。
+
+        这类 label（按钮下方的用途说明）文本较长：固定 wraplength 会在窄窗口下
+        溢出被裁、在宽窗口下过早折行。跟随宽度后始终铺满可用宽、不多不少。
+        """
+        try:
+            avail = int(self.content.winfo_width())
+        except Exception:
+            return
+        if avail <= 1:
+            return
+        for lbl in getattr(self, "_hint_labels", []):
+            try:
+                lbl.configure(wraplength=max(200, avail - 40))
+            except Exception:
+                pass
+
+    def _sync_fold_widths(self) -> None:
+        """只同步「按宽度折行」的三处（不含内容区的内嵌宽/横向滚动条判定）。
+
+        折行宽取的都是**实际几何宽度**（已随窗口更新，不是惰性请求值），所以
+        调完立刻刷几何就能得到正确的内容高度。内嵌宽那一项单独放在后面：它要读
+        内容区的**请求宽**（惰性值），必须等刷完几何才准——顺序反了会先按上一轮
+        布局的请求宽把内嵌窗设错，再刷一次才发现要改，白多一轮整屏重绘。
+        """
+        for fn in (
+            getattr(self, "_sync_canvas_width", None),
+            getattr(self, "_sync_detect_width", None),
+            getattr(self, "_sync_hint_wrap", None),
+        ):
+            if fn is None:
+                continue
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _sync_aux_widths(self) -> None:
+        """同步全部与宽度相关的几何（宽度变化 / 内容结构变化后调用一次）。
+
+        包含四处内嵌滚动容器的宽度与「长文案」的折行宽：内容区、备份项列表区、
+        数据根识别区。折行宽变了内容高度才会准，所以必须在测量基准之前跑完。
+        """
+        self._sync_fold_widths()
+        fn = getattr(self, "_sync_content_width", None)
+        if fn is not None:
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _autosize_window(self) -> None:
+        """首次构建时把窗口高度设定为屏幕高的固定比例（默认观感高度）。
+
+        取值 = ``屏幕高 × _WINDOW_H_DEFAULT_RATIO``（下限 ``_WINDOW_H_MIN``、
+        硬上限 ``屏幕高 × _WINDOW_H_SCREEN_RATIO``）。两个要点：
+
+        1. **按比例而非按内容**：三工具默认高度完全一致，内容少的工具（如
+           Qoder）窗口不会缩成一小条；内容多时由内容区自身的滚动条承载。
+        2. **按屏幕比例而非固定像素**：进程已声明 DPI 感知（见
+           `_enable_dpi_awareness`），``winfo_screenheight`` 与 ``geometry``
+           同为物理像素，故该比例在任意 DPI 缩放下都成立——窗口占屏幕的视觉
+           大小恒定，小尺寸/高分屏上都不会超出屏幕被遮挡。
+
+        只在 ``_fit_layout(autosize=True)`` 时调用；之后窗口尺寸完全由用户与
+        窗口管理器控制，程序不再改写——否则用户手调过的窗口会在切工具/展开
+        列表时被莫名其妙地弹回。
+        """
+        try:
+            screen = int(self.root.winfo_screenheight())
+        except Exception:
+            screen = 900
+        default_h = int(screen * _WINDOW_H_DEFAULT_RATIO)
+        hard_cap = int(screen * _WINDOW_H_SCREEN_RATIO)
+        win_h = max(_WINDOW_H_MIN, min(default_h, hard_cap))
+        # 宽度沿用窗口当前宽度（只改高度）。量不到时回退到 geometry 串里的宽度，
+        # 绝不用猜测值覆盖——曾用 ``or 738`` 兜底，一旦窗口尚未映射就会把宽度
+        # 悄悄改窄，导致界面右侧显示不全。
+        cur_w = 0
+        try:
+            cur_w = int(self.root.winfo_width())
+        except Exception:
+            cur_w = 0
+        if cur_w <= 1:
+            try:
+                cur_w = int(self.root.winfo_geometry().split("x")[0])
+            except Exception:
+                cur_w = 0
+        if cur_w <= 1:
+            cur_w = 960
+        try:
+            self.root.geometry("%dx%d" % (cur_w, win_h))
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+    def _on_root_configure(self, event) -> None:
+        """主窗口尺寸变化（用户拖动 / 最大化 / 换分辨率屏幕）→ 节流后重排内容。"""
+        if event.widget is not self.root:
+            return
+        self._schedule_relayout()
+
+    def _on_root_destroy(self, event) -> None:
+        """根窗口被销毁时的兜底清理：撤掉尚未触发的 after 回调。
+
+        关窗按钮走 `_on_close` → `_cancel_after`，但窗口也可能被**别的方式**销毁
+        （外部 `destroy()`、测试拆卸、解释器退出）。此时残留的节流重排 / 轮询回调
+        会在定时器到期时被 Tk 报 `invalid command name "..._fit_layout"`——实测整套
+        测试刷了 150+ 行这种噪音，把真正的失败信息淹掉。
+        """
+        if event.widget is not self.root:
+            return  # 子控件销毁也会触发 <Destroy>，只认根窗口
+        self._closing = True
+        self._cancel_after()
+
+    def _schedule_relayout(self, delay: int = 60) -> None:
+        """把连续的尺寸变化合并成一次重排，避免拖动窗口时反复重算几何。"""
+        job = getattr(self, "_relayout_job", None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+            self._relayout_job = None
+        try:
+            self._relayout_job = self.root.after(delay, self._fit_layout)
+        except Exception:
+            self._relayout_job = None
+
+    def _fit_layout(self, autosize: bool = False) -> None:
+        """按当前窗口可用高度重排内容区：等比缩放各弹性区域 + 必要时竖向滚动。
+
+        设 ``avail`` = 内容区可视高度，内容总高 = 非弹性部分 + 两个弹性区：
+
+        - 内容比 ``avail`` 矮：按比例**放大**各弹性区域——窗口越高，备份列表区
+          与数据导入说明区越大，界面铺满、底部不留大片空白；
+        - 内容比 ``avail`` 高：按比例**压缩**这两个区域，为下方区域腾出空间；
+          压缩到各自下限仍不够时出现竖向滚动条，因此无论窗口多矮，全部内容都
+          可达、不会被裁掉看不见。
+
+        缩放系数 k 同时作用于两个弹性区域（各自按其自然值等比伸缩），且各自
+        被自身的上下限夹紧。非弹性区域（数据目录、选项、按钮行等）高度由行
+        内容决定、不参与缩放——强行拉伸只会产生空无一物的留白。
+
+        **一次到位**：目标尺寸先纯算术解出（``_solve_scale``），再一次性应用到
+        控件上，中途不把弹性区复位到自然值——否则用户会看到「先弹回自然、再压
+        回去」的中间态，拖窗口时整片界面持续闪动（这正是本轮修复的两个现象）。
+        重排过程只在宽度/结构真的变了时才刷几何，故拖窗口高度时零重绘。
+
+        进度条与状态栏已由根 grid 布局固定在最下方，任何窗口高度下都完整可见。
+
+        ``autosize=True`` 额外按屏幕比例把窗口高度一次性设定到合适值（仅首次
+        构建使用）。HEADLESS 测试下同样安全（量不到高度时退化为自然尺寸）。
+        """
+        if getattr(self, "_in_relayout", False):
+            return
+        self._in_relayout = True
+        try:
+            self._do_fit_layout(autosize)
+        finally:
+            self._in_relayout = False
+
+    def _refresh_geometry(self) -> None:
+        """强制同步一次几何计算，使后续 winfo_reqheight 读到的是新尺寸。
+
+        改完弹性区域的显式高度后**必须**调用，否则 Tk 的请求高度还是上一轮的
+        值——基准高度一旦偏大/偏小，缩放系数就会算错（实测表现为「窗口调矮、
+        列表区反而变大」）。
         """
         try:
             self.root.update_idletasks()
         except Exception:
+            pass
+
+    def _do_fit_layout(self, autosize: bool) -> None:
+        # ① 宽度变化 → 文案折行数、内嵌宽、识别区高度都要重算，「非弹性部分」的
+        #    高度也随之改变，故先同步宽度相关几何、再作废基准缓存。
+        #    **宽度没变时整段跳过**：拖高度时既不重绘也不重排（消除闪烁的关键）。
+        refreshed = False
+        if self._content_width() != self._fixed_cache_w:
+            self._sync_fold_widths()
+            self._refresh_geometry()
+            refreshed = True
+            if self._sync_content_width():
+                # 内嵌宽真的变了（窗口比内容窄、走横向滚动的场景）→ 折行要按新
+                # 宽度重算并再刷一次，否则基准高度是按旧折行量出来的。
+                self._sync_fold_widths()
+                self._refresh_geometry()
+            self._fixed_cache = None
+
+        avail = self._avail_body_height()
+        if avail <= 0:
+            # 量不到可用高度（无头 / 窗口尚未映射）：保持自然尺寸，不做缩放，
+            # 也不显示滚动条——避免用 0 高度算出「全部压缩到底」的假结果。
+            self._apply_flex(_LIST_H_NATURAL, _IMP_ROWS_NATURAL)
+            self._refresh_geometry()
+            self._set_scroll(False)
+            self._fixed_cache = None  # 窗口一旦可量就必须重测
+            if autosize:
+                self._autosize_window()
             return
-        # 列表内容实际高度（含 others 区块展开后的全部行）
-        try:
-            content_h = self.list_frame.winfo_reqheight()
-        except Exception:
-            content_h = 0
-        # canvas 高度：所有工具统一为同一固定值，与项数/请求高度无关。
-        # CodeBuddy 备份项类别多（会话/记忆/规则/检查点/灵感/专家历史/插件等）
-        # reqheight 可达 500+，Qoder/Reasonix 项少约 268/285；不贴合 reqheight
-        # 而是强制统一，让三工具（Qoder/CodeBuddy/Reasonix）观感完全一致——
-        # 切换工具时主窗口与内容区高度都不变。超出部分由 canvas 滚动条承载。
-        LIST_MIN, LIST_MAX = 285, 285
-        canvas_h = max(LIST_MIN, min(content_h, LIST_MAX))
-        try:
-            self._canvas.configure(height=canvas_h)
-            self._list_inner.configure(height=canvas_h)
-        except Exception:
-            pass
-        try:
-            self.root.update_idletasks()
-        except Exception:
-            pass
-        # 主窗口高度自适应：取各区块请求高度之和（含列表区锁定的 285），
-        # 不写死为屏幕固定比例——否则像 qoder 这种识别区矮、项少的工具，
-        # 内容远小于写死高度，会在底部（进度条与状态栏之间）留下大片空白。
-        # 改为贴合内容：内容多（codebuddy 识别区高/项多）窗自然高，内容少
-        # （qoder）窗自然矮，三工具都无底部留白，也无需为「统一窗高」牺牲紧凑。
-        # 上限取屏幕 92%（留边距避免顶到任务栏），下限取 minsize 460。
-        try:
-            natural_h = self.root.winfo_reqheight()
-        except Exception:
-            natural_h = 560
-        try:
-            screen = self.root.winfo_screenheight()
-        except Exception:
-            screen = 900
-        max_h = int(screen * 0.92)
-        win_h = max(460, min(natural_h, max_h))
-        cur_w = self.root.winfo_width() or 738
-        self.root.geometry("%dx%d" % (cur_w, win_h))
-        # 强制重算以让 winfo 系列在下一次读取前同步新尺寸
-        try:
-            self.root.update_idletasks()
-        except Exception:
-            pass
-        # 同步数据根识别区的内嵌窗口宽度（首屏布局后宽度才稳定）
-        if getattr(self, "_sync_detect_width", None):
-            try:
-                self._sync_detect_width()
-            except Exception:
-                pass
+
+        fixed = self._fixed_cache
+        if fixed is None:
+            fixed = self._measure_fixed(fresh=refreshed)
+
+        k = self._solve_scale(avail, fixed)
+        list_h, imp_rows = self._target_flex(k)
+        # 全程只可能改这一次尺寸 → 不会出现「先复位、再压缩」的两段式重排。
+        self._apply_flex(list_h, imp_rows)
+        # 内容总高直接按解析式算出（非弹性 + 列表区 + 说明区），不必再刷一次
+        # 几何去量——少一次全屏重绘，拖动窗口时就不再闪。
+        content_h = int(round(fixed + list_h + self._imp_block_px(imp_rows)))
+        # 压缩到底仍装不下 → 出现竖向滚动条，并让内嵌窗口保持内容高度
+        self._set_scroll(content_h > avail)
+        self._set_content_window_height(max(content_h, avail))
+
+        if autosize:
+            self._autosize_window()
+        # 收尾再同步一次宽度相关几何：竖向滚动条刚显隐过，可视宽要等下一次几何
+        # 计算才更新，而内嵌窗宽 / 折行宽都依赖它——这里同步一次可少一轮「先按
+        # 旧宽排一遍、下一帧再纠正」的重排。（只配置控件、不刷几何，代价极小。）
+        self._sync_aux_widths()
 
     def _reset_options(self) -> None:
         """把选项区域各参数复位到初始默认值，防用户改乱后无从选择。
@@ -834,11 +1492,12 @@ class QoderBackupApp:
 
         self._rebuild_others_block()
 
-        # 兜底：重建后强制同步一次内嵌窗口宽度（不依赖 <Configure> 事件是否触发）
-        if getattr(self, "_sync_canvas_width", None):
-            self.root.after_idle(self._sync_canvas_width)
-        # 列表内容变化后重新自适应高度（others 区块展开/收起会改变总高）
-        self.root.after_idle(self._fit_layout)
+        # 滚轮绑定：Tk 的 <MouseWheel> 不从子 widget 冒泡，重建行之后必须重绑
+        self._bind_list_wheel()
+        # 列表内容变化后重新自适应高度（others 区块展开/收起会改变总高）。
+        # 走 _schedule_relayout 而非裸 after_idle：任务句柄被记录，窗口销毁时
+        # 能一并取消，避免留下「invalid command name」噪音。
+        self._schedule_relayout(0)
 
         ok = os.path.isdir(self.root_dir)
         self._refresh_detect_status(ok)
@@ -847,19 +1506,21 @@ class QoderBackupApp:
         else:
             # 全部找到（含重新检测成功后）：清空上一次可能残留的"未找到"提示
             self.summary.config(text="", foreground="#0a6")
-
-        self._rebuild_others_block()
-
-        # 兜底：重建后强制同步一次内嵌窗口宽度（不依赖 <Configure> 事件是否触发）
-        if getattr(self, "_sync_canvas_width", None):
-            self.root.after_idle(self._sync_canvas_width)
-        # 列表内容变化后重新自适应高度（others 区块展开/收起会改变总高）
-        self.root.after_idle(self._fit_layout)
+        # 行数/文案都换过一轮 → 作废布局基准缓存，让紧随其后的那一次重排重新
+        # 量高度（量的过程中会先按当前宽度重刷各行的折行宽，故不必再单独排一次
+        # after_idle 同步宽度；那样还会在窗口销毁后留下 "invalid command name" 噪音）。
+        # 也**不再**重复 _rebuild_others_block / _schedule_relayout：重复调用只会
+        # 白做一遍重建，正是「换工具后要等好几秒才稳定」的成因之一。
+        self._invalidate_fixed()
 
     def _rebuild_others_block(self) -> None:
         """在底部区块按当前勾选状态渲染"其他用户"UID 多选（仅勾选主项时显示）。"""
         for w in self.others_block.winfo_children():
             w.destroy()
+        # UID 行增减会改变内容总高（展开/收起都在这里发生）：作废布局基准并
+        # 排一次重排，否则展开后滚动条显隐与弹性区尺寸会停在展开前的那一刻。
+        self._invalidate_fixed()
+        self._schedule_relayout(0)
         if not self.others_master_var.get() or not self.others_by_uid:
             return
         self.other_vars: dict[str, tk.BooleanVar] = {}
@@ -877,6 +1538,8 @@ class QoderBackupApp:
             ttk.Label(
                 row, text="该用户的数据（记忆/会话/规则等）", foreground="#666"
             ).pack(side=tk.LEFT, padx=6)
+        # 展开出来的 UID 行同样要能在其任意位置用滚轮滚动列表
+        self._bind_list_wheel()
 
     def _on_current_toggled(self) -> None:
         # 当前用户记忆区勾选变化无需额外动作，导出时按 var 取值
@@ -1100,9 +1763,11 @@ class QoderBackupApp:
         # 清空上一次逐行内容（成对处理：先清后填，避免旧行残留）
         for w in self.detect_rows_frame.winfo_children():
             w.destroy()
+        # 识别行数变化同样改变内容总高 → 作废布局基准（含下方的提前 return 分支）
+        self._invalidate_fixed()
         # 每次刷新先收起滚动条，填充后按需再显示（成对处理，避免残留）
         try:
-            self.detect_rows_sb.pack_forget()
+            self.detect_rows_sb.grid_remove()
         except Exception:
             pass
         if not ok:
@@ -1166,16 +1831,24 @@ class QoderBackupApp:
         try:
             if getattr(self, "_sync_detect_width", None):
                 self._sync_detect_width()
-            self.detect_rows_canvas.update_idletasks()
-            content_h = self.detect_rows_frame.winfo_reqheight()
+            # 内容高 = **逐行请求高之和**，直接算，不调 update_idletasks 去量父容器：
+            # 父容器的请求高是惰性值，为量它必须先刷几何，而这一刷会把刚重建好的
+            # 整窗（含全部备份行）重排+重绘一遍——实测单次 180~650ms，换工具时
+            # 光这一步就白等 0.3~1.5s。子控件自身的请求高是即时的，累加即可。
+            content_h = 0
+            for child in self.detect_rows_frame.winfo_children():
+                try:
+                    content_h += int(child.winfo_reqheight())
+                except Exception:
+                    pass
             # 高度 = min(内容实际高, 最大两行高)：1 行就 1 行高，2 行以上截断
             canvas_h = min(content_h, self._detect_max_h)
             self.detect_rows_canvas.configure(height=canvas_h)
             self._detect_overflow = content_h > self._detect_max_h
             if self._detect_overflow:
-                self.detect_rows_sb.pack(side=tk.RIGHT, fill=tk.Y)
+                self.detect_rows_sb.grid()
             else:
-                self.detect_rows_sb.pack_forget()
+                self.detect_rows_sb.grid_remove()
         except Exception:
             self._detect_overflow = False
 
@@ -1237,9 +1910,12 @@ class QoderBackupApp:
         """统一刷新「仅特定工具显示」的行（当前：DSH 会话健康行、Qoder 历史诊断行）。
 
         工具切换 / 重新探测数据目录后调用，保证行可见性与当前适配器一致。
+        行的进出会改变内容总高，故作废布局基准（重排任务已由调用方的
+        ``_refresh_items`` 排好，这里不重复排）。
         """
         self._update_dsh_health_visibility()
         self._update_qoder_diag_visibility()
+        self._invalidate_fixed()
 
     def _update_qoder_diag_visibility(self) -> None:
         """qoder 适配器选中时显示「历史会话诊断」行，其他工具隐藏（不破坏布局）。
@@ -1719,10 +2395,21 @@ class QoderBackupApp:
                             messagebox.showinfo(title, text)
                         else:
                             messagebox.showerror("修复失败", text)
-                        self.root.after(50, self._dsh_check)
+                        self._dsh_check_job = self.root.after(50, self._dsh_check)
             except queue.Empty:
                 pass
             if not self._closing:
+                # 排下一 tick 前，先把上一次存的句柄撤掉：`_drain_queue` 也可能被
+                # **手动调用**（测试用它泵消息），不撤就会多出一条并行轮询链，而
+                # `_after_id` 只记得住一个 ⇒ 另一条链的句柄丢失、窗口销毁时无从
+                # 撤销，Tk 便报 "invalid command name ..._drain_queue"（整套测试
+                # 实测残留 14 处噪音全是这么来的）。
+                # 已经触发过的句柄再 cancel 是空操作，无需区分「已触发 / 未触发」。
+                if self._after_id is not None:
+                    try:
+                        self.root.after_cancel(self._after_id)
+                    except tk.TclError:
+                        pass
                 self._after_id = self.root.after(80, self._drain_queue)
             else:
                 self._after_id = None
@@ -1795,6 +2482,22 @@ class QoderBackupApp:
             except tk.TclError:
                 pass
             self._after_id = None
+        # 布局重排的节流任务同样要撤掉（窗口销毁后再触发会报 invalid command）
+        job = getattr(self, "_relayout_job", None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+            self._relayout_job = None
+        # DSH 修复后的「延迟自动复检」（同样是窗口销毁后会报 invalid command 的回调）
+        job = getattr(self, "_dsh_check_job", None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+            self._dsh_check_job = None
 
     def _on_close(self) -> None:
         """关闭窗口：若有任务在跑先确认，避免线程访问已销毁的 Tk。"""
