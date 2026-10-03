@@ -109,13 +109,60 @@ _IMP_ROWS_MAX = 8
 #: 三工具（Qoder / CodeBuddy / Reasonix …）默认高度完全一致，不随内容多少变化
 #: ——内容少的工具不会出现「窗口缩成一小条」的观感。之后窗口尺寸完全由用户
 #: 与窗口管理器控制（见 `_autosize_window`）。
+#:
+#: ★ **只看屏幕、绝不看内容**（2026-10-03 用户定策）：一度改成「内容排不下就抬到
+#: 上限」，但抬出来的窗口会顶到桌面边界——低分辨率 + 高 DPI 缩放的屏幕上控件按
+#: 比例放大而屏幕物理尺寸不变，窗口反而可能**装不上屏幕**，连标题栏、状态栏
+#: 都被挤出去，直接没法用。取舍很明确：**优先保证窗口完整可见，其次才是内容
+#: 完整可见**；内容装不下由内容区自己的滚动条承载（用户已认可该行为）。
 _WINDOW_H_DEFAULT_RATIO = 0.75
-#: 硬上限保护：任何情况下默认高度都不超过屏幕高的该比例（避免被任务栏/屏幕
-#: 边缘遮挡）。当前 `_WINDOW_H_DEFAULT_RATIO < _WINDOW_H_SCREEN_RATIO`，此项
-#: 只在将来调大默认比例时起兜底作用。
+#: 上限兜底（非 Windows / 取不到工作区时用）：屏幕高的该比例。当前
+#: `_WINDOW_H_DEFAULT_RATIO < _WINDOW_H_SCREEN_RATIO`，此项只在将来调大默认
+#: 比例时起兜底作用。
 _WINDOW_H_SCREEN_RATIO = 0.92
 #: 默认高度的下限（px）：屏幕极矮时也要保证操作区可用。
 _WINDOW_H_MIN = 460
+
+
+def _work_area_height() -> int:
+    """Windows 桌面工作区高度（已扣除任务栏）；非 Windows / 取不到时返回 0。
+
+    ★ 用工作区而不是 ``winfo_screenheight()`` 当上限：屏幕高**包含任务栏**占用的
+    那一条，按屏幕高开窗会让窗口底部（正好是状态栏）被任务栏压住。必须与
+    `_enable_dpi_awareness()` 配合——进程声明 DPI 感知后该值才是物理像素，
+    与 ``geometry`` 同量纲。
+    """
+    if sys.platform != "win32":
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        rect = wintypes.RECT()
+        # SPI_GETWORKAREA = 0x0030
+        ok = ctypes.windll.user32.SystemParametersInfoW(  # type: ignore[attr-defined]
+            0x0030, 0, ctypes.byref(rect), 0)
+        if ok:
+            h = int(rect.bottom - rect.top)
+            return h if h > 1 else 0
+    except Exception:
+        pass
+    return 0
+
+
+def _window_height_ceiling(screen: int) -> int:
+    """默认窗口高度的上限：优先**真实工作区**（已扣任务栏），取不到才按屏幕比例。
+
+    这是「优先保证窗口完整可见」这条定策的落点：比例是**估计值**，工作区是
+    **实测值**。屏高 864 / 任务栏 48 时两者给 795 与 816，都安全；但任务栏特别高
+    或屏幕特别矮时，比例会算出超过可用高度的值、把窗口顶出桌面——取实测值即从
+    结构上排除这种情况。
+    """
+    wa = _work_area_height()
+    if wa >= _WINDOW_H_MIN:
+        return wa
+    return max(_WINDOW_H_MIN, int(screen * _WINDOW_H_SCREEN_RATIO))
+
 
 # 无头开关：单元测试置 True 时隐藏备份浏览器子窗口，避免测试闪窗（仅影响测试）。
 HEADLESS = False
@@ -1174,14 +1221,18 @@ class QoderBackupApp:
         """首次构建时把窗口高度设定为屏幕高的固定比例（默认观感高度）。
 
         取值 = ``屏幕高 × _WINDOW_H_DEFAULT_RATIO``（下限 ``_WINDOW_H_MIN``、
-        硬上限 ``屏幕高 × _WINDOW_H_SCREEN_RATIO``）。两个要点：
+        上限 `_window_height_ceiling`）。三个要点：
 
         1. **按比例而非按内容**：三工具默认高度完全一致，内容少的工具（如
            Qoder）窗口不会缩成一小条；内容多时由内容区自身的滚动条承载。
+           ★ **绝不为了塞下内容而抬高窗口**——那会让低分辨率 + 高 DPI 缩放的
+           用户把窗口开出屏幕（标题栏/状态栏看不见，反而没法用）。
         2. **按屏幕比例而非固定像素**：进程已声明 DPI 感知（见
            `_enable_dpi_awareness`），``winfo_screenheight`` 与 ``geometry``
            同为物理像素，故该比例在任意 DPI 缩放下都成立——窗口占屏幕的视觉
            大小恒定，小尺寸/高分屏上都不会超出屏幕被遮挡。
+        3. **上限取实测工作区**：比固定比例更严格地保证「窗口整体可见」，
+           详见 `_window_height_ceiling`。
 
         只在 ``_fit_layout(autosize=True)`` 时调用；之后窗口尺寸完全由用户与
         窗口管理器控制，程序不再改写——否则用户手调过的窗口会在切工具/展开
@@ -1192,8 +1243,8 @@ class QoderBackupApp:
         except Exception:
             screen = 900
         default_h = int(screen * _WINDOW_H_DEFAULT_RATIO)
-        hard_cap = int(screen * _WINDOW_H_SCREEN_RATIO)
-        win_h = max(_WINDOW_H_MIN, min(default_h, hard_cap))
+        cap = _window_height_ceiling(screen)
+        win_h = max(_WINDOW_H_MIN, min(default_h, cap))
         # 宽度沿用窗口当前宽度（只改高度）。量不到时回退到 geometry 串里的宽度，
         # 绝不用猜测值覆盖——曾用 ``or 738`` 兜底，一旦窗口尚未映射就会把宽度
         # 悄悄改窄，导致界面右侧显示不全。

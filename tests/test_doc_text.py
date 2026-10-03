@@ -6,6 +6,13 @@
 - 对**仓库真文档** ``docs/使用说明.md`` 跑一遍：不含 ``![``、不含 ``images/``、
   **行数差 == 2**（1 行图片 + 1 个折叠空行；写成 1 是常见误判）、无连续空行；
 - 三种图片形态：独立成行 / 行内 / 被链接包裹（``[![alt](img)](url)``）；
+- **行内标记只删标记、保留内容**（``TestInlineMarkers``）——Tk ``Text`` 与终端都不
+  渲染 markdown，原样留着用户看到的就是一堆 ``**``、`` ` ``；
+- **代码片段必须先占位、后还原**（``TestInlineMarkers.test_code_span_protects_asterisks``）：
+  真文档里有 `` `***REDACTED***` ``、`` `messages/*.json` ``，先剥反引号会把它们吃坏；
+- **表格渲染成对齐纯文本**（``TestTableRendering``）：丢掉 ``|---|`` 分隔行、按显示
+  宽度（东亚字符算 2 列）对齐、表头下补等宽横线；
+- **下划线一律不当强调**（``ai_env_clone`` / ``__init__.py`` / ``OPENAI_API_KEY``）；
 - 纯函数**不导入 tkinter**（受管 Python 没装 tkinter，导入了测试直接 ImportError）；
 - ``resources.read_help_doc()`` 在 **frozen 与源码两种模式**下返回**逐字相同**的文本
   （用 monkeypatch 模拟 ``sys.frozen`` / ``sys._MEIPASS``）。
@@ -144,6 +151,163 @@ class TestMdToParagraphs(unittest.TestCase):
         paras = doctext.md_to_paragraphs(src)
         text = doctext.plain_text(src)
         self.assertEqual(len([l for l in text.split("\n") if l.strip()]), len(paras))
+
+
+class TestInlineMarkers(unittest.TestCase):
+    """★ 行内标记只删标记、保留内容（Tk ``Text`` 与终端都不渲染 markdown）。"""
+
+    def _one(self, src: str) -> str:
+        paras = doctext.md_to_paragraphs(src)
+        self.assertEqual(len(paras), 1, "应只产出一个段落：%r" % paras)
+        return paras[0][0]
+
+    def test_bold_italic_strike_code_stripped(self) -> None:
+        self.assertEqual(self._one("前 **粗体** 后\n"), "前 粗体 后")
+        self.assertEqual(self._one("前 *斜体* 后\n"), "前 斜体 后")
+        self.assertEqual(self._one("前 ~~删除~~ 后\n"), "前 删除 后")
+        self.assertEqual(self._one("前 `代码` 后\n"), "前 代码 后")
+
+    def test_code_span_protects_asterisks(self) -> None:
+        """★ 代码片段先占位后还原：里面的 ``*`` 不得被强调规则吃掉。
+
+        真文档里就有 `` `***REDACTED***` `` 与 `` `messages/*.json` ``：
+        先剥反引号会把前者吃成 ``REDACTED``、后者吃成 ``messages/.json``。
+        """
+        self.assertEqual(self._one("占位 `***REDACTED***` 结束\n"),
+                         "占位 ***REDACTED*** 结束")
+        self.assertEqual(self._one("正文 `messages/*.json` 快照\n"),
+                         "正文 messages/*.json 快照")
+        self.assertEqual(self._one("路径 `a\\b\\*\\c.json` 命中\n"),
+                         "路径 a\\b\\*\\c.json 命中")
+
+    def test_underscore_never_treated_as_emphasis(self) -> None:
+        """★ 下划线一律不处理：识别符远多于真正的 ``_斜体_``。
+
+        宽松匹配会把 ``ai_env_clone`` 劈成 ``aienv_clone``、把
+        ``__init__.py`` 劈成 ``init.py`` —— 那是直接改坏命令与路径。
+        """
+        for src in ("python -m ai_env_clone\n",
+                    "读 ai_env_clone/__init__.py 里的常量\n",
+                    "环境变量 OPENAI_API_KEY 与 MY_KEY_ENV\n",
+                    "字段 qoder_backup_ 与 import_migration\n"):
+            self.assertEqual(self._one(src), src.rstrip("\n"))
+
+    def test_link_keeps_text_only(self) -> None:
+        self.assertEqual(self._one("见 [项目主页](https://example.com) 详情。\n"),
+                         "见 项目主页 详情。")
+
+    def test_empty_code_span(self) -> None:
+        """`` `` `` 这种空代码片段不得留下反引号。"""
+        self.assertNotIn("`", self._one("前 `` 后\n"))
+
+    def test_real_doc_has_no_marker_left(self) -> None:
+        """真文档跑完后：无成对加粗、无反引号、无原始表格行。
+
+        只允许两处**故意的内容**里出现 ``**``：脱敏占位 ``***REDACTED***`` 与
+        通配模式 ``history/**``（它们本来就该原样显示）。
+        """
+        paras = doctext.md_to_paragraphs(_read_help_source())
+        joined = "\n".join(text for text, _ in paras)
+        self.assertNotIn("`", joined, "反引号必须全部剥掉")
+        self.assertNotIn("~~", joined)
+        for line in joined.split("\n"):
+            if "**" in line:
+                self.assertTrue(
+                    "REDACTED" in line or "history/**" in line,
+                    "只允许脱敏占位与通配模式保留 **：%r" % line[:120],
+                )
+        self.assertNotIn("|---", joined, "表格分隔行必须丢弃")
+
+
+class TestTableRendering(unittest.TestCase):
+    """★ 表格渲染成**对齐的纯文本**（纯文本控件画不出表格线）。"""
+
+    SRC = (
+        "| 工具 | 备注 |\n"
+        "| --- | --- |\n"
+        "| Qoder | 会话主库加密 |\n"
+        "| AB | 短 |\n"
+    )
+
+    def _table(self, src: str = SRC) -> str:
+        paras = doctext.md_to_paragraphs(src)
+        self.assertEqual(len(paras), 1, "整个表格应是**一个**段落：%r" % paras)
+        self.assertEqual(paras[0][1], "table")
+        return paras[0][0]
+
+    def test_separator_row_dropped(self) -> None:
+        """``|---|`` 这一行必须消失：纯文本画不出表格线，留着只是多一串横杠。
+
+        注意**只有表头下那一条**横线是允许的（见 ``test_header_underlined``），
+        故这里断言的是「原始竖线没了 + 横线恰好一条」，而不是「不含 ``-``」。
+        """
+        out = self._table()
+        self.assertNotIn("|", out, "原始竖线不应出现")
+        dash_lines = [l for l in out.split("\n") if set(l) <= set("- ")]
+        self.assertEqual(len(dash_lines), 1,
+                         "只应有表头下这一条横线：%r" % out.split("\n"))
+
+    def test_header_underlined(self) -> None:
+        """表头下补一条等宽横线，保住「哪行是表头」这个信息。"""
+        lines = self._table().split("\n")
+        self.assertEqual(len(lines), 4, "表头 + 横线 + 2 行数据：%r" % lines)
+        self.assertRegex(lines[1], r"^-+(\s+-+)*$", "横线行只含横线与分隔空格")
+        self.assertEqual(lines[0].split()[0], "工具")
+
+    def test_cjk_column_width_pads_ascii_rows(self) -> None:
+        """★ 按**显示宽度**对齐：中文算 2 列，按 ``len()`` 算会整体左偏。
+
+        ``工具`` 显示宽度 4（2 个字符 × 2 列），列间留 2 空格 ⇒ 第二列从第 6 个
+        **显示列**开始；``AB`` 只有 2 列宽，必须补 2 个空格才对齐。注意比较的必须
+        是显示列而非字符下标——``工具`` 只占 2 个字符却是 4 列宽。
+        """
+        out = self._table("| 工具 | 备注 |\n| --- | --- |\n| AB | 短 |\n")
+        lines = out.split("\n")
+
+        def col(line: str, token: str) -> int:
+            return doctext._disp_width(line[:line.index(token)])
+
+        self.assertEqual(col(lines[0], "备注"), 6, lines)
+        self.assertEqual(col(lines[2], "短"), col(lines[0], "备注"),
+                         "ASCII 单元格必须按显示宽度补齐：%r" % lines)
+
+    def test_cjk_width_counted_as_two(self) -> None:
+        self.assertEqual(doctext._disp_width("工具"), 4)
+        self.assertEqual(doctext._disp_width("AB"), 2)
+
+    def test_table_without_separator_has_no_rule(self) -> None:
+        """非标准写法（无分隔行）→ 原样对齐、不加横线。"""
+        out = self._table("| a | b |\n| c | d |\n")
+        self.assertEqual(len(out.split("\n")), 2, out)
+
+    def test_empty_middle_cell_does_not_shift_columns(self) -> None:
+        """中间空单元格不能让后面的列错位。"""
+        out = self._table("| a | b | c |\n| --- | --- | --- |\n| 1 |  | 3 |\n")
+        lines = out.split("\n")
+        self.assertEqual(lines[0].index("c"), lines[2].index("3"), lines)
+
+    def test_missing_trailing_cells_do_not_raise(self) -> None:
+        """行尾缺列（表格写法不完整）时补齐即可，不得抛异常。"""
+        out = self._table("| a | b | c |\n| --- | --- | --- |\n| 1 |\n")
+        self.assertEqual(len(out.split("\n")), 3, out)
+
+
+class TestListAndQuote(unittest.TestCase):
+    def test_code_fence_marker_not_emitted(self) -> None:
+        """★ 栅栏行本身不产出段落：查看器里显示 `` ```powershell `` 纯属噪音。"""
+        paras = doctext.md_to_paragraphs("```powershell\npython -m x\n```\n")
+        self.assertEqual(paras, [("python -m x", "code")])
+
+    def test_ordered_list_keeps_number(self) -> None:
+        """★ 有序列表的编号是内容的一部分，不能丢。"""
+        paras = doctext.md_to_paragraphs("1. 第一步\n2. 第二步\n")
+        self.assertEqual([t for t, _ in paras], ["1. 第一步", "2. 第二步"])
+        self.assertEqual([tag for _, tag in paras], ["li", "li"])
+
+    def test_bare_quote_line_produces_no_paragraph(self) -> None:
+        """引用块里的空续行（单独一个 ``>``）只是换行，不该产出空段落。"""
+        paras = doctext.md_to_paragraphs("> 甲\n>\n> 乙\n")
+        self.assertEqual([t for t, _ in paras], ["甲", "乙"])
 
 
 class TestNoTkinterDependency(unittest.TestCase):

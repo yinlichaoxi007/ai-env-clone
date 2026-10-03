@@ -9,7 +9,9 @@
    的兜底契约。真实窗口下的等比缩放与按需滚动条行为另见
    ``tests/test_window_fit.py``。
 3. 首次打开的默认窗口高度 = 屏幕高 × 0.75（``TestDefaultWindowHeight``），
-   与内容多少、工具类型都无关，且按比例取值故任意 DPI 缩放下占屏恒定。
+   与内容多少、工具类型都无关，且按比例取值故任意 DPI 缩放下占屏恒定；
+   上限取**实测桌面工作区**（``TestHeightCeiling``）——优先保证窗口整体可见，
+   绝不为了塞下内容而把窗口顶出屏幕。
 """
 import os
 import sys
@@ -140,10 +142,19 @@ class TestDefaultWindowHeight(unittest.TestCase):
             app = QoderBackupApp(root)
         return root, app
 
-    def _autosize_with(self, app, root, screen, natural_h=None):
-        """以注入的屏幕高（可再注入内容自然高）跑一次 autosize，返回设入的高度。"""
+    def _autosize_with(self, app, root, screen, natural_h=None, work_area=0):
+        """以注入的屏幕高（可再注入内容自然高）跑一次 autosize，返回设入的高度。
+
+        ★ 默认把 ``_work_area_height`` 打桩成 0：本组用例验的是**屏幕比例**基准
+        契约，而工作区高是**本机真实值**（与注入的 ``screen`` 无关）。真实值一旦
+        小于注入屏高的比例高（本机实测工作区 816，而注入 1440 → 比例高 1080），
+        上限就会把结果压成 816，得出「比例不生效」的假结论。打桩成 0 即显式走
+        「取不到工作区 → 屏幕比例兜底」这条路径，与注入的 ``screen`` 自洽。
+        「工作区优先」那条路径由 ``TestHeightCeiling`` 显式覆盖。
+        """
         captured = []
         with mock.patch.object(root, "winfo_screenheight", return_value=screen), \
+             mock.patch.object(m, "_work_area_height", return_value=work_area), \
              mock.patch.object(root, "geometry",
                                side_effect=lambda *a: captured.append(a[0])):
             if natural_h is None:
@@ -243,6 +254,84 @@ class TestDefaultWindowHeight(unittest.TestCase):
         finally:
             app._cancel_after()
             root.destroy()
+
+
+class TestHeightCeiling(unittest.TestCase):
+    """★ 默认高度上限 = 实测工作区，保证「窗口整体可见」优先于「内容完整可见」。
+
+    用户定策（2026-10-03）：「优先保证窗口能显示全，而不是内容显示全，否则低
+    分辨率高缩放的屏幕上主窗口都可能显示不全影响使用。」
+
+    实现上只加固**上限**这一处：比例仍是基准（内容少的工具不缩成一小条），但
+    比例算出的值若超过桌面可用高度，就必须压回可用高度——否则窗口底部（状态栏）
+    会被任务栏或屏幕边缘切掉，窗口反而没法用。
+    """
+
+    def _make_app(self):
+        import tkinter as tk
+        from ai_env_clone.__main__ import QoderBackupApp
+
+        fake_root = os.path.join(ROOT, "tests", "_fake_data_root")
+        with mock.patch("ai_env_clone.__main__._load_last_tool", return_value=None), \
+             mock.patch("ai_env_clone.__main__._save_last_tool", return_value=None), \
+             mock.patch.object(QoderBackupApp, "_detect_root",
+                               return_value=fake_root):
+            root = tk.Tk()
+            root.withdraw()
+            app = QoderBackupApp(root)
+        return root, app
+
+    # ------------------------------------------------------------ 取值口径 --
+    def test_prefers_real_work_area(self):
+        """能拿到工作区就用工作区（实测值优先于比例估计值）。"""
+        with mock.patch.object(m, "_work_area_height", return_value=816):
+            self.assertEqual(m._window_height_ceiling(864), 816)
+
+    def test_falls_back_to_screen_ratio(self):
+        """取不到工作区（非 Windows / API 失败）→ 屏幕比例兜底。"""
+        for wa in (0, 1):
+            with mock.patch.object(m, "_work_area_height", return_value=wa):
+                self.assertEqual(
+                    m._window_height_ceiling(1000),
+                    int(1000 * m._WINDOW_H_SCREEN_RATIO),
+                )
+
+    def test_absurd_work_area_ignored(self):
+        """工作区小于下限（虚报 / 异常）视为不可用，不得把上限压到不可用高度。"""
+        with mock.patch.object(m, "_work_area_height",
+                               return_value=m._WINDOW_H_MIN - 1):
+            self.assertGreaterEqual(m._window_height_ceiling(900),
+                                    m._WINDOW_H_MIN)
+
+    # ------------------------------------------------------------ 窗口高 = --
+    def test_default_height_never_exceeds_work_area(self):
+        """★ 比例高超过工作区时必须压回工作区 —— 窗口完整可见优先。"""
+        root, app = self._make_app()
+        try:
+            # 屏高 1440 → 比例高 1080，而可用只有 800（模拟高缩放/小屏）
+            geoms = []
+            with mock.patch.object(root, "winfo_screenheight", return_value=1440), \
+                 mock.patch.object(m, "_work_area_height", return_value=800), \
+                 mock.patch.object(root, "geometry",
+                                   side_effect=lambda s: geoms.append(s)):
+                app._autosize_window()
+            self.assertTrue(geoms, "autosize 应设置一次 geometry")
+            self.assertEqual(int(geoms[-1].split("x")[1]), 800,
+                             "默认高度不得超过工作区，否则窗口会开出屏幕")
+        finally:
+            app._cancel_after()
+            root.destroy()
+
+    def test_work_area_height_is_sane_or_zero(self):
+        """``_work_area_height()`` 只允许返回 0 或合理值（不得大于屏幕高）。"""
+        wa = m._work_area_height()
+        self.assertIsInstance(wa, int)
+        if sys.platform != "win32":
+            self.assertEqual(wa, 0, "非 Windows 无该 API，必须返回 0")
+        else:
+            self.assertGreaterEqual(wa, 0)
+            if wa:
+                self.assertLessEqual(wa, 20000, "返回值明显不合理，疑似量错")
 
 
 if __name__ == "__main__":
