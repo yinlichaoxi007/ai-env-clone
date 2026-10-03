@@ -4,6 +4,10 @@
 需要适配器时请显式：``from ai_env_clone.adapters import get_adapter``。
 """
 
+# 版本号放在 .version 里（不依赖 tkinter，也不依赖本包内其它模块），
+# 这里再导出一次，保证 `ai_env_clone.__version__` 的旧用法继续可用。
+from .version import __version__
+
 from .core import (
     ALWAYS_INCLUDE,
     BackupError,
@@ -40,6 +44,5 @@ __all__ = [
     "MANIFEST_VERSION",
     "DEFAULT_EXCLUDES",
     "ALWAYS_INCLUDE",
+    "__version__",
 ]
-
-__version__ = "0.1.0"

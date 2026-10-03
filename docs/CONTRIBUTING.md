@@ -185,26 +185,44 @@ python -m unittest tests.test_import_matrix tests.test_session_migration_formats
 | Tag 形如        | 含义           | 触发动作                                              |
 | --------------- | -------------- | ----------------------------------------------------- |
 | `v1.2.3`        | 正式版         | 构建多平台可执行程序并发布 GitHub Release（正式 Release）          |
-| `beta1` `rc2` `alpha1` | 预发布 | 构建多平台可执行程序并发布 GitHub Release（标记为 pre-release）    |
+| `v1.2.3-rc.1` `beta1` `alpha1` | 预发布 | 构建多平台可执行程序并发布 GitHub Release（标记为 pre-release）    |
+
+> 判定规则是**子串匹配**：tag 里含 `rc` / `beta` / `alpha` / `preview` / `dev`（不分大小写）
+> 即预发布。所以 `v0.2.0-rc.1` 也是预发布，命名可放心用标准 semver 写法。
 
 > 本工具是**面向终端用户的 GUI 程序**；分发靠 GitHub Releases 的
 > 多平台可执行程序（Windows / macOS arm64 / macOS x86_64 / Linux）+ 自动附带的源码包。
 
 ### 发布步骤
 
+顺序固定为「**改版本 → 提交推送 → 打 tag**」：tag 触发的是**远端代码**的构建，
+代码里的版本号必须先就位，否则 CI 会照着旧版本号打包发布。
+
 ```bash
-# 1) 在本地打 tag（版本号与 ai_env_clone/__init__.py 的 __version__ 保持一致）
+# 1) 先改版本号（唯一来源），并同步 README「CLI」章里 --version 的示例输出
+#    ai_env_clone/version.py  →  __version__ = "1.0.0"
+#    窗口标题 / --version / exe 版本资源都由它派生，没有第二处要改
+$EDITOR ai_env_clone/version.py
+
+# 2) 跑一遍全量测试，再提交并推送代码
+python -m unittest discover -s tests -t .
+git add -A && git commit -m "release: 1.0.0"
+git push origin main
+
+# 3) 代码推送成功后再打 tag（版本号 = v + __version__）
 git tag v1.0.0
 git push origin v1.0.0
 ```
 
-推送后 `build-release.yml` 自动运行（无需手动点 Release 按钮）：
+推送 tag 后 `build-release.yml` 自动运行（无需手动点 Release 按钮）：
 
 - **`build-release.yml`** 用 matrix 一次性构建四个平台的可执行程序并汇总发布：
   - `windows-latest` → `AiEnvClone-windows.exe`
   - `macos-latest`（Apple Silicon / arm64）→ `AiEnvClone-macos-arm64.app.zip`
-  - `macos-13`（Intel / x86_64）→ `AiEnvClone-macos-x86_64.app.zip`
-  - `ubuntu-latest` → `AiEnvClone-linux`（直接使用 runner 自带 python3，已含 tkinter）
+  - `macos-15-intel`（Intel / x86_64；`macos-13` 已于 2025-12-04 退役）→ `AiEnvClone-macos-x86_64.app.zip`
+  - `ubuntu-latest` → `AiEnvClone-linux`（**统一用 `actions/setup-python` 的 Python**：
+    它是 python-build-standalone 构建、自带 tkinter；runner 自带的系统 python3 缺 tkinter，
+    不能直接用）
   - 上述产物全部作为 GitHub Release 资产上传；
   - GitHub 会**自动附上** `Source code (zip)` / `Source code (tar.gz)` 源码包，无需手动传；
   - `v*` 为正式 Release，`beta/rc/alpha*` 自动标记为预发布；
@@ -221,7 +239,25 @@ Actions 页面可手动运行 `build-release.yml`（填已存在的 tag 名）�
 
 ### 版本号同步
 
-每次发正式版前，请更新 `ai_env_clone/__init__.py` 中的 `__version__`，与 tag 保持一致。
+版本号的**唯一来源**是 `ai_env_clone/version.py` 的 `__version__`。窗口标题、`--version`
+输出、Windows exe「属性 → 详细信息」里的版本资源，全部由它派生（`build_exe.py` 自动生成
+版本资源注入 exe）——**不存在第二处需要手工维护的版本号**。要改的只有两处外部文字：
+`version.py` 本身，以及 README「CLI」章里 `--version` 的示例输出（有测试守着）。
+
+发版相关的不变式由 `tests/test_version.py` 看住：
+
+- 版本字面量只允许出现在 `version.py`（其它文件写死版本号会直接失败）；
+- README 必须写着当前版本号；
+- `--version` 的处理必须排在 `import tkinter` 之前（否则没装 tkinter 的环境会崩）；
+- HEAD 正好落在某个 `v*` tag 上时，`tag[1:]` 必须等于 `__version__`
+  ——即「tag 打了但代码里还是旧版本号」这种漂移会被立刻拦下（打 tag 后跑一次测试即可自检）。
+
+### 关于 `AiEnvClone.spec`
+
+它是 **PyInstaller 每次构建自动写到项目根的中间产物**（`build_exe.py` 的命令行参数会被
+PyInstaller 固化成 spec），已被 `.gitignore` 忽略，**不是构建入口**。构建入口是
+`build_exe.py`——要改打包参数（如版本资源、单文件/窗口模式）请改那里；
+往 `.spec` 里加东西没有意义，下次构建就会被覆盖。
 
 ### 镜像
 

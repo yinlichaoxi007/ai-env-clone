@@ -2,8 +2,12 @@
 AI 工具记忆与会话历史 备份 / 迁移工具（图形界面，统一入口）
 
 运行：
-    python -m ai_env_clone        # 源码/开发方式（仓库根目录执行）
-    ai_env_clone                  # pip 安装后直接用命令启动（由 pyproject.toml 的 entry_points 生成）
+    python -m ai_env_clone            # 源码/开发方式（仓库根目录执行），启动图形界面
+    python -m ai_env_clone --version  # 只打印版本号后退出（-V 亦可），不启动界面
+    ai_env_clone                      # 安装为命令后直接启动
+
+版本号定义在 ``ai_env_clone/version.py``（唯一来源），窗口标题与 ``--version``
+输出都由它派生；改版本只改那一处。
 
 通过 ``ai_env_clone`` 的适配器抽象层接入具体工具（下拉切换），核心逻辑位于
 ``ai_env_clone.core``，各工具适配器位于 ``ai_env_clone/adapters/``。本文件是
@@ -20,10 +24,19 @@ import re
 import shutil
 import subprocess
 import threading
-import tkinter as tk
-import tkinter.font as tkfont
 from datetime import datetime
-from tkinter import filedialog, messagebox, ttk
+
+from ai_env_clone.version import app_title, handle_version_flag
+
+# 版本查询必须先于 import tkinter 生效：版本号不该依赖 GUI 库——CI、最小化容器、
+# 只做版本核对的脚本可能没装 tkinter（本项目的受管 Python 就没有）。命中即退出，
+# 界面完全不启动。这段顺序由 tests/test_version.py 断言，别挪到 tkinter 之后。
+if handle_version_flag(sys.argv[1:]):
+    raise SystemExit(0)
+
+import tkinter as tk  # noqa: E402 - 必须在版本查询之后导入，见上
+import tkinter.font as tkfont  # noqa: E402
+from tkinter import filedialog, messagebox, ttk  # noqa: E402
 
 from ai_env_clone.adapters import get_adapter, list_adapters
 from ai_env_clone.adapters.base import MULTI_MACHINE_CYCLE_HINT
@@ -51,7 +64,7 @@ from ai_env_clone.core import (
     session_workspaces_lines,
 )
 
-APP_TITLE_TPL = "%s 备份迁移工具"  # % (tool_display_name,)
+# 主窗口标题模板（含版本号）定义在 ai_env_clone/version.py，见上方 import。
 BROWSER_TITLE_TPL = "还原备份/快照"
 
 
@@ -158,7 +171,7 @@ class QoderBackupApp:
         last_tool = _load_last_tool()
         default_tool = last_tool or (self._tool_names[0] if self._tool_names else "")
         self.adapter = get_adapter(default_tool)
-        self.root.title(APP_TITLE_TPL % self.adapter.display_name)
+        self.root.title(app_title(self.adapter.display_name))
 
         self.root_dir = self._detect_root()
         self.items = self.adapter.build_items(self.root_dir)
@@ -205,7 +218,7 @@ class QoderBackupApp:
         self.other_vars.clear()
 
         # 同步所有涉及工具名的标题
-        self.root.title(APP_TITLE_TPL % self.adapter.display_name)
+        self.root.title(app_title(self.adapter.display_name))
         self.dir_frame.config(text="%s 数据目录" % self.adapter.display_name)
 
         self._refresh_items()

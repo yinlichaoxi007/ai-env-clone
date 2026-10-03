@@ -186,17 +186,20 @@ GUI 界面要点：
 
 ### CLI（命令行）
 
-> 当前 CLI 入口正在完善中，核心逻辑层 `ai_env_clone.core` 已完全解耦，可独立调用 `export_backup` / `import_backup` / `inspect_backup`。
+**版本查询**（已可用；不启动界面，`-V` 亦可）：
 
 ```bash
-# 备份
-python -m ai_env_clone --backup --out ./my-backup.zip
-
-# 恢复
-python -m ai_env_clone --restore --in ./my-backup.zip
+python -m ai_env_clone --version
+# → AiEnvClone 0.2.0-rc.1
 ```
 
-（具体 CLI 参数以发布版本为准，请关注 Release Notes。）
+> 打包版 exe 的「属性 → 详细信息」里是**同一个版本号**——它由 `ai_env_clone/version.py` 生成，与窗口标题、`--version` 同源，不会出现「标题一个号、属性页另一个号」。
+
+备份 / 还原的 CLI 子命令**尚未实现**：当前 `python -m ai_env_clone` 只会启动图形界面，核心逻辑层 `ai_env_clone.core` 已完全解耦，脚本里可直接调用。
+
+```python
+from ai_env_clone.core import export_backup, import_backup
+```
 
 ### 备份包说明
 
@@ -356,7 +359,8 @@ python -m ai_env_clone.dsh_repair repair-data <文件或目录> --apply --fix-du
 
 ```
 ai_env_clone/                包（import 名 ai_env_clone，产品名 AiEnvClone）
-├── __init__.py        包初始化与 __version__
+├── __init__.py        包初始化（__version__ 由 version.py 再导出）
+├── version.py         产品标识与版本号（唯一来源：窗口标题 / --version / exe 版本资源均由它派生）
 ├── __main__.py        图形界面层（tkinter），统一入口，负责交互与进度展示
 ├── core.py            通用核心层（扫描/打包/校验/恢复/SQLite快照/ZipSlip防护），与具体工具解耦
 ├── compress_estimate.py  压缩体积预估（经验系数 + 可校准缓存）
@@ -618,14 +622,20 @@ On Windows you can also double-click `run.bat` (requires Python 3.10+ installed 
 
 ### CLI
 
-> The CLI entry is being finalized. The core layer `ai_env_clone.core` is fully decoupled and callable via `export_backup` / `import_backup` / `inspect_backup`.
+**Version query** (available now; does not start the GUI; `-V` works too):
 
 ```bash
-python -m ai_env_clone --backup --out ./my-backup.zip
-python -m ai_env_clone --restore --in ./my-backup.zip
+python -m ai_env_clone --version
+# → AiEnvClone 0.2.0-rc.1
 ```
 
-(Exact CLI flags follow the released version; see Release Notes.)
+> The packaged `.exe` shows the **same version** under Properties → Details — it is generated from `ai_env_clone/version.py`, the same source as the window title and `--version`, so they cannot disagree.
+
+Backup / restore CLI subcommands are **not implemented yet**: `python -m ai_env_clone` currently just opens the GUI. The core layer `ai_env_clone.core` is fully decoupled and can be called directly from scripts:
+
+```python
+from ai_env_clone.core import export_backup, import_backup
+```
 
 ### About the backup archive
 
@@ -782,7 +792,8 @@ Some tools store session message files deeply nested (for example CodeBuddy uses
 
 ```
 ai_env_clone/                package (import name ai_env_clone, product name AiEnvClone)
-├── __init__.py        package init & __version__
+├── __init__.py        package init (re-exports __version__ from version.py)
+├── version.py         product identity & version (single source for window title / --version / exe version resource)
 ├── __main__.py        GUI layer (tkinter), unified entry point, interaction & progress
 ├── core.py            generic core (scan / pack / verify / restore / SQLite snapshot / Zip Slip guard), tool-agnostic
 ├── compress_estimate.py  compressed-size estimation (empirical ratios + calibratable cache)
