@@ -138,5 +138,133 @@ class TestItemContracts(unittest.TestCase):
         self.assertEqual(_agg_prefix("profiles_patch:desktop"), "profiles_patch")
 
 
+DB_SUFFIXES = (".db", ".sqlite", ".sqlite3")
+# SQLite 的伴随文件不算「独立的库」，与主库同进同出即可。
+DB_SIDE_SUFFIXES = ("-wal", "-shm", "-journal")
+
+#: 期望的「整库覆盖」工具（会话/记录集中在单文件库里，还原 = 整库换掉）。
+#: 这份名单必须与 :attr:`BaseAdapter.RESTORE_LIBRARY_FILES` 的声明一致；
+#: 任一产品改了存储形态，两个方向都会失败，提醒同步——正是我们想要的效果。
+LIBRARY_MODE_TOOLS = {"qoder", "workbuddy", "trae-cn", "trae-solo-cn", "zcode"}
+
+
+def _is_library_file(path: str) -> bool:
+    """按扩展名判断某条目路径是否是「聚合型单文件库」（SQLite 主库）。"""
+    base = os.path.basename(path or "").lower()
+    if base.endswith(DB_SIDE_SUFFIXES):
+        return False
+    return base.endswith(DB_SUFFIXES)
+
+
+class TestRestoreSemanticsContract(unittest.TestCase):
+    """还原语义的**声明必须与磁盘事实一致**，否则界面提示会失真。
+
+    界面按适配器区分还原措辞：整库覆盖型工具要说清「库里原有记录会被替换」，
+    文件落盘型工具则说明「其他数据不受影响」。措辞一旦与真实行为不符，用户会
+    按错误的心智模型操作（2026-10-03 之前所有工具都被统一告知「会话为新增、
+    不会覆盖已有会话」，对整库覆盖型工具是**假的**）。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.by_tool: dict[str, list] = {}
+        cls.adapters: dict[str, object] = {}
+        for name in list_adapters():
+            ad = get_adapter(name)
+            cls.adapters[name] = ad
+            try:
+                _root, items = _build(ad)
+            except Exception:  # noqa: BLE001 - 由 TestItemContracts 统一报错
+                items = []
+            cls.by_tool[name] = items
+
+    def test_declaration_matches_default_checked_library_files(self) -> None:
+        """★ 核心守卫：声明了库文件 ⇔ 默认勾选条目里确实有库文件。
+
+        两个方向都要查：
+        - 有默认勾选的 ``.db``/``.sqlite`` 却没声明 ⇒ 提示会说「只增不删」，
+          而实际会整库覆盖，属**危险**的失真；
+        - 声明了库文件但默认勾选里没有 ⇒ 提示过分吓人，会拦住正常还原。
+        """
+        problems = []
+        for name, items in self.by_tool.items():
+            if not items:
+                continue
+            declared = bool(getattr(self.adapters[name], "RESTORE_LIBRARY_FILES", ()))
+            actual = sorted(
+                {os.path.basename(it.path) for it in items
+                 if it.recommended and it.exists and _is_library_file(it.path)}
+            )
+            if actual and not declared:
+                problems.append(
+                    "%s：默认勾选里有库文件 %s，但未声明 RESTORE_LIBRARY_FILES" % (name, actual)
+                )
+            if declared and not actual:
+                problems.append(
+                    "%s：声明了 RESTORE_LIBRARY_FILES=%s，但默认勾选里没有对应的库文件"
+                    % (name, getattr(self.adapters[name], "RESTORE_LIBRARY_FILES", ()))
+                )
+            # 逐名核对：默认勾选的库文件必须都被点名，否则提示会漏掉某个库
+            # （用户以为那个库不受影响，实际会被换掉）。
+            declared_names = set(getattr(self.adapters[name], "RESTORE_LIBRARY_FILES", ()))
+            missing = sorted(set(actual) - declared_names)
+            if actual and missing:
+                problems.append(
+                    "%s：默认勾选的库文件 %s 未写进 RESTORE_LIBRARY_FILES" % (name, missing)
+                )
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_library_mode_tool_set_is_expected(self) -> None:
+        """整库覆盖型的**工具名单**必须与预期一致。
+
+        名单是文档/提示的对外承诺，不该静默变化。产品改了存储形态（例如改成
+        按文件落盘）时本用例会失败，提醒同步改代码、文档与 README。
+        """
+        actual = {
+            name for name, ad in self.adapters.items()
+            if getattr(ad, "restore_replaces_library", False)
+        }
+        self.assertEqual(
+            actual, LIBRARY_MODE_TOOLS,
+            "整库覆盖型工具名单发生变化：新增 %s，移除 %s。"
+            "请同步 RESTORE_LIBRARY_FILES、README 的「覆盖 vs 融合」说明与本用例。"
+            % (sorted(actual - LIBRARY_MODE_TOOLS), sorted(LIBRARY_MODE_TOOLS - actual)),
+        )
+
+    def test_notices_are_nonempty_and_plain_text(self) -> None:
+        """两段提示都必须非空，且**不得含 Markdown 标记**。
+
+        Tk 的 ``Label``/``Text``/``messagebox`` 不渲染 Markdown，写上 ``**`` 或
+        反引号会原样显示星号（项目界面文案的硬规则）。
+        """
+        for name, ad in self.adapters.items():
+            for meth in ("restore_overwrite_notice", "restore_result_note"):
+                text = getattr(ad, meth)()
+                self.assertTrue(text.strip(), "%s.%s() 返回空文案" % (name, meth))
+                self.assertNotIn("**", text, "%s.%s() 含 Markdown 加粗标记" % (name, meth))
+                self.assertNotIn("`", text, "%s.%s() 含 Markdown 反引号" % (name, meth))
+
+    def test_library_notice_names_its_library_files(self) -> None:
+        """整库覆盖型的提示必须**点出库文件名**，否则用户不知道说的是哪个库。"""
+        for name, ad in self.adapters.items():
+            if not getattr(ad, "restore_replaces_library", False):
+                continue
+            for meth in ("restore_overwrite_notice", "restore_result_note"):
+                text = getattr(ad, meth)()
+                for fname in ad.RESTORE_LIBRARY_FILES:
+                    self.assertIn(
+                        fname, text,
+                        "%s.%s() 未提到库文件 %s" % (name, meth, fname),
+                    )
+
+    def test_file_mode_notice_does_not_claim_full_safety(self) -> None:
+        """文件落盘型也必须说清影响面（不能只说「没影响」而不交代覆盖同名文件）。"""
+        for name, ad in self.adapters.items():
+            if getattr(ad, "restore_replaces_library", False):
+                continue
+            text = ad.restore_overwrite_notice()
+            self.assertIn("文件", text, "%s 的文件落盘说明未提到「文件」" % name)
+
+
 if __name__ == "__main__":
     unittest.main()

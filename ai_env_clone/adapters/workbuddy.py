@@ -454,6 +454,11 @@ class WorkBuddyAdapter(BaseAdapter):
     name = "workbuddy"
     display_name = "WorkBuddy"
 
+    #: 会话记录集中在 ``workbuddy.db`` 的 ``sessions`` 表里 ⇒ 还原 = **整库覆盖**：
+    #: 目标机库中原有的会话会被备份里的内容取代（本工具**不做**库内并集合并，
+    #: 见 README「覆盖 vs 融合」的取舍）。界面据此提示正确的多机用法。
+    RESTORE_LIBRARY_FILES: tuple[str, ...] = ("workbuddy.db",)
+
     #: WorkBuddy 专属压缩经验系数（档位 -> 类别 -> 压缩后/源 占比）。
     #:
     #: 备份数据构成（据此归类）：

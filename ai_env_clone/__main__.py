@@ -26,6 +26,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 from ai_env_clone.adapters import get_adapter, list_adapters
+from ai_env_clone.adapters.base import MULTI_MACHINE_CYCLE_HINT
 from ai_env_clone import import_matrix, session_migration, workspace_plan
 from ai_env_clone.compress_estimate import (
     COMPRESS_LEVELS,
@@ -2580,6 +2581,22 @@ class QoderBackupApp:
         root_dir = self.root_dir
         compresslevel = self._compress_levels.get(self.compress_var.get(), DEFAULT_COMPRESS_LEVEL)
         sel_items = self._selected_items()
+        # 「完整备份」口径核对（主线程取值）：默认勾选项即本工具的**完整备份内容**
+        # （会话、记忆、规则等无法从零重建的部分）。用户若取消了其中若干项，必须
+        # 在他**刚拿到包**这一刻说清「这个包不完整」——否则等到换机还原才发现缺
+        # 数据，而源机器可能已经不用了。只统计磁盘上确实存在的项：不存在项本就
+        # 没东西可备，不该被算成「被跳过」。
+        sel_ids = {id(it) for it in sel_items}
+        skipped_defaults = sorted(
+            {
+                it.label
+                for it in self.items
+                if it.recommended
+                and it.exists
+                and self._agg_prefix(it.key) != "memories_others"
+                and id(it) not in sel_ids
+            }
+        )
         # 敏感项相关：勾选了「定位敏感文件」且存在含敏感凭证的项时，备份后自动打开定位
         locate_sensitive = self.locate_sensitive_var.get()
         sensitive_paths = [
@@ -2638,6 +2655,23 @@ class QoderBackupApp:
                     "但把备份包分享、上传或发给他人时，它们会一并外传，请留意。"
                     % "\n".join("　· %s：%s" % (lbl, note) for lbl, note in merged)
                 )
+            # 完整性口径 + 多机用法：都落在「用户刚把包拿到手」这一刻。前者防止
+            # 「以为备全了、换机才发现缺数据」；后者是本工具唯一安全的多机姿势，
+            # 只在文档里写等于没写。
+            if skipped_defaults:
+                base_msg += (
+                    "\n\n⚠ 本次不是完整备份：你已跳过 %d 项默认勾选的内容（%s）。\n"
+                    "默认勾选项即本工具的完整备份口径（会话、记忆、规则等无法从零重建的"
+                    "内容都包含在内）；如需完整备份，请重新勾选后再导一次。"
+                    % (len(skipped_defaults), "、".join(skipped_defaults))
+                )
+            else:
+                base_msg += (
+                    "\n\n本次为完整备份：默认勾选项（会话、记忆、规则等无法从零重建的"
+                    "内容）均已包含；未勾选项为可重建的插件/技能/索引，或出于安全不随包"
+                    "携带的凭证（需在新机重新填写）。"
+                )
+            base_msg += "\n\n用法提醒：%s" % MULTI_MACHINE_CYCLE_HINT
             # done payload 扩展为三元组：(title, text, reveal_paths)；reveal_paths 为空列表时主线程不定位
             reveal = sensitive_paths if (locate_sensitive and sensitive_paths) else []
             self.msg_queue.put(
@@ -2821,10 +2855,14 @@ class QoderBackupApp:
             origin_line = ("\n本包携带 %d 处源机器的路径等信息（IDE 工作区记录 / 会话正文等），"
                            "还原时会一并写回本机对应位置。\n" % len(origin_rows))
 
+        # 还原语义按适配器区分措辞：整库覆盖型工具（会话集中在单个库文件）必须
+        # 说清「库里原有记录会被替换」，否则用户会按「只增不删」去理解而误还原。
+        overwrite_notice = self.adapter.restore_overwrite_notice()
         if not messagebox.askyesno(
             "确认还原备份包",
             "即将把%s还原（覆盖写入）到：\n%s\n\n"
             "将自动解压并写入 %d 个文件（%s），无需手动解压。\n%s\n"
+            "%s\n"
             "请务必先完全退出 %s，否则可能导致数据损坏。\n是否继续？"
             % (
                 "回滚快照" if expected_kind == "rollback" else "备份包",
@@ -2832,6 +2870,7 @@ class QoderBackupApp:
                 info["file_count"],
                 human_size(info["total_bytes"]),
                 origin_line,
+                overwrite_notice,
                 self.adapter.display_name,
             ),
         ):
@@ -2910,6 +2949,9 @@ class QoderBackupApp:
         # 回滚快照与备份文件同目录（<备份工具目录>/backup/<工具名>/），方便按时间信息对比选择
         rollback_dir = self._tool_dir("backup")
         os.makedirs(rollback_dir, exist_ok=True)
+        # 还原结果说明按适配器区分（整库覆盖 vs 文件落盘）——不能在后台线程里读 Tk，
+        # 故在主线程先取好文案。
+        result_note = self.adapter.restore_result_note()
 
         def work():
             r = import_backup(
@@ -2934,9 +2976,16 @@ class QoderBackupApp:
                     "done",
                     (
                         "还原成功",
-                        "已还原 %d 个文件（备份包已自动解压覆盖，会话为新增、不会覆盖已有会话）。%s\n\n"
-                        "请重启 %s 以加载还原的会话与记忆；若会话列表为空，请确认目标机器的项目路径与源机器一致。"
-                        % (r["restored"], extra, self.adapter.display_name),
+                        "已还原 %d 个文件。\n\n%s%s\n\n"
+                        "请重启 %s 以加载还原的会话与记忆；若会话列表为空，"
+                        "请确认目标机器的项目路径与源机器一致。\n\n用法提醒：%s"
+                        % (
+                            r["restored"],
+                            result_note,
+                            extra,
+                            self.adapter.display_name,
+                            MULTI_MACHINE_CYCLE_HINT,
+                        ),
                     ),
                 )
             )

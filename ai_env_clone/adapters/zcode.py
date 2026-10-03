@@ -339,6 +339,10 @@ class ZCodeAdapter(BaseAdapter):
     name = "zcode"
     display_name = "ZCode"
 
+    #: 会话记录集中在 ``cli/db/db.sqlite``（每个数据根一份）与 ``v2/tasks-index.sqlite``
+    #: ⇒ 还原 = 整库覆盖，目标机库中原有的会话/任务会被备份内容取代。
+    RESTORE_LIBRARY_FILES: tuple[str, ...] = ("db.sqlite", "tasks-index.sqlite")
+
     #: ZCode 专属压缩经验系数（档位 -> 类别 -> 压缩后/源 占比）。
     #:
     #:   - db     : ``db.sqlite`` / ``tasks-index.sqlite``（SQLite，消息体为 JSON 文本，

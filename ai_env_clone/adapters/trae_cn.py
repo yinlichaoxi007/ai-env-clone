@@ -513,6 +513,10 @@ class TraeCnAdapter(BaseAdapter):
     #: 用户可见的产品名（安装目录仍为 ``Trae CN``）
     display_name = "TraeCode CN"
 
+    #: AI Agent 的会话记录集中在 ``ModularData/ai-agent/database.db`` ⇒ 还原 = 整库覆盖，
+    #: 目标机库中原有的会话会被备份内容取代。界面据此提示正确的多机用法。
+    RESTORE_LIBRARY_FILES: tuple[str, ...] = ("database.db",)
+
     #: Trae CN 专属压缩经验系数（档位 -> 类别 -> 压缩后/源 占比）。
     #:
     #:   - db     : ``ModularData/ai-agent/database.db``（已由产品侧加密/压缩，

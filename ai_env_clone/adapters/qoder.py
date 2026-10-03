@@ -949,6 +949,19 @@ class QoderAdapter(BaseAdapter):
     name = "qoder"
     display_name = "Qoder"
 
+    #: Qoder 的会话与账本都集中在单文件库里 ⇒ 还原 = 整库覆盖（不是文件级累加）：
+    #:   - ``local.db``             旧版会话主库（会话正文为**列级密文**，只能整库搬）
+    #:   - ``main.sqlite``          新版桌面端会话库（``chat_sessions`` / ``chat_session_messages``）
+    #:   - ``sessionMigration.sqlite`` / ``memoryMigration.sqlite``  应用内导入功能的账本
+    #: 界面据此提示「目标机库内原有会话会被替换」。磁盘上不在这几个库里的内容（记忆 md、
+    #: 配置等）仍是文件级落盘，不受影响。
+    RESTORE_LIBRARY_FILES: tuple[str, ...] = (
+        "local.db",
+        "main.sqlite",
+        "sessionMigration.sqlite",
+        "memoryMigration.sqlite",
+    )
+
     #: Qoder 专属压缩经验系数（档位 -> 类别 -> 压缩后/源 占比），按本机真实备份
     #: 反推并校准，单独维护、不与其他工具混用。
     #:

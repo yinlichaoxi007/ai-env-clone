@@ -71,6 +71,10 @@ class TraeSoloCnAdapter(BaseAdapter):
     #: 用户可见的产品名（安装目录仍为 ``TRAE SOLO CN``）
     display_name = "TraeWork CN"
 
+    #: 与 Trae CN 同族：AI Agent 会话记录集中在 ``ModularData/ai-agent/database.db``
+    #: ⇒ 还原 = 整库覆盖，目标机库中原有的会话会被备份内容取代。
+    RESTORE_LIBRARY_FILES: tuple[str, ...] = ("database.db",)
+
     #: 与 Trae CN 同族，压缩特性一致；SOLO 侧 ``snapshot/`` 与工作区元数据占比更高，
     #: other 档略微上调（详见 trae_cn.TraeCnAdapter.COMPRESS_RATIO 的说明）。
     COMPRESS_RATIO: dict[int, dict[str, float]] = {
