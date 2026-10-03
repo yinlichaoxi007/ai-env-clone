@@ -12,15 +12,24 @@
 
 说明：
 - 使用 --onefile 生成单文件；--windowed 表示无控制台窗口（纯 GUI）。
-- PyInstaller 会自动收集 ai_env_clone 包（统一入口 ``__main__.py``）及其依赖，无需额外 --add-data。
+- PyInstaller 会自动收集 ai_env_clone 包（统一入口 ``__main__.py``）及其依赖。
 - Windows 上会把**版本资源**写进 exe（文件属性 → 详细信息），内容由
   ``ai_env_clone/version.py`` 生成 ⇒ 与窗口标题、``--version`` 输出同源，不会漂移。
+- **使用说明**（帮助 → 使用说明 / ``--docs``）的纯文本由本脚本在**构建期派生**：
+  读 ``docs/使用说明.md`` → 剥离图片（``ai_env_clone.doctext.strip_images``）→ 写临时目录
+  → ``--add-data`` 打进 exe（包内根下 ``help.md``）。
+  仓库源文档**保持带图**（给开发者与仓库网页看），两者同源派生、不会漂移。
+  ★ 只带这一个**文件**、**绝不整目录加 ``docs``**：``docs/local/`` 是 gitignored 的
+  内部设计文档（本机 388 KB，CI 检出后根本不存在）⇒ 整目录会把它们误打进 exe 发给用户，
+  且造成「本机产物比 CI 大」的不一致。
+  ★ **只改本脚本一处即四平台自动生效**（CI 四平台跑的都是 ``python build_exe.py``）。
 - 若杀毒软件误报，可将 dist 目录加入白名单。
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
+import os
 import shutil
 import subprocess
 import sys
@@ -32,6 +41,8 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+from ai_env_clone.doctext import strip_images  # noqa: E402
+from ai_env_clone.resources import HELP_DOC_NAME  # noqa: E402
 from ai_env_clone.version import APP_NAME, __version__, windows_version_info  # noqa: E402
 
 # Windows 控制台默认编码可能是 cp1252，无法打印中文。优先切 UTF-8；
@@ -50,6 +61,8 @@ if hasattr(sys.stdout, "reconfigure"):
 ENTRY = HERE / "ai_env_clone" / "__main__.py"
 DIST = HERE / "dist"
 BUILD = HERE / "build"
+#: 仓库里的使用说明源文档（**带图**，给开发者与仓库网页看；打包时剥离图片后另存）
+HELP_SRC = HERE / "docs" / "使用说明.md"
 
 
 def cleanup_build_dir() -> None:
@@ -79,6 +92,40 @@ def version_file(exe_name: str):
         path = Path(tmp) / "version_info.txt"
         path.write_text(windows_version_info(exe_name), encoding="utf-8")
         print("版本资源：%s → %s（%s）" % (path.name, exe_name, __version__))
+        yield path
+
+
+@contextlib.contextmanager
+def doc_text_file():
+    """临时写出「无图版使用说明」，供 ``--add-data`` 打进 exe。
+
+    流程：读仓库源文档（**带图**）→ :func:`ai_env_clone.doctext.strip_images`
+    （与运行时查看器**同一份实现**）→ 写临时目录 → 随 ``with`` 块内的
+    ``--add-data`` 进包。包内根下即 :data:`HELP_DOC_NAME`（ASCII 名）。
+
+    三个刻意的选择：
+
+    1. **构建期派生，而不是运行时剥离**：运行时只剩「幂等兜底」，
+       两模式行为必然一致；仓库源文档得以保持带图。
+    2. **ASCII 包内名**：``--add-data`` 的两段路径还要按 ``os.pathsep`` 切分，
+       临时目录在 Windows 上含盘符、POSIX 上是 ``/tmp/…`` ⇒ 全 ASCII 一次性
+       绕开「中文文件名 + 路径分隔符」的全部跨平台边缘情况。
+    3. **只带这一个文件**：见模块 docstring —— 整目录加 ``docs`` 会把
+       gitignored 的 ``docs/local/`` 内部设计文档误打进 exe。
+    """
+    if not HELP_SRC.exists():
+        print("找不到使用说明源文档：%s（将不随包分发，界面「使用说明」会提示缺失）"
+              % HELP_SRC, file=sys.stderr)
+        yield None
+        return
+    text = strip_images(HELP_SRC.read_text(encoding="utf-8"))
+    with tempfile.TemporaryDirectory(prefix="aienvclone-doc-") as tmp:
+        path = Path(tmp) / HELP_DOC_NAME
+        # 显式保留源文档的行尾（默认换行），避免 Windows 上写出 CRLF、
+        # 在 Linux/macOS 上写出与仓库不一致的行尾。
+        path.write_text(text, encoding="utf-8", newline="")
+        print("使用说明（无图）：%s ← %s（%d 字符）"
+              % (HELP_DOC_NAME, HELP_SRC.name, len(text)))
         yield path
 
 
@@ -112,6 +159,11 @@ def main() -> int:
         if sys.platform == "win32":
             vf = stack.enter_context(version_file(args.name + ".exe"))
             cmd += ["--version-file", str(vf)]
+        # 使用说明（无图版）：四平台都带。目标目录写 "." ⇒ exe 内即根下 help.md。
+        # ★ 用 os.pathsep 拼两段路径（Windows ";" / POSIX ":"），别手拼字符串。
+        doc = stack.enter_context(doc_text_file())
+        if doc is not None:
+            cmd += ["--add-data", str(doc) + os.pathsep + "."]
         cmd.append(str(ENTRY))
 
         print("执行：%s" % " ".join(cmd))

@@ -27,12 +27,30 @@ import threading
 from datetime import datetime
 
 from ai_env_clone.version import app_title, handle_version_flag
+from ai_env_clone.doctext import (
+    handle_docs_flag,
+    md_to_paragraphs,
+    plain_text,
+)
+from ai_env_clone.resources import read_help_doc, resource_path
+from ai_env_clone.updater import handle_check_update_flag, platform_asset_name
+from ai_env_clone import prefs as _prefs
 
 # 版本查询必须先于 import tkinter 生效：版本号不该依赖 GUI 库——CI、最小化容器、
 # 只做版本核对的脚本可能没装 tkinter（本项目的受管 Python 就没有）。命中即退出，
 # 界面完全不启动。这段顺序由 tests/test_version.py 断言，别挪到 tkinter 之后。
 if handle_version_flag(sys.argv[1:]):
     raise SystemExit(0)
+
+# 「打印使用说明」同理不该依赖 GUI 库：CLI 只能输出纯文本，而使用说明菜单
+# （帮助 → 使用说明）读的也是同一份渲染结果，口径一致性由「共用纯函数」保证。
+if handle_docs_flag(sys.argv[1:]):
+    raise SystemExit(0)
+
+# 「检查更新」同理不依赖 GUI 库；退出码 0=有新版本 / 1=已是最新 / 2=检查失败。
+_rc = handle_check_update_flag(sys.argv[1:])
+if _rc is not None:
+    raise SystemExit(_rc)
 
 import tkinter as tk  # noqa: E402 - 必须在版本查询之后导入，见上
 import tkinter.font as tkfont  # noqa: E402
@@ -114,37 +132,27 @@ def human_size(n: float) -> str:
 # --------------------------------------------------------------------------- #
 # 用户偏好缓存（记住上次选择的工具，下次启动保持）
 # --------------------------------------------------------------------------- #
-#: 偏好缓存文件名，存于 ``compress_estimate.cache_dir()``（用户级缓存目录，不进仓库）。
-_PREFS_FILENAME = "prefs.json"
+# 实现已抽到 ``ai_env_clone/prefs.py``：``--docs`` / ``--check-update`` 这些
+# CLI 分支生效在 ``import tkinter`` 之前，也要读「更新设置」（代理、通道），
+# 所以偏好读写不能留在本文件（它 import 了 tkinter）。
+# ★ 那里改成了**读-改-写**（深度合并）：旧实现 ``json.dump({"last_tool": …})``
+# 是整文件覆盖，直接复用会把同文件的 ``update`` 段抹掉。
+_PREFS_FILENAME = _prefs.PREFS_FILENAME
 
 
 def _prefs_path() -> str:
-    """偏好缓存文件完整路径。"""
-    from ai_env_clone.compress_estimate import cache_dir
-
-    return os.path.join(cache_dir(), _PREFS_FILENAME)
+    """偏好缓存文件完整路径（转发到 ``prefs.prefs_path``）。"""
+    return _prefs.prefs_path()
 
 
 def _load_last_tool() -> str | None:
     """读用户上次选择的工具标识；无缓存 / 损坏 / 该工具已注销则返回 None（回退默认）。"""
-    try:
-        with open(_prefs_path(), "r", encoding="utf-8") as f:
-            data = json.load(f)
-        name = data.get("last_tool")
-    except (OSError, ValueError, TypeError):
-        return None
-    if not isinstance(name, str) or name not in list_adapters():
-        return None
-    return name
+    return _prefs.load_last_tool()
 
 
 def _save_last_tool(name: str) -> None:
     """记录用户当前选择的工具，供下次启动保持。写失败静默，不影响主流程。"""
-    try:
-        with open(_prefs_path(), "w", encoding="utf-8") as f:
-            json.dump({"last_tool": name}, f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
+    _prefs.save_last_tool(name)
 
 
 class QoderBackupApp:

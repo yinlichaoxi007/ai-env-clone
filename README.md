@@ -193,6 +193,25 @@ python -m ai_env_clone --version
 # → AiEnvClone 0.2.0-rc.1
 ```
 
+**使用说明**（已可用；不启动界面）：在终端打印使用说明的**纯文字**版本，
+与图形界面「帮助 → 使用说明」**同源**（同一份渲染函数、同一份文档），因此两边内容必然一致。
+使用说明**不显示图片**——exe 里的那份是打包时由仓库文档自动派生的无图版。
+
+```bash
+python -m ai_env_clone --docs
+```
+
+**检查更新**（已可用；不启动界面、**不下载**）：
+
+```bash
+python -m ai_env_clone --check-update
+```
+
+退出码：`0` = 有新版本 / `1` = 已是最新 / `2` = 检查失败（脚本里可直接判断）。
+优先访问 GitHub，失败自动改从 Gitee 重试；两侧都失败时会**分别给出各自的原因**
+（而不是笼统一句「检查更新失败」），便于判断该换网络还是换代理。
+代理地址可在图形界面「设置 → 更新设置」填写，`--check-update` 会自动沿用。
+
 > 打包版 exe 的「属性 → 详细信息」里是**同一个版本号**——它由 `ai_env_clone/version.py` 生成，与窗口标题、`--version` 同源，不会出现「标题一个号、属性页另一个号」。
 
 备份 / 还原的 CLI 子命令**尚未实现**：当前 `python -m ai_env_clone` 只会启动图形界面，核心逻辑层 `ai_env_clone.core` 已完全解耦，脚本里可直接调用。
@@ -360,7 +379,11 @@ python -m ai_env_clone.dsh_repair repair-data <文件或目录> --apply --fix-du
 ```
 ai_env_clone/                包（import 名 ai_env_clone，产品名 AiEnvClone）
 ├── __init__.py        包初始化（__version__ 由 version.py 再导出）
-├── version.py         产品标识与版本号（唯一来源：窗口标题 / --version / exe 版本资源均由它派生）
+├── version.py         产品标识与版本号（唯一来源：窗口标题 / --version / exe 版本资源均由它派生；另含保序版本比较 parse_version/is_newer，供更新检查用）
+├── doctext.py         使用说明的纯文本处理（剥离图片 + markdown→文本段落，幂等；GUI 与 --docs 共用，不依赖 tkinter）
+├── resources.py       随包资源定位（使用说明、打赏图片等；源码模式读仓库、打包模式读 sys._MEIPASS）
+├── prefs.py           用户偏好持久化（记住上次工具 + 更新设置；读-改-写，深度合并）
+├── updater.py         更新检测的只读部分（GitHub→Gitee 降级、版本/资产选择、SHA256SUMS 白名单；不依赖 tkinter）
 ├── __main__.py        图形界面层（tkinter），统一入口，负责交互与进度展示
 ├── core.py            通用核心层（扫描/打包/校验/恢复/SQLite快照/ZipSlip防护），与具体工具解耦
 ├── compress_estimate.py  压缩体积预估（经验系数 + 可校准缓存）
@@ -629,6 +652,28 @@ python -m ai_env_clone --version
 # → AiEnvClone 0.2.0-rc.1
 ```
 
+**Usage doc** (available now; does not start the GUI): prints the **plain text** form of
+the usage guide — the *same* source as "Help → 使用说明" in the GUI (one shared render
+function, one shared document), so the two can never drift. Images are **not** rendered:
+the copy shipped inside the exe is derived from the repo document at build time with
+images stripped.
+
+```bash
+python -m ai_env_clone --docs
+```
+
+**Check for updates** (available now; does not start the GUI and does **not** download):
+
+```bash
+python -m ai_env_clone --check-update
+```
+
+Exit code: `0` = update available / `1` = already up to date / `2` = check failed
+(so scripts can branch on it). Tries GitHub first and automatically retries via Gitee;
+when both fail it reports **each side's own reason** (instead of a vague "check failed"),
+so it is clear whether to change network or proxy. A proxy can be set in
+"设置 → 更新设置" in the GUI and is reused by `--check-update`.
+
 > The packaged `.exe` shows the **same version** under Properties → Details — it is generated from `ai_env_clone/version.py`, the same source as the window title and `--version`, so they cannot disagree.
 
 Backup / restore CLI subcommands are **not implemented yet**: `python -m ai_env_clone` currently just opens the GUI. The core layer `ai_env_clone.core` is fully decoupled and can be called directly from scripts:
@@ -793,7 +838,11 @@ Some tools store session message files deeply nested (for example CodeBuddy uses
 ```
 ai_env_clone/                package (import name ai_env_clone, product name AiEnvClone)
 ├── __init__.py        package init (re-exports __version__ from version.py)
-├── version.py         product identity & version (single source for window title / --version / exe version resource)
+├── version.py         product identity & version (single source for window title / --version / exe version resource; also order-preserving parse_version/is_newer for update checks)
+├── doctext.py         plain-text processing for the usage doc (strip images + markdown→paragraphs, idempotent; shared by the GUI viewer and --docs, tkinter-free)
+├── resources.py       bundled-resource lookup (usage doc, images; repo root in source mode, sys._MEIPASS when packaged)
+├── prefs.py           user preferences (last tool + update settings; read-modify-write with deep merge)
+├── updater.py         read-only update discovery (GitHub→Gitee failover, release/asset selection, SHA256SUMS whitelist; tkinter-free)
 ├── __main__.py        GUI layer (tkinter), unified entry point, interaction & progress
 ├── core.py            generic core (scan / pack / verify / restore / SQLite snapshot / Zip Slip guard), tool-agnostic
 ├── compress_estimate.py  compressed-size estimation (empirical ratios + calibratable cache)
