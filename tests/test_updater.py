@@ -21,6 +21,8 @@
 import json
 import unittest
 import urllib.error
+import urllib.request
+from unittest import mock
 
 from ai_env_clone import updater
 
@@ -103,6 +105,65 @@ class TestPlatformAsset(unittest.TestCase):
 
     def test_current_platform_is_supported(self) -> None:
         self.assertIn(updater.platform_asset_name(), updater.ASSET_NAMES.values())
+
+
+class TestOpenerUsesUrllibDefaultSSLContext(unittest.TestCase):
+    """★ **不要自己造 SSLContext 递给 urllib**——Gitee 会因此返回 **403**。
+
+    实测（同一 URL、同一请求头，交替各 3 次）：
+
+    ============================================== ==========
+    写法                                             Gitee
+    ============================================== ==========
+    ``HTTPSHandler(context=None)`` / 交给 urllib 默认 200
+    ``HTTPSHandler(context=create_default_context())`` **403**
+    ============================================== ==========
+
+    GitHub 两种写法都得 200，所以只有 Gitee 判。
+
+    ⚠️ 容易总结错的地方：**别把结论写成「不能有 context」**。urllib 3.13 自己
+    构造的默认 ``HTTPSHandler`` 也是**带** context 的（``_context`` 非 None），
+    且它与手搓 `create_default_context()` 在 ``verify_mode`` / ``options`` /
+    加密套件 / ALPN / 证书库上**逐项完全相同**，却一个 200 一个 403。所以真正
+    起作用的不是 context 的属性，而是「这个 context 是谁造的、何时造的」。
+
+    这条**离线单测永远发现不了**（打桩的 HTTP 不会 403），只会在真实联网时静默
+    毁掉「GitHub 失败回落 Gitee」这条兜底路径，故必须用契约测试钉住：
+    **凡我们自己传给 ``build_opener`` 的 handler，都不得携带自定义 context。**
+    """
+
+    def _passed_handlers(self):
+        """截获我们传给 ``build_opener`` 的 handler 列表（不真的建 opener）。"""
+        calls = []
+        with mock.patch.object(urllib.request, "build_opener",
+                               side_effect=lambda *a, **k: calls.append(a) or mock.Mock()):
+            updater.build_opener("")
+            updater.build_opener("http://127.0.0.1:7897")
+        return calls
+
+    def test_never_passes_own_ssl_context(self) -> None:
+        calls = self._passed_handlers()
+        self.assertEqual(len(calls), 2, "空代理与显式代理两条路径都要覆盖")
+        for args in calls:
+            for h in args:
+                if isinstance(h, urllib.request.HTTPSHandler):
+                    self.assertIsNone(
+                        h._context,
+                        "不得把自定义 SSLContext 传给 build_opener："
+                        "Gitee 对显式 context 返回 403（交给 urllib 默认的即可）",
+                    )
+
+    def test_still_returns_real_opener(self) -> None:
+        """去掉自定义 context 不能顺手把代理也丢了（两者在同一个函数里）。"""
+        op = updater.build_opener("http://127.0.0.1:7897")
+        ps = [h for h in op.handlers
+              if isinstance(h, urllib.request.ProxyHandler)]
+        self.assertTrue(ps, "应存在 ProxyHandler")
+        self.assertEqual(ps[0].proxies.get("https"), "http://127.0.0.1:7897")
+        # urllib 默认那一个 HTTPSHandler 必须在（否则 https 直接不可用）
+        self.assertTrue([h for h in op.handlers
+                         if isinstance(h, urllib.request.HTTPSHandler)],
+                        "应保留 urllib 默认的 HTTPSHandler")
 
 
 class TestSourceFailover(unittest.TestCase):

@@ -184,13 +184,27 @@ def build_opener(proxy: str = ""):
 
     ★ **不读系统 ``ProxyEnable``**：本机实测它是关的、但 ``ProxyServer`` 已填好，
     两者不一致；只认「界面设置 > 环境变量 > 直连」这条链。
+
+    ★ **不要自己造 ``SSLContext`` 递给 urllib**（曾写成
+    ``build_opener(handler, HTTPSHandler(context=ssl.create_default_context()))``）。
+    实测 Gitee 侧据此返回 **403**：同一 URL、同样请求头，交替各 3 次 ——
+    交给 urllib 默认 handler 的 3/3 得 200，自带 context 的 3/3 得 403
+    （GitHub 两种写法都 200，故只有 Gitee 判）。
+
+    ⚠️ 别把结论记成「不能有 context」：urllib 3.13 自己构造的默认
+    ``HTTPSHandler`` 也是**带** context 的，且它与手搓 ``create_default_context()``
+    在 ``verify_mode`` / ``options`` / 加密套件 / ALPN / 证书库上**逐项完全相同**，
+    却一个 200 一个 403 ⇒ 起作用的是「context 由谁、何时构造」，不是它的属性。
+    因此这里只构造 ProxyHandler，HTTPSHandler 一律留给 ``build_opener`` 默认添加
+    （证书校验照旧是开的）。契约由 ``tests/test_updater.py``
+    ``TestOpenerUsesUrllibDefaultSSLContext`` 钉住。
     """
     if proxy:
         handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
     else:
         handler = urllib.request.ProxyHandler()
-    ctx = ssl.create_default_context()
-    return urllib.request.build_opener(handler, urllib.request.HTTPSHandler(context=ctx))
+    return urllib.request.build_opener(handler)
+
 
 def _get_json(opener, url: str, timeout: float = _TIMEOUT) -> object:
     req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT,
