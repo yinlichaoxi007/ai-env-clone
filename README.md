@@ -213,6 +213,8 @@ python -m ai_env_clone --check-update
 （而不是笼统一句「检查更新失败」），便于判断该换网络还是换代理。
 代理地址可在图形界面「设置 → 更新设置」填写，`--check-update` 会自动沿用。
 
+**下载与自动替换尚未实现**：目前只做到「检测 + 展示」——命令行 `--check-update`，以及图形界面「帮助 → 关于 → 检查更新」。下载、校验与 Windows 原地替换是后续步骤。
+
 > 打包版 exe 的「属性 → 详细信息」里是**同一个版本号**——它由 `ai_env_clone/version.py` 生成，与「帮助 → 关于」对话框、`--version` 同源，不会出现「关于里一个号、属性页另一个号」。
 
 备份 / 还原的 CLI 子命令**尚未实现**：当前 `python -m ai_env_clone` 只会启动图形界面，核心逻辑层 `ai_env_clone.core` 已完全解耦，脚本里可直接调用。
@@ -675,6 +677,8 @@ Exit code: `0` = update available / `1` = already up to date / `2` = check faile
 when both fail it reports **each side's own reason** (instead of a vague "check failed"),
 so it is clear whether to change network or proxy. A proxy can be set in
 "设置 → 更新设置" in the GUI and is reused by `--check-update`.
+
+**Downloading and self-replacement are not implemented yet**: only "detection + display" exists today — the `--check-update` command and **Help → About → Check for updates** in the GUI.
 
 > The packaged `.exe` shows the **same version** under Properties → Details — it is generated from `ai_env_clone/version.py`, the same source as the **Help → About** dialog and `--version`, so they cannot disagree.
 
