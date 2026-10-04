@@ -5059,7 +5059,7 @@ class MigrateDialog:
                     self.win.after(0, self._apply_archive_meta, token, path, info,
                                    tool, src, None, "")
                     return
-                arc = archive_source.extract_session_root(path, tool)
+                arc = archive_source.extract_session_root(path, tool, light=True)
                 try:
                     items = session_migration.list_source_sessions(tool, arc.root)
                 except Exception:
@@ -5123,9 +5123,10 @@ class MigrateDialog:
         if items:
             self.listbox.selection_set(0)
         self.import_btn.configure(state="normal")
+        note = ("；会话正文将在导入时解出" if arc.deferred else "")
         self.status_lbl.configure(
-            text="已从备份包解出 %d 个可导入会话（按需解出 %d/%d 个条目）"
-                 % (len(items), arc.extracted, arc.total),
+            text="已从备份包解出 %d 个可导入会话（按需解出 %d/%d 个条目%s）"
+                 % (len(items), arc.extracted, arc.total, note),
             foreground="#0a6" if items else "#a05a00",
         )
         self._refresh_preview()
@@ -5401,9 +5402,14 @@ class MigrateDialog:
         """逐条导入（在后台线程执行），结果写入 ``self._result``。"""
         done: list = []
         errs: list = []
+        arc = self._archive
         for it, kwargs in jobs:
             title = it.get("title") or "(无标题)"
             try:
+                # 延迟解包模式：列表阶段只解了索引，先按会话补解正文再迁移。
+                # 不是包来源（走页签一的数据目录）时 materialize 是空操作。
+                if arc is not None:
+                    arc.materialize(kwargs["source_path"])
                 sid = session_migration.migrate_session(
                     warn=lambda m: self.warns.append(m), **kwargs
                 )

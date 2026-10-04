@@ -15,6 +15,10 @@
 2. **按需解包**：CodeBuddy 的 history 包可能几百 MB，但一次导入只需会话子树 ⇒
    只解定位到的子树 + 关键伴随文件（如 ``session-workspaces.json``），不全量解包。
    解出的层级保留归档内相对路径，这样包内的工作区映射能被既有反查逻辑自动读到。
+   更进一步，``light=True`` 时**连子树都只解「列表要读的那几个文件」**（每会话的
+   ``index.json`` + 标题兜底的那条消息），正文留给 :meth:`ArchiveSource.materialize`
+   在真正导入该会话时补解——写盘是解包的绝对瓶颈（Windows 上每个文件约 1 ms），
+   少写文件才是真正的提速手段。
 
 定位规则（工具 -> 「会话数据根」）
 --------------------------------
@@ -35,6 +39,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import posixpath
 import shutil
@@ -51,6 +56,7 @@ __all__ = [
     "ArchiveSource",
     "TEMP_PREFIX",
     "LOCATABLE_TOOLS",
+    "LIGHT_TOOLS",
     "locate_session_root",
     "extract_session_root",
     "cleanup_stale",
@@ -68,6 +74,12 @@ PROBE_MAX_DEPTH = 4
 
 #: 本模块能定位出会话数据根的工具（= ``import_matrix`` 里可作来源的工具）。
 LOCATABLE_TOOLS = frozenset({"reasonix", "codebuddy", "workbuddy", "zcode", "dsh"})
+
+#: 支持「列表阶段只解索引、正文留到导入时补解」的工具。
+#: 只有 CodeBuddy 成立：它的枚举靠 ``index.json``，消息正文是独立文件；
+#: 其余工具的会话正文**就是**它的枚举依据（reasonix/workbuddy 的 ``.jsonl``、
+#: zcode/dsh 的库文件），收窄会直接让列表空掉。
+LIGHT_TOOLS = frozenset({"codebuddy"})
 
 #: 与「会话数据根」同级的伴随文件：扫描 / 反查逻辑会读它，解包时一并取出。
 #: （CodeBuddy 的 ``session-workspaces.json`` 落在 history 的上一层。）
@@ -176,6 +188,8 @@ class ArchiveSource:
     reason: str = ""          # "path"（按路径段命中）/ "fallback"（有界搜索命中）
     extracted: int = 0        # 实际解出的条目数
     total: int = 0            # 包内文件条目总数（用于说明「未全量解包」）
+    zip_path: str = ""        # 源包路径（``deferred`` 时补解要再开一次）
+    deferred: bool = False    # 是否「列表阶段只解了索引，正文待补解」
     _cleaned: bool = field(default=False, repr=False)
 
     @property
@@ -189,6 +203,34 @@ class ArchiveSource:
         self._cleaned = True
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
+    def materialize(self, local_dir: str) -> bool:
+        """把 ``local_dir`` 对应的归档子树**补解**出来。
+
+        ``deferred`` 模式下列表阶段只解了每会话的 ``index.json``（+ 标题兜底的那条
+        消息），正文要等到真正导入时才需要。本方法按需把该会话目录整棵解出。
+
+        :return: 是否真的补解了。``local_dir`` 不在本来源根下（例如用户其实在做
+            「从数据目录导入」）或本来源不是延迟模式时返回 ``False``，不做任何事。
+        """
+        if not self.deferred or self._cleaned:
+            return False
+        base = os.path.realpath(self.root)
+        try:
+            target = os.path.realpath(local_dir)
+            if not os.path.isdir(target) or target == base:
+                return False
+            if os.path.commonpath([base, target]) != base:
+                return False
+        except (OSError, ValueError):
+            return False
+        rel = os.path.relpath(target, base).replace(os.sep, "/")
+        sub = posixpath.join(self.prefix, rel) if self.prefix else rel
+        with zipfile.ZipFile(self.zip_path) as zf:
+            infos = [i for i in zf.infolist() if not i.is_dir()]
+            names = [_norm(i.filename) for i in infos]
+            _extract_subtree(zf, infos, names, sub, os.path.realpath(self.temp_dir))
+        return True
+
     def __enter__(self) -> "ArchiveSource":
         return self
 
@@ -200,8 +242,14 @@ class ArchiveSource:
 # --------------------------------------------------------------------------- #
 # 解包
 # --------------------------------------------------------------------------- #
-def extract_session_root(zip_path: str, tool: str) -> ArchiveSource:
+def extract_session_root(zip_path: str, tool: str,
+                         light: bool = False) -> ArchiveSource:
     """把 ``zip_path`` 里 ``tool`` 的会话子树按需解到临时目录。
+
+    :param light: ``True`` 时只解**列表阶段真正会读**的成员（见
+        :func:`_light_names`），其余正文留给 :meth:`ArchiveSource.materialize` 在
+        真正导入该会话时补解。只对 CodeBuddy 生效（其余工具的会话正文就是它的
+        枚举依据，收窄会让列表直接空掉）。
 
     :raise ArchiveSourceError: 坏包 / 空包 / 定位不到会话数据 / 解包失败。
         （任何失败路径都会先删掉已建的临时目录，不留垃圾。）
@@ -223,9 +271,14 @@ def extract_session_root(zip_path: str, tool: str) -> ArchiveSource:
         # ``root_real`` 与「已建目录」在循环外算好：``realpath`` / ``makedirs`` 都是
         # 逐个成员的系统调用，放进循环会让解包慢上数倍（实测 6000 个成员 +5s）。
         root_real = os.path.realpath(tmp)
+        deferred = False
         try:
             if prefix is not None:
-                picked = _extract_subtree(zf, infos, names, prefix, root_real)
+                keep = None
+                if light and tool in LIGHT_TOOLS:
+                    keep = _light_names(zf, infos, names, prefix, tool)
+                    deferred = True
+                picked = _extract_subtree(zf, infos, names, prefix, root_real, keep)
                 root = _join_rel(tmp, prefix)
                 reason = "path"
             else:
@@ -243,7 +296,73 @@ def extract_session_root(zip_path: str, tool: str) -> ArchiveSource:
             raise ArchiveSourceError("解包失败：%s: %s" % (type(exc).__name__, exc)) from exc
 
     return ArchiveSource(tool=tool, root=root, temp_dir=tmp, prefix=prefix or "",
-                         reason=reason, extracted=picked, total=len(infos))
+                         reason=reason, extracted=picked, total=len(infos),
+                         zip_path=zip_path, deferred=deferred)
+
+
+def _first_message_id(doc) -> str:
+    """会话 ``index.json`` 里「标题兜底」会读的那条消息 id。
+
+    **必须与** ``session_migration._codebuddy_title_from_first_message`` **取同一条**，
+    否则列表阶段会漏解那条消息，标题退化为空（列表质量下降）。
+    """
+    if not isinstance(doc, dict):
+        return ""
+    msgs = doc.get("messages") or []
+    for m in msgs:
+        if isinstance(m, dict) and m.get("role") == "user":
+            return str(m.get("id") or "")
+    if msgs and isinstance(msgs[0], dict):
+        return str(msgs[0].get("id") or "")
+    return ""
+
+
+def _index_has_title(doc) -> bool:
+    """``index.json`` 自身是否已给出标题。
+
+    **必须与** ``session_migration._scan_codebuddy`` **取同一判据**：只有它为假时
+    那边才会去读正文兜底，也只有那时才需要解出那条消息。
+    """
+    if not isinstance(doc, dict):
+        return False
+    if doc.get("title") or doc.get("name"):
+        return True
+    convs = doc.get("conversations") or []
+    return bool(convs and isinstance(convs[0], dict) and convs[0].get("name"))
+
+
+def _light_names(zf: zipfile.ZipFile, infos: Sequence[zipfile.ZipInfo],
+                 names: Sequence[str], prefix: str, tool: str) -> set:
+    """列表阶段**真正会被读**的归档成员名集合（当前只有 CodeBuddy）。
+
+    ``list_source_sessions`` 对 CodeBuddy 只读两样东西：
+
+    - 每会话的 ``index.json``（标题 / 消息索引）；
+    - ``index.json`` 没标题时，它指向的那**一条**消息（标题兜底）。
+
+    其余 ``messages/*.json`` 是会话正文，导入时才用得上 ⇒ 列表阶段不解，
+    写盘文件数从「每会话 1 + N 条消息」降到「每会话 1~2 个」。
+    """
+    if tool != "codebuddy":
+        return set()
+    inside = (prefix + "/") if prefix else ""
+    wanted: set = set()
+    for info, rel in zip(infos, names):
+        if not rel.startswith(inside) or posixpath.basename(rel) != "index.json":
+            continue
+        wanted.add(rel)
+        try:
+            with zf.open(info) as fp:
+                doc = json.loads(fp.read().decode("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        if _index_has_title(doc):
+            continue  # 已有标题，不会走正文兜底，那条消息不用解
+        mid = _first_message_id(doc)
+        if mid:
+            wanted.add(posixpath.join(posixpath.dirname(rel), "messages",
+                                      "%s.json" % mid))
+    return wanted
 
 
 def _make_dirs(parent: str, made: set) -> None:
@@ -275,19 +394,25 @@ def _write_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, root_real: str,
 
 
 def _extract_subtree(zf: zipfile.ZipFile, infos: Sequence[zipfile.ZipInfo],
-                     names: Sequence[str], prefix: str, root_real: str) -> int:
-    """只解 ``prefix`` 子树 + 同级伴随文件。"""
+                     names: Sequence[str], prefix: str, root_real: str,
+                     keep: Optional[set] = None) -> int:
+    """只解 ``prefix`` 子树 + 同级伴随文件。
+
+    ``keep`` 非空时再收窄到该成员名集合（列表阶段的「只解索引」，见
+    :func:`_light_names`）。**伴随文件不受收窄影响**——CodeBuddy 的工作区映射
+    就靠它，缺了会让落点判定失效。
+    """
     inside = (prefix + "/") if prefix else ""
     parent = posixpath.dirname(prefix) if prefix else ""
     picked = 0
     made: set = set()
     for info, rel in zip(infos, names):
-        keep = rel.startswith(inside) if inside else True
-        if not keep and parent:
-            # 伴随文件（如 codebuddy 的 session-workspaces.json）与会话根同级
-            keep = (posixpath.dirname(rel) == parent
-                    and posixpath.basename(rel) in COMPANION_NAMES)
-        if not keep:
+        in_tree = rel.startswith(inside) if inside else True
+        if in_tree:
+            if keep is not None and rel not in keep:
+                continue
+        elif not (parent and posixpath.dirname(rel) == parent
+                  and posixpath.basename(rel) in COMPANION_NAMES):
             continue
         if _write_member(zf, info, root_real, rel, made):
             picked += 1

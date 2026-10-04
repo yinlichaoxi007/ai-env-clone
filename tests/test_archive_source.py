@@ -11,6 +11,7 @@
 - 坏包 / 空包 / 非本工具包 → :class:`ArchiveSourceError`。
 """
 
+import json
 import os
 import shutil
 import tempfile
@@ -234,6 +235,117 @@ class TestCleanupStale(unittest.TestCase):
         with mock.patch("ai_env_clone.archive_source.tempfile.gettempdir",
                         return_value=os.path.join(self.tmp, "nope")):
             self.assertEqual(asrc.cleanup_stale(), 0)
+
+
+class TestDeferredExtract(unittest.TestCase):
+    """``light=True``（延迟解正文）的正确性契约。
+
+    提速的前提是「列表阶段少写文件」，但列表内容必须**与全量解包完全一致**：
+    标题、会话数、落点线索都不能因为少解了正文而退化。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.zips = os.path.join(self.tmp, "zips")
+        os.makedirs(self.zips, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _codebuddy_zip(self, name="cb.zip"):
+        """两个会话：``s1`` 的 index.json 自带标题；``s2`` 无标题（要走正文兜底）。"""
+        entries = {
+            "Users/u/CB/session-workspaces.json": json.dumps({"workspaces": {}}),
+            "Users/u/CB/history/w1/s1/index.json": json.dumps(
+                {"title": "带标题的会话",
+                 "messages": [{"id": "m1", "role": "user"}]}),
+            "Users/u/CB/history/w1/s1/messages/m1.json": json.dumps({"id": "m1"}),
+            "Users/u/CB/history/w1/s1/messages/m2.json": json.dumps({"id": "m2"}),
+            "Users/u/CB/history/w1/s2/index.json": json.dumps(
+                {"messages": [{"id": "n1", "role": "user"}]}),
+            "Users/u/CB/history/w1/s2/messages/n1.json": json.dumps(
+                {"id": "n1", "message": "首条用户消息用它兜底标题"}),
+            "Users/u/CB/history/w1/s2/messages/n2.json": json.dumps({"id": "n2"}),
+            "Users/u/CB/history/w1/s1/blob.bin": "x" * 10,
+        }
+        path = os.path.join(self.zips, name)
+        with zipfile.ZipFile(path, "w") as zf:
+            for member, body in entries.items():
+                zf.writestr(member, body)
+        return path
+
+    def _has(self, src, *rel):
+        return os.path.isfile(os.path.join(src.root, *rel))
+
+    def test_extracts_only_what_listing_reads(self):
+        """只解 index.json + 伴随文件 + （仅无标题会话的）兜底消息。"""
+        with asrc.extract_session_root(self._codebuddy_zip(), "codebuddy",
+                                       light=True) as src:
+            self.assertTrue(src.deferred)
+            # 列表要读的：两个会话的 index.json、同级伴随文件
+            self.assertTrue(self._has(src, "w1", "s1", "index.json"))
+            self.assertTrue(self._has(src, "w1", "s2", "index.json"))
+            self.assertTrue(os.path.isfile(os.path.join(
+                src.temp_dir, "Users", "u", "CB", "session-workspaces.json")))
+            # s2 没标题 → 兜底要读的那条消息必须解出
+            self.assertTrue(self._has(src, "w1", "s2", "messages", "n1.json"))
+            # 其余都是正文：列表不读，不该解
+            self.assertFalse(self._has(src, "w1", "s1", "messages", "m1.json"))
+            self.assertFalse(self._has(src, "w1", "s1", "messages", "m2.json"))
+            self.assertFalse(self._has(src, "w1", "s2", "messages", "n2.json"))
+            self.assertFalse(self._has(src, "w1", "s1", "blob.bin"))
+            self.assertLess(src.extracted, src.total)
+
+    def test_listing_identical_to_full_extract(self):
+        """延迟解包后的会话列表必须与全量解包**逐条一致**（含标题）。"""
+        path = self._codebuddy_zip()
+
+        def listing(src):
+            return [(os.path.relpath(r["id"], src.root), r["title"])
+                    for r in session_migration.list_source_sessions("codebuddy", src.root)]
+
+        with asrc.extract_session_root(path, "codebuddy", light=True) as light:
+            got = listing(light)
+        with asrc.extract_session_root(path, "codebuddy") as full:
+            want = listing(full)
+        self.assertEqual(got, want)
+        self.assertEqual([t for _i, t in want],
+                         ["带标题的会话", "首条用户消息用它兜底标题"])
+
+    def test_materialize_restores_session_bodies(self):
+        """补解某个会话目录：正文回来，其余会话不受影响。"""
+        with asrc.extract_session_root(self._codebuddy_zip(), "codebuddy",
+                                       light=True) as src:
+            s1 = os.path.join(src.root, "w1", "s1")
+            self.assertTrue(src.materialize(s1))
+            self.assertTrue(self._has(src, "w1", "s1", "messages", "m1.json"))
+            self.assertTrue(self._has(src, "w1", "s1", "messages", "m2.json"))
+            self.assertTrue(self._has(src, "w1", "s1", "blob.bin"))
+            self.assertFalse(self._has(src, "w1", "s2", "messages", "n2.json"))
+
+    def test_materialize_ignores_paths_outside_root(self):
+        """不是本来源根的路径（例如用户其实在做「从数据目录导入」）→ 空操作。"""
+        with asrc.extract_session_root(self._codebuddy_zip(), "codebuddy",
+                                       light=True) as src:
+            self.assertFalse(src.materialize(self.tmp))
+            self.assertFalse(src.materialize(os.path.join(src.root, "不存在")))
+
+    def test_materialize_noop_when_not_deferred(self):
+        """全量解包（非延迟）时补解是空操作，不重复开包。"""
+        with asrc.extract_session_root(self._codebuddy_zip(), "codebuddy") as src:
+            self.assertFalse(src.deferred)
+            self.assertFalse(src.materialize(os.path.join(src.root, "w1", "s1")))
+
+    def test_light_not_applied_to_other_tools(self):
+        """其余工具的正文就是它的枚举依据，收窄会让列表空掉 ⇒ 一律全量解。"""
+        path = os.path.join(self.zips, "wb.zip")
+        _mk_zip(path, ["Users/u/.workbuddy/projects/p1/s1.jsonl",
+                       "Users/u/.workbuddy/workbuddy.db"])
+        with asrc.extract_session_root(path, "workbuddy", light=True) as src:
+            self.assertFalse(src.deferred)
+            self.assertTrue(src.fully_extracted)
+            rows = session_migration.list_source_sessions("workbuddy", src.root)
+        self.assertEqual(len(rows), 1)
 
 
 if __name__ == "__main__":
