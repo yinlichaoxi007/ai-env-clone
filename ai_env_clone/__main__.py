@@ -24,16 +24,24 @@ import re
 import shutil
 import subprocess
 import threading
+import webbrowser
 from datetime import datetime
 
+from ai_env_clone import version as _version
 from ai_env_clone.version import app_title, handle_version_flag
 from ai_env_clone.doctext import (
+    _TABLE_MAX_WIDTH,
     handle_docs_flag,
     md_to_paragraphs,
     plain_text,
 )
 from ai_env_clone.resources import read_help_doc, resource_path
-from ai_env_clone.updater import handle_check_update_flag, platform_asset_name
+from ai_env_clone.updater import (
+    check_update,
+    describe_result,
+    handle_check_update_flag,
+    platform_asset_name,
+)
 from ai_env_clone import prefs as _prefs
 
 # 版本查询必须先于 import tkinter 生效：版本号不该依赖 GUI 库——CI、最小化容器、
@@ -54,7 +62,7 @@ if _rc is not None:
 
 import tkinter as tk  # noqa: E402 - 必须在版本查询之后导入，见上
 import tkinter.font as tkfont  # noqa: E402
-from tkinter import filedialog, messagebox, ttk  # noqa: E402
+from tkinter import filedialog, messagebox, scrolledtext, ttk  # noqa: E402
 
 from ai_env_clone.adapters import get_adapter, list_adapters
 from ai_env_clone.adapters.base import MULTI_MACHINE_CYCLE_HINT
@@ -419,6 +427,8 @@ class QoderBackupApp:
         # 工具切换：维护者实现新适配器后，下拉即可切换当前 AI 工具
         tool_row = ttk.Frame(self.content)
         tool_row.pack(fill=tk.X, padx=12, pady=(6, 0))
+        # 留一个句柄：菜单与下拉框同处这一行，测试要能量「菜单有没有把行高撑高」。
+        self.tool_row = tool_row
         ttk.Label(tool_row, text="AI 工具：").pack(side=tk.LEFT)
         self.tool_var = tk.StringVar(value=self.adapter.display_name)
         self.tool_combo = ttk.Combobox(
@@ -431,6 +441,12 @@ class QoderBackupApp:
         self.tool_combo["values"] = list(self._tool_display.keys())
         self.tool_combo.bind("<<ComboboxSelected>>", self._on_switch_tool)
         self.tool_combo.pack(side=tk.LEFT, padx=(4, 0))
+
+        # 菜单放在「AI 工具」这一行的**右侧**（该行原本右侧全空）⇒ **零新增窗口高度**：
+        # 本行高度不变 ⇒ 不触发 _fit_layout() 的高度基准重算。
+        # ⚠️ 不用 root.config(menu=…)：那会独占一行、需要重新校准高度基准，
+        #    且 macOS 还会把它收进系统应用菜单（三平台表现就不一致了）。
+        self._build_row_menus(tool_row)
 
         # 数据目录
         self.dir_frame = ttk.LabelFrame(
@@ -1755,6 +1771,237 @@ class QoderBackupApp:
         except tk.TclError:
             pass
         return win
+
+    # ------------------------------------------------------------------ #
+    # 菜单（设置 / 帮助）—— 与「AI 工具」同行、右侧对齐，零新增窗口高度
+    # ------------------------------------------------------------------ #
+    def _build_row_menus(self, row: ttk.Frame) -> None:
+        """在「AI 工具」那一行的**右侧**放置「设置 / 帮助」两个菜单按钮。
+
+        ★ 为什么放这一行（2026-10-03 用户定案）：该行原本只有一个左对齐 Label
+        与 Combobox，**右侧全空**；菜单放进来的**行高不变** ⇒ ``_fit_layout()``
+        的高度基准不用重算（``root.config(menu=…)`` 会独占一行、必须重新校准）。
+        宽度增量由内容区既有的「横向撑满 / 按需横向滚动」机制吸收。
+
+        ⚠️ ``pack(side=RIGHT)`` 是「**先** pack 的贴最右」⇒ 必须先 pack「帮助」、
+        再 pack「设置」，视觉上才是「设置 ｜ 帮助」。
+        ⚠️ 本行保持 ``pack``，不要改成 ``grid``（跨机制改会让宽度基准不一致）。
+        ★ ``padding=(4, 3)`` 是**实测选出来的**：ttk Menubutton 默认请求高 25px，
+        比同行 ttk Combobox 的 23px 高 2px，会把这一行的请求高度从 23 顶到 25
+        ⇒ 「零新增高度」就不成立了。``(4, 3)`` 恰好也是 23px（实测 4 档取值），
+        与下拉框齐平、按钮又不显局促。
+        """
+        help_mb = ttk.Menubutton(row, text="帮助", padding=(4, 3))
+        help_menu = tk.Menu(help_mb, tearoff=False)
+        help_menu.add_command(label="使用说明", accelerator="F1",
+                              command=self._show_help)
+        help_menu.add_separator()
+        help_menu.add_command(label="关于", command=self._show_about)
+        help_mb["menu"] = help_menu
+        help_mb.pack(side=tk.RIGHT)
+
+        set_mb = ttk.Menubutton(row, text="设置", padding=(4, 3))
+        set_menu = tk.Menu(set_mb, tearoff=False)
+        set_menu.add_command(label="更新设置…", command=self._show_update_settings)
+        set_mb["menu"] = set_menu
+        set_mb.pack(side=tk.RIGHT, padx=(0, 6))
+
+        self._menu_buttons = (help_mb, set_mb)
+        # 热键只挂**无副作用**的项（使用说明）；更新动作不挂，避免误触替换程序。
+        self.root.bind("<F1>", lambda _e: self._show_help())
+
+    def _show_help(self) -> None:
+        """「帮助 → 使用说明」：纯文本查看器（与 CLI ``--docs`` **同源**）。
+
+        「同源」是指两边都用 :func:`doctext.md_to_paragraphs` 的同一份输出，
+        不是靠人工同步两份文案 ⇒ 这里不许自己写第二套 markdown 解析。
+
+        ★ **表格宽度按窗口实测**：渲染前量一次正文区能放多少显示列，传给
+        ``md_to_paragraphs``；窗口缩放后重新量、重新排版（见
+        :meth:`_render_doc`）。曾经的实现把可用宽度写死在 ``doctext`` 里，
+        于是「把窗口拉到最大，表格仍是分条形态」——渲染结果与窗口宽度无关。
+        ★ 表格与分条之间只有**一个**切换阈值（``doctext._table_min_total``）：
+        缩小到某宽度变分条、放大后再变回表格，用的是同一个宽度，不会错开。
+        """
+        try:
+            text = read_help_doc()
+        except OSError:
+            # 打包漏带资源属构建缺陷，但不该抛异常；给可落地的下一步。
+            messagebox.showwarning(
+                "使用说明不可用",
+                "未找到使用说明文档。\n\n"
+                "源码模式下应存在 docs/使用说明.md；打包版本可能是构建时漏带了资源。\n"
+                "可访问项目主页查看在线文档：\n"
+                "https://github.com/%s/%s"
+                % (_version.PROJECT_OWNER, _version.PROJECT_REPO),
+            )
+            return
+        if HEADLESS:
+            messagebox.showinfo("使用说明", text)
+            return
+        win = tk.Toplevel(self.root)
+        win.title("使用说明")
+        win.geometry("880x660")
+        win.transient(self.root)
+        frame = ttk.Frame(win)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # ★ ``wrap="char"`` 而不是默认的 ``"word"``：本查看器读的是**中文为主的文档**，
+        # 而 Tk 的 word 折行只认空格当断点。中文句子动辄上百列没有一个空格 ⇒
+        # 它只能回溯到段首那个空格（如列表项的 ``- ``）就断，结果是「一行只有一个
+        # ``-``」＋右侧大片留白。按字符折行才是中文的正确断点粒度。
+        # 英文词被劈开的代价可接受：真文档里的长英文串（路径等）几乎都在**表格**里，
+        # 而表格行是我们自己按宽度折好的，不会走到控件折行这一步。
+        txt = scrolledtext.ScrolledText(
+            frame, wrap="char", relief=tk.FLAT, padx=8, pady=6
+        )
+        txt.pack(fill=tk.BOTH, expand=True)
+        self._configure_doc_tags(txt)
+        # 挂个句柄：``ScrolledText`` 内部自带 Frame + 滚动条，从窗口遍历控件找不到
+        # 正文控件；测试要断言「图片行确实没进来」只能靠这个引用。
+        win.doc_text = txt
+        win.doc_source = text        # 原文；重排时反复渲染的是它，不是已渲染结果
+        win.doc_paras = []           # 上次渲染出的段落序列（内容没变就不动控件）
+        win.doc_cols = None
+        win.doc_job = None
+        self._render_doc(win, first=True)
+        txt.bind("<Configure>", lambda _e: self._schedule_doc(win))
+        ttk.Button(win, text="关闭", command=win.destroy, width=12).pack(pady=(0, 10))
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        return win
+
+    def _render_doc(self, win, first: bool = False) -> None:
+        """按**当前窗口宽度**渲染使用说明；内容与上次一致时什么都不做。
+
+        「先渲染再比较」而不是「比较宽度再渲染」是刻意的：一块宽度可能让 A 表换形态、
+        B 表不变，只有真渲染出段落序列才能判断这次重排有没有意义。比较相等就早退，
+        于是 ``<Configure>`` 不会引发「重排 → 滚动条变化 → 又触发 Configure」的振荡，
+        用户光标处的滚动位置也就不会被无谓地重置。
+        """
+        txt = win.doc_text
+        cols = self._doc_available_columns(txt)
+        paras = md_to_paragraphs(win.doc_source, cols)
+        if not first and paras == win.doc_paras:
+            win.doc_cols = cols
+            return
+        anchor = None
+        if not first:
+            try:
+                anchor = txt.index("@0,0")   # 记下顶部的字符位置，重排后滚回去
+            except tk.TclError:
+                anchor = None
+        try:
+            txt.configure(state="normal")
+            txt.delete("1.0", tk.END)
+            for para, tag in paras:
+                txt.insert(tk.END, para + "\n", tag)
+            txt.configure(state="disabled")
+        except tk.TclError:          # 窗口在重排途中被关掉
+            return
+        win.doc_paras = paras
+        win.doc_cols = cols
+        if anchor is not None:
+            try:
+                txt.see(anchor)
+            except tk.TclError:
+                pass
+
+    def _schedule_doc(self, win) -> None:
+        """窗口缩放 → 防抖后重排（拖拽期间每个像素都触发 Configure，不能当场重排）。"""
+        if win.doc_job is not None:
+            try:
+                win.after_cancel(win.doc_job)
+            except tk.TclError:
+                return
+        try:
+            win.doc_job = win.after(180, lambda: self._rerender_doc(win))
+        except tk.TclError:
+            win.doc_job = None
+
+    def _rerender_doc(self, win) -> None:
+        win.doc_job = None
+        try:
+            self._render_doc(win)
+        except tk.TclError:
+            pass
+
+    def _doc_available_columns(self, txt) -> int:
+        """实测使用说明正文区能容纳多少**显示列**（东亚字符算 2 列）。
+
+        两条实测事实决定了这里必须「量」而不是「算」：
+
+        - 表格用等宽字体（标签 ``table``），所以**一列宽的像素值**可以在同一字体上
+          量出来：量 32 个 ``0`` 取平均，比 ``measure("M")`` 稳（后者在 YaHei 下
+          12 px 而实际平均 7 px，差 70%）。
+        - 正文区宽度 = 控件宽 − 内边距/边框 − 右侧滚动条宽。滚动条是
+          ``ScrolledText`` 内部的子控件，不扣掉就会多算约 17 px。
+        """
+        try:
+            txt.update_idletasks()
+            fnt = tkfont.Font(font=txt.tag_cget("table", "font"))
+            char_px = max(1.0, fnt.measure("0" * 32) / 32.0)
+        except tk.TclError:
+            return _TABLE_MAX_WIDTH
+        width = txt.winfo_width()
+        if width <= 1:               # 窗口还没映射出真实尺寸，先按默认宽度渲染
+            return _TABLE_MAX_WIDTH
+        chrome = 0
+        for opt in ("borderwidth", "padx", "highlightthickness"):
+            try:
+                chrome += 2 * int(txt.cget(opt))
+            except (tk.TclError, ValueError):
+                pass
+        vbar = getattr(txt, "vbar", None)
+        if vbar is not None:
+            try:
+                chrome += vbar.winfo_width()
+            except tk.TclError:
+                pass
+        # 下限 20 列：再窄也没法用，``doctext`` 那边会自己退成「分条」。
+        return max(20, int((width - chrome) // char_px))
+
+    @staticmethod
+    def _configure_doc_tags(txt: "tk.Text") -> None:
+        """给使用说明查看器配置各段落标签的字体与缩进（纯排版，不含业务逻辑）。
+
+        ★ 刻意**不设 ``background``**：系统暗色主题下硬编码浅底会让文字看不见，
+        而 Tk 默认前景/背景已随主题 ⇒ 只调字体、缩进与颜色以外的间距。
+        """
+        base = tkfont.nametofont("TkDefaultFont")
+        mono = tkfont.nametofont("TkFixedFont")
+        family = base.actual("family")
+        size = base.actual("size")
+        for tag, boost in (("h1", 4), ("h2", 3), ("h3", 2), ("h4", 1)):
+            txt.tag_configure(
+                tag, font=(family, size + boost, "bold"), spacing1=10, spacing3=4
+            )
+        txt.tag_configure("p", spacing3=4)
+        txt.tag_configure("li", lmargin1=18, lmargin2=32, spacing3=2)
+        txt.tag_configure("quote", lmargin1=18, lmargin2=18, foreground="#666")
+        txt.tag_configure("code", font=mono, lmargin1=18, lmargin2=18)
+        txt.tag_configure("table", font=mono, spacing1=4, spacing3=6)
+        # 极窄窗口（网格折不动了）才会出现的「分条」形态：内容是「标题 + 缩进字段」，
+        # 不需要对齐 ⇒ 不设等宽字体，只把折行后的续行按缩进对齐（lmargin2），
+        # 否则长句折行会顶到最左边、「 列名：值」的层级感全丢。
+        txt.tag_configure("records", lmargin2=14, spacing1=1, spacing3=2)
+        txt.tag_configure("hr", spacing1=4, spacing3=4)
+
+    def _show_about(self) -> None:
+        """「帮助 → 关于」：版本 / 检查更新 / 版权 / 项目链接 / 打赏二维码。"""
+        if HEADLESS:
+            messagebox.showinfo("关于", "\n".join(_version.about_lines(
+                self.adapter.display_name)))
+            return
+        AboutDialog(self)
+
+    def _show_update_settings(self) -> None:
+        """「设置 → 更新设置」：自动检查开关 / 频率 / 通道 / 代理。"""
+        if HEADLESS:
+            messagebox.showinfo("更新设置", "（单元测试下不弹窗）")
+            return
+        UpdateSettingsDialog(self)
 
     def on_migrate(self) -> None:
         """打开「导入会话」对话框（仅当前工具支持导入时可用）。"""
@@ -4306,6 +4553,373 @@ class MigrateDialog:
             if self.warns:
                 detail += "\n\n附带提示：\n" + "\n".join("· " + w for w in self.warns)
             messagebox.showerror("导入失败", detail, parent=self.win)
+
+
+#: 链接色：浅底用深蓝、深底用浅蓝。Tk 没有「链接色」这个概念，而**硬编码一种蓝**
+#: 会在系统暗色主题下变成看不清的深蓝（本文件 ``_configure_doc_tags`` 对背景色
+#: 有过同样的取舍）。
+_LINK_FG_ON_LIGHT = "#1155cc"
+_LINK_FG_ON_DARK = "#6caeff"
+
+#: 「关于」里要变成可点击链接的地址形态。
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _link_foreground(widget: "tk.Misc") -> str:
+    """按控件底色的亮度挑一个可读的链接色（取不到颜色就按浅底处理）。"""
+    try:
+        rgb = widget.winfo_rgb(widget.cget("background"))   # 每通道 0..65535
+    except tk.TclError:
+        return _LINK_FG_ON_LIGHT
+    lum = (rgb[0] * 299 + rgb[1] * 587 + rgb[2] * 114) // 1000
+    return _LINK_FG_ON_LIGHT if lum > 32768 else _LINK_FG_ON_DARK
+
+
+class AboutDialog:
+    """「关于」对话框：版本信息 + **只读**的更新检查 + 打赏二维码。
+
+    四件事必须守住（都由测试钉住）：
+
+    1. **版本号来自 ``version.about_lines()``**，与 ``--version``、exe 版本资源同源；
+       本类只负责把这几行画出来，不许自己拼版本字符串。
+    2. **检查更新是只读的**：只调 ``updater.check_update()``（不下载、不替换），
+       且跑在后台线程里；网络慢或需代理时界面不冻结。
+    3. **二维码缺图时整块隐藏**（不留空白、不报错）：仓库当前并没有该图片，
+       「源码模式 / 未随包分发」都会命中这条**正常路径**。
+       ★ ``PhotoImage`` **必须持引用**（``self._qr_image``），否则被 GC 回收后
+       二维码显示为空白——Tk 的经典坑。
+    4. **项目地址可点、可复制**（用户反馈）：信息块用**只读 ``Text``** 而不是
+       ``Label``（``Label`` 里的字**选不中**，地址只能手抄）；URL 挂 ``link`` 标签，
+       单击用系统浏览器打开，拖选 ``Ctrl+C`` 或右键菜单复制。
+    """
+
+    def __init__(self, app: "QoderBackupApp"):
+        self.app = app
+        self._qr_image = None       # ★ 必须留在实例上，见类 docstring 第 3 条
+        self._checking = False
+
+        top = tk.Toplevel(app.root)
+        self.top = top
+        top.title("关于 %s" % _version.APP_NAME)
+        top.transient(app.root)
+        top.resizable(False, False)
+        try:
+            icon = app.root.wm_iconbitmap()
+            if icon:
+                top.iconbitmap(icon)
+        except Exception:
+            pass
+
+        body = ttk.Frame(top)
+        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=(16, 4))
+        self._build_qr(body)
+
+        right = ttk.Frame(body)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(14, 0))
+
+        # 信息块是**只读 Text**（不是 Label）：这样文字可选、可复制，见类 docstring。
+        self.info = self._build_info(right)
+        self.info.pack(fill=tk.X)
+
+        ttk.Separator(right, orient="horizontal").pack(fill=tk.X, pady=8)
+
+        row = ttk.Frame(right)
+        row.pack(fill=tk.X)
+        self.latest_var = tk.StringVar(value="最新版本：未检查")
+        ttk.Label(row, textvariable=self.latest_var).pack(side=tk.LEFT)
+        self.check_btn = ttk.Button(row, text="检查更新", width=10,
+                                    command=self.check)
+        self.check_btn.pack(side=tk.RIGHT)
+
+        # 更新说明摘要：只在真有更新且带说明时才 pack（平时不占高度）。
+        self.notes = tk.Text(right, height=6, width=46, wrap="word",
+                             relief=tk.FLAT, state="disabled")
+        self._notes_packed = False
+
+        btns = ttk.Frame(top)
+        btns.pack(fill=tk.X, pady=(4, 12))
+        ttk.Button(btns, text="关闭", width=12, command=top.destroy).pack(
+            side=tk.RIGHT, padx=16
+        )
+
+        top.update_idletasks()
+        x = app.root.winfo_x() + (app.root.winfo_width() - top.winfo_width()) // 2
+        y = app.root.winfo_y() + (app.root.winfo_height() - top.winfo_height()) // 3
+        top.geometry("+%d+%d" % (max(0, x), max(0, y)))
+        top.grab_set()
+
+    def _build_info(self, parent) -> "tk.Text":
+        """版本信息块：只读 ``Text``，项目地址**可点（开浏览器）也可复制**。
+
+        为什么不用 ``tk.Label``：``Label`` 里的文字**选不中**，用户想把项目地址复制
+        出去只能手抄。只读的 ``Text`` 照样不允许编辑，但**仍可拖选与 ``Ctrl+C``**
+        （Tk 的常规行为），再给 URL 范围挂一个 ``link`` 标签就有了「点一下打开」。
+
+        宽度必须**实测反推**，不能按 ``font.measure()`` 直接换算：``Text`` 的
+        ``width`` 单位是「平均字符宽」而非像素，两者不相等且随字体/DPI 漂移
+        ⇒ 先量 1 字符与 2 字符的 ``reqwidth`` 求差（= 真实字符宽），再按最长行
+        换算列数。窄了会**裁掉**右边的字（``wrap="none"`` 不会折行），故宁可宽一点。
+        """
+        lines = _version.about_lines(self.app.adapter.display_name)
+        font = tkfont.nametofont("TkDefaultFont")
+        bg = self.top.cget("background")
+        txt = tk.Text(
+            parent, height=len(lines), width=1, wrap="none", font=font,
+            borderwidth=0, highlightthickness=0, padx=0, pady=0,
+            takefocus=0, cursor="arrow", background=bg,
+        )
+        txt.insert("1.0", "\n".join(lines))
+        txt.tag_configure("link", foreground=_link_foreground(self.top),
+                          underline=True)
+        self._tag_links(txt)
+        txt.tag_bind("link", "<Button-1>", self._on_link_click)
+        txt.tag_bind("link", "<Enter>",
+                     lambda _e: txt.configure(cursor="hand2"))
+        txt.tag_bind("link", "<Leave>",
+                     lambda _e: txt.configure(cursor="arrow"))
+        txt.bind("<Button-3>", self._on_context)
+        txt.configure(state="disabled")     # 只读：能选能复制，不能改
+
+        txt.update_idletasks()
+        one = txt.winfo_reqwidth()
+        txt.configure(width=2)
+        txt.update_idletasks()
+        char_px = max(1, txt.winfo_reqwidth() - one)
+        need_px = max(font.measure(line) for line in lines)
+        txt.configure(width=max(1, -(-(need_px - (one - char_px)) // char_px)))
+        return txt
+
+    def _tag_links(self, txt: "tk.Text") -> None:
+        """把文本里的 URL 都标上 ``link`` 标签（标签本身不携带地址）。"""
+        text = txt.get("1.0", "end-1c")
+        for m in _URL_RE.finditer(text):
+            txt.tag_add("link", "1.0 +%dc" % m.start(), "1.0 +%dc" % m.end())
+
+    def _url_at(self, index: str) -> str:
+        """取某位置的**整行**里的 URL（没有则空串）。
+
+        ★ 按「行」找而不是记「标签范围 → 地址」的映射：``tag_bind`` 是**按标签**
+        （整个控件一份）生效的，单击时拿不到「点的哪个范围」，只能靠位置反查；
+        而地址本来就是行内唯一的那一串，按行取足矣。
+        """
+        line = self.info.get(index + " linestart", index + " lineend")
+        m = _URL_RE.search(line)
+        return m.group(0) if m else ""
+
+    def _on_link_click(self, event) -> None:
+        self._open_url_at(self.info.index("@%d,%d" % (event.x, event.y)))
+
+    def _open_url_at(self, index: str) -> None:
+        """用系统默认浏览器打开该位置的地址（没有地址就什么也不做）。"""
+        url = self._url_at(index)
+        if url:
+            webbrowser.open(url)
+
+    def _on_context(self, event) -> None:
+        """右键菜单：复制链接地址 / 复制选中 / 全选（``Label`` 时代这些都做不到）。"""
+        menu = self._build_context_menu(
+            self.info.index("@%d,%d" % (event.x, event.y))
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _build_context_menu(self, index: str) -> "tk.Menu":
+        """按**点击所在行**拼菜单（独立成方法是为了能脱离鼠标事件测）。"""
+        menu = tk.Menu(self.top, tearoff=False)
+        url = self._url_at(index)
+        if url:
+            menu.add_command(label="复制链接地址",
+                             command=lambda: self._copy_text(url))
+        if self.info.tag_ranges("sel"):
+            menu.add_command(label="复制", command=self._copy_selection)
+        menu.add_command(label="全选", command=self._select_all)
+        return menu
+
+    def _copy_text(self, text: str) -> None:
+        """写系统剪贴板。★ 写完必须 ``update_idletasks()``：Tk 的剪贴板由本进程
+        提供服务，不刷一次就退出，Windows 上内容会丢。"""
+        self.top.clipboard_clear()
+        self.top.clipboard_append(text)
+        self.top.update_idletasks()
+
+    def _copy_selection(self) -> None:
+        try:
+            self._copy_text(self.info.get("sel.first", "sel.last"))
+        except tk.TclError:      # 没有选区
+            pass
+
+    def _select_all(self) -> None:
+        self.info.tag_add("sel", "1.0", "end-1c")
+
+    def _build_qr(self, parent) -> None:
+        """打赏二维码：**找不到图片就整块不建**（正常路径，不是异常）。"""
+        path = resource_path("docs/images/reward_qr.png")
+        if not path:
+            return
+        try:
+            img = tk.PhotoImage(file=path)
+        except tk.TclError:
+            return
+        # ★ subsample() **只支持整数倍**，故按「可见宽约 240」取整数倍降低。
+        k = max(1, -(-img.width() // 240))
+        if k > 1:
+            img = img.subsample(k, k)
+        self._qr_image = img        # ★ 持引用，否则 GC 后显示空白
+        col = ttk.Frame(parent)
+        col.pack(side=tk.LEFT, anchor="n")
+        ttk.Label(col, image=img).pack()
+        ttk.Label(col, text="打赏支持", foreground="#666").pack(pady=(4, 0))
+
+    # -- 检查更新（只读） -------------------------------------------------- #
+    def check(self) -> None:
+        """点「检查更新」：置为检查中并禁用按钮，实际请求走后台线程。"""
+        if self._checking:
+            return
+        self._checking = True
+        self.check_btn.configure(state="disabled")
+        self.latest_var.set("最新版本：检查中…")
+        threading.Thread(target=self._check_worker, daemon=True).start()
+
+    def _check_worker(self) -> None:
+        """后台线程：真正发请求；结果一律经 ``after`` 回到主线程再碰控件。"""
+        settings = _prefs.update_settings()
+        failed = False
+        try:
+            result = check_update(
+                current=_version.__version__,
+                include_prerelease=bool(settings.get("include_prerelease")),
+                proxy=settings.get("proxy") or "",
+                skipped_version=settings.get("skipped_version") or "",
+            )
+        except Exception as exc:      # noqa: BLE001 - 任何异常都要落到界面，不许静默
+            failed, text, info, notes = True, "检查更新失败：%r" % (exc,), None, ""
+        else:
+            text = describe_result(result, _version.__version__, platform_asset_name())
+            info = result.info
+            notes = (info.notes if info is not None else "") or ""
+        try:
+            self.top.after(0, lambda: self._apply_check(text, info, notes, failed))
+        except tk.TclError:           # 对话框已被关闭
+            pass
+
+    def _apply_check(self, text: str, info, notes: str, failed: bool) -> None:
+        """主线程里刷新结果：文案 + 说明摘要；成功检查后记录检查时间。"""
+        self._checking = False
+        try:
+            self.check_btn.configure(state="normal")
+        except tk.TclError:
+            return
+        if info is not None:
+            self.latest_var.set("最新版本：v%s" % info.version)
+            # 更新说明 = 结论（含「未做哈希校验 / 这是预发布」这类提醒）+ 发布说明
+            notes = text + (("\n\n" + notes) if notes else "")
+        else:
+            self.latest_var.set(text)
+        if notes:
+            self.notes.configure(state="normal")
+            self.notes.delete("1.0", tk.END)
+            self.notes.insert("1.0", notes)
+            self.notes.configure(state="disabled")
+            if not self._notes_packed:
+                self.notes.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+                self._notes_packed = True
+        if not failed:
+            _prefs.record_check()
+
+
+class UpdateSettingsDialog:
+    """「设置 → 更新设置」：自动检查开关 / 频率 / 更新通道 / 代理。
+
+    持久化走 ``prefs.save_update_settings``（**深度合并**写入 ``prefs.json``）。
+    ★ 不要在这里自己写 JSON：整文件覆盖会把同文件的 ``last_tool`` 抹掉，
+    这正是 ``prefs.py`` 改成读-改-写的原因。
+    """
+
+    def __init__(self, app: "QoderBackupApp"):
+        self.app = app
+        cfg = _prefs.update_settings()
+
+        top = tk.Toplevel(app.root)
+        self.top = top
+        top.title("更新设置")
+        top.transient(app.root)
+        top.resizable(False, False)
+
+        body = ttk.Frame(top)
+        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=14)
+
+        self.auto_var = tk.BooleanVar(value=bool(cfg["auto_check"]))
+        ttk.Checkbutton(body, text="启动时自动检查更新", variable=self.auto_var).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8)
+        )
+
+        ttk.Label(body, text="检查频率：").grid(row=1, column=0, sticky="w", pady=4)
+        self.interval_var = tk.StringVar(
+            value=_prefs.INTERVAL_LABELS.get(cfg["interval"], _prefs.INTERVAL_LABELS["daily"])
+        )
+        self.interval_combo = ttk.Combobox(
+            body, textvariable=self.interval_var, state="readonly", width=16,
+            values=[_prefs.INTERVAL_LABELS[k] for k in _prefs.CHECK_INTERVALS],
+        )
+        self.interval_combo.grid(row=1, column=1, sticky="w", padx=(6, 0), pady=4)
+
+        self.pre_var = tk.BooleanVar(value=bool(cfg["include_prerelease"]))
+        ttk.Checkbutton(body, text="包含预发布版本（rc / beta 等）",
+                        variable=self.pre_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(8, 4)
+        )
+
+        ttk.Label(body, text="代理：").grid(row=3, column=0, sticky="w", pady=4)
+        self.proxy_var = tk.StringVar(value=cfg["proxy"])
+        ttk.Entry(body, textvariable=self.proxy_var, width=32).grid(
+            row=3, column=1, sticky="w", padx=(6, 0), pady=4
+        )
+
+        ttk.Label(
+            body,
+            text="自动检查默认关闭：本机可能需要代理才能访问 GitHub，\n"
+                 "静默检查会让你每次启动都白等几秒。\n"
+                 "代理留空时按「环境变量 → 直连」的顺序尝试；\n"
+                 "只对 GitHub / Gitee 请求生效，不影响其它功能。",
+            justify=tk.LEFT, foreground="#666",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        btns = ttk.Frame(top)
+        btns.pack(fill=tk.X, pady=(4, 12))
+        ttk.Button(btns, text="保存", width=10, command=self.save).pack(
+            side=tk.RIGHT, padx=(6, 16)
+        )
+        ttk.Button(btns, text="取消", width=10, command=top.destroy).pack(
+            side=tk.RIGHT
+        )
+
+        top.update_idletasks()
+        x = app.root.winfo_x() + (app.root.winfo_width() - top.winfo_width()) // 2
+        y = app.root.winfo_y() + (app.root.winfo_height() - top.winfo_height()) // 3
+        top.geometry("+%d+%d" % (max(0, x), max(0, y)))
+        top.grab_set()
+
+    def _interval_key(self) -> str:
+        """把下拉里的中文标签翻回持久化用的键（翻不出来就回退 ``daily``）。"""
+        label = self.interval_var.get()
+        for key, text in _prefs.INTERVAL_LABELS.items():
+            if text == label:
+                return key
+        return "daily"
+
+    def save(self) -> None:
+        """保存并关闭。写失败只提示、不抛（偏好存不下不该挡住主流程）。"""
+        ok = _prefs.save_update_settings(
+            auto_check=bool(self.auto_var.get()),
+            interval=self._interval_key(),
+            include_prerelease=bool(self.pre_var.get()),
+            proxy=self.proxy_var.get().strip(),
+        )
+        if not ok:
+            messagebox.showwarning("保存失败", "更新设置未能写入偏好文件。")
+        self.top.destroy()
 
 
 class _Tooltip:

@@ -255,6 +255,20 @@ class TestReleaseSelection(unittest.TestCase):
         opener = FakeOpener({"api.github.com": [_release("v1.5.0-rc.1")]})
         self.assertEqual(_run(opener, current="1.0.0", include=True).info.version, "1.5.0-rc.1")
 
+    def test_prerelease_flag_matches_version_shape(self) -> None:
+        """★ ``UpdateInfo.prerelease`` 必须按版本形态判定，不能恒为真。
+
+        ``version.parse_version`` 的正式版哨兵是 ``FINAL``（**不是空元组**），
+        于是历史上写过的 ``parsed[1] != ()`` **恒为 True** —— 结果正式版也被
+        标成「预发布」，用户会看到「这是预发布版本，可能不够稳定」这句假警报。
+        本用例同时钉住两个方向，防止再写回 ``!= ()``。
+        """
+        stable = FakeOpener({"api.github.com": [_release("v1.5.0")]})
+        self.assertFalse(_run(stable, current="1.0.0").info.prerelease,
+                         "正式版不得被标成预发布")
+        rc = FakeOpener({"api.github.com": [_release("v1.5.0-rc.1")]})
+        self.assertTrue(_run(rc, current="1.0.0", include=True).info.prerelease)
+
     def test_legacy_glued_tag_sorted_correctly(self) -> None:
         """历史 tag ``v0.1.0rc`` 要排在 ``v0.2.0`` 之前（不能被当成乱码丢弃后错序）。"""
         opener = FakeOpener({"api.github.com": [_release("v0.1.0rc"), _release("v0.2.0")]})

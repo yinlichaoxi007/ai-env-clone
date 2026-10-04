@@ -6,11 +6,13 @@
   最小化容器、只做版本核对的脚本可能没装 tkinter（本项目的受管 Python 就没有）。
   本模块不导入 tkinter，也不导入本包内其它模块，因此可以在 ``import tkinter``
   之前安全使用。
-- 窗口标题模板放这里，是为了让「标题里必须带版本号」这条不变式能被**不装
-  tkinter 的测试**直接断言（见 ``tests/test_version.py``）。
+- **「关于」对话框的字段**由 :func:`about_lines` 在这里组装成纯字符串，
+  于是「版本号出现在用户看得见的地方」这条不变式能被**不装 tkinter 的测试**
+  直接断言（见 ``tests/test_version.py``）。主窗口**标题不带版本号**（见
+  :data:`APP_TITLE_TPL`），该不变式由 :func:`about_lines` 承接。
 
 发布约定：发布 tag = ``v`` + :data:`__version__`（例如 ``v0.2.0-rc.1``）。
-改版本号只改这一处——窗口标题、``--version`` 输出、打包产物的 exe 版本资源
+改版本号只改这一处——「关于」对话框、``--version`` 输出、打包产物的 exe 版本资源
 全部由它派生；``tests/test_version.py`` 会在「当前 HEAD 正好落在一个 ``v*``
 tag 上」时校验两者一致，防止 tag 与代码版本漂移。
 """
@@ -22,8 +24,12 @@ import sys
 __all__ = [
     "APP_NAME",
     "APP_TITLE_TPL",
+    "AUTHOR",
     "LEGAL_COPYRIGHT",
     "FINAL",
+    "PROJECT_OWNER",
+    "PROJECT_REPO",
+    "about_lines",
     "app_title",
     "emit_console",
     "handle_version_flag",
@@ -42,13 +48,26 @@ __version__ = "0.2.0-rc.1"
 #: 产物基础名：与 ``build_exe.py --name`` 的默认值、打包产物名一致。
 APP_NAME = "AiEnvClone"
 
-#: 主窗口标题模板：``<工具显示名> 备份迁移工具 v<版本>``。
-#: 标题带版本号是刻意的——用户反馈问题截的是标题，版本号在里面就不必再追问。
-APP_TITLE_TPL = "%s 备份迁移工具 v%s"
+#: 主窗口标题模板：``<工具显示名> 备份迁移工具``。
+#:
+#: ★ **刻意不带版本号**（2026-10-03 定案）：版本号搬到「帮助 → 关于」对话框。
+#: 原因是「标题带版本」与「窗口要装得下」存在取舍——低分辨率 + 高 DPI 缩放下
+#: 标题过长会被窗口管理器截断，反而看不出是哪个工具；而「版本号必须出现在用户
+#: 看得见的地方」这条约束由 :func:`about_lines` + 测试承接，不是靠标题兜。
+#: 用户反馈问题截的仍是标题，此时工具名 + 关于对话框里的版本号组合起来够用。
+APP_TITLE_TPL = "%s 备份迁移工具"
+
+#: 作者名。更新源、README、版权串共用同一个写法。
+AUTHOR = "yinlichaoxi007"
+
+#: 仓库坐标（GitHub 与 Gitee 同名同主）。``updater`` 的更新请求与「关于」里的
+#: 项目链接都从这里取，避免两处各写一遍 owner/repo 而漂移。
+PROJECT_OWNER = "yinlichaoxi007"
+PROJECT_REPO = "ai-env-clone"
 
 #: 版权串。**「关于」对话框与 exe 版本资源共用这一个常量**，
 #: 避免两处写法漂移（改年份只改这里）。
-LEGAL_COPYRIGHT = "Copyright (c) 2026 yinlichaoxi007"
+LEGAL_COPYRIGHT = "Copyright (c) 2026 %s" % AUTHOR
 
 #: 可识别的预发布标识，顺序即**优先级**：同一版本号下 ``dev`` < ``alpha`` <
 #: ``beta`` < ``rc`` < 正式版。未列出的标识按 :func:`_tag_rank` 排在
@@ -69,8 +88,28 @@ _WIN_TABLE_KEY = "080404B0"
 
 
 def app_title(tool_display_name: str) -> str:
-    """主窗口标题：``<工具显示名> 备份迁移工具 v<版本>``。"""
-    return APP_TITLE_TPL % (tool_display_name, __version__)
+    """主窗口标题：``<工具显示名> 备份迁移工具``（**不含版本号**，见 :data:`APP_TITLE_TPL`）。"""
+    return APP_TITLE_TPL % tool_display_name
+
+
+def about_lines(tool_display_name: str = "") -> list[str]:
+    """「关于」对话框要显示的字段，组装成**纯字符串列表**（不依赖 tkinter）。
+
+    为什么放在这里而不是 GUI 里：``版本号必须出现在用户看得见的地方、且与代码
+    同源``这条不变式，需要能被**不装 tkinter 的测试**直接断言（受管 Python 与
+    最小化 CI 都没有 tkinter）。标题去掉版本号后，承载它的就是本函数。
+
+    返回顺序即显示顺序；空串表示插入一个空行（由 GUI 决定间距，这里只给内容）。
+    """
+    lines = ["%s 备份迁移工具" % APP_NAME]
+    if tool_display_name:
+        lines.append("当前工具：%s" % tool_display_name)
+    lines.append("当前版本：%s" % __version__)
+    lines.append("作者：%s" % AUTHOR)
+    lines.append(LEGAL_COPYRIGHT)
+    lines.append("项目主页：https://github.com/%s/%s" % (PROJECT_OWNER, PROJECT_REPO))
+    lines.append("　　　　　https://gitee.com/%s/%s" % (PROJECT_OWNER, PROJECT_REPO))
+    return lines
 
 
 def version_line() -> str:
@@ -241,6 +280,7 @@ def windows_version_info(exe_name: str = "") -> str:
         "tablekey": _WIN_TABLE_KEY,
         "langid": "0x%04X" % _WIN_LANGID,
         "codepage": repr(_WIN_CODEPAGE),
+        "copyright": LEGAL_COPYRIGHT,
     }
 
 
@@ -315,7 +355,7 @@ VSVersionInfo(
           [StringStruct('FileDescription', 'AI 工具环境备份迁移工具'),
            StringStruct('FileVersion', '%(version)s'),
            StringStruct('InternalName', '%(app)s'),
-           StringStruct('LegalCopyright', 'Copyright (c) 2026 yinlichaoxi007'),
+           StringStruct('LegalCopyright', '%(copyright)s'),
            StringStruct('OriginalFilename', '%(original)s'),
            StringStruct('ProductName', '%(app)s'),
            StringStruct('ProductVersion', '%(version)s')]

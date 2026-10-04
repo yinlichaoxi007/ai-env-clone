@@ -27,7 +27,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-from .version import FINAL, is_newer, parse_version
+from .version import FINAL, PROJECT_OWNER, PROJECT_REPO, is_newer, parse_version
 
 __all__ = [
     "UpdateInfo",
@@ -45,9 +45,10 @@ __all__ = [
     "build_opener",
 ]
 
-#: 仓库坐标（GitHub 与 Gitee 同名同主）。
-OWNER = "yinlichaoxi007"
-REPO = "ai-env-clone"
+#: 仓库坐标（GitHub 与 Gitee 同名同主）。★ **定义在 ``version.py``**，
+#: 与「关于」对话框里的项目链接同源——两处各写一遍 owner/repo 迟早漂移。
+OWNER = PROJECT_OWNER
+REPO = PROJECT_REPO
 
 #: 四个平台的资产名。**必须精确匹配** —— 见模块 docstring 规则 2。
 ASSET_NAMES = {
@@ -455,7 +456,7 @@ def check_update(
         asset_name=asset_name,
         url=url,
         size=int(asset.get("size") or 0),
-        prerelease=(parsed[1] != ()) if parsed else False,
+        prerelease=(parsed[1] != FINAL) if parsed else False,
         notes=str(chosen.get("body") or "")[:2000],
         source=source,
     )

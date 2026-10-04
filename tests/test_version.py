@@ -94,15 +94,46 @@ class TestVersionSource(unittest.TestCase):
             % (v.__version__, offenders),
         )
 
-    def test_title_and_version_line_carry_version(self) -> None:
+    def test_title_carries_tool_name_but_not_version(self) -> None:
+        """★ 标题**不带版本号**（版本号在「关于」里，见 test_about_lines_*）。
+
+        这条是从「标题必须以 v<版本> 结尾」**搬家**过来的反向断言：同样钉住
+        「版本号的位置」这个决定，只是位置改成了「不许出现在标题里」——
+        防止有人日后又把它加回标题（那会与「关于」重复、且长标题在小屏上会被
+        窗口管理器截断）。
+        """
         title = v.app_title("CodeBuddy CN")
         self.assertIn("CodeBuddy CN", title)
-        self.assertTrue(
-            title.endswith("v" + v.__version__),
-            "窗口标题须以 v<版本> 结尾，实际为 %r" % title,
+        self.assertNotIn(
+            v.__version__, title,
+            "窗口标题不得再带版本号（已搬到「关于」对话框）：%r" % title,
         )
+        self.assertNotIn("v" + v.__version__, title)
         self.assertIn(v.__version__, v.version_line())
         self.assertIn(v.APP_NAME, v.version_line())
+
+    def test_about_lines_carry_version_and_copyright(self) -> None:
+        """★ 版本号**必须**出现在 about_lines() 里——它是标题去掉版本号的补偿。
+
+        这也是为什么 about_lines() 放在 version.py 而不在 GUI 里：受管 Python
+        与最小化 CI 都没有 tkinter，本用例必须能在那种环境下跑。
+        """
+        lines = v.about_lines("CodeBuddy CN")
+        text = "\n".join(lines)
+        self.assertIn(v.__version__, text, "「关于」必须显示当前版本号")
+        self.assertIn(v.LEGAL_COPYRIGHT, text, "「关于」必须显示版权串")
+        self.assertIn(v.AUTHOR, text)
+        self.assertIn("CodeBuddy CN", text)
+        # 项目链接：GitHub 与 Gitee 各一条，坐标与 updater 同源
+        self.assertIn("%s/%s" % (v.PROJECT_OWNER, v.PROJECT_REPO), text)
+        self.assertIn("github.com", text)
+        self.assertIn("gitee.com", text)
+        # 不带工具名也要能用（CLI / 无窗口场景）
+        self.assertIn(v.__version__, "\n".join(v.about_lines()))
+
+    def test_windows_version_info_shares_copyright_constant(self) -> None:
+        """exe 版本资源里的版权串与「关于」用同一常量，不许两处各写一遍。"""
+        self.assertIn(v.LEGAL_COPYRIGHT, v.windows_version_info("AiEnvClone.exe"))
 
     def test_release_tuple_pads_and_drops_prerelease(self) -> None:
         """数字段只放整数：预发布标识无法表达，故只取发布段并补零到四位。"""

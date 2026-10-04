@@ -180,6 +180,7 @@ GUI 界面要点：
 - **估算大小**：点击「估算大小」按钮可预估所选备份项打包后的体积。
 - **数据导入区**：位于「备份内容」与「选项」之间，随所选工具刷新。直接列出**该工具可导入的来源软件、实测版本、可导入的数据范围与状态**（`支持导入` / `仅备份/还原` / `待支持`）；支持导入时「导入会话…」按钮可用，点击即打开导入对话框；「导入说明」按钮弹出全部工具的支持矩阵。
 - **仅特定工具显示的行**：选中 **DeepSeek Harness** 时出现「会话健康」行（检测未分组会话 / 旧格式 replayState 等）；选中 **Qoder CN** 时出现「历史会话诊断」行（对比新版 `main.sqlite` 与旧版 `local.db` 两处数据根及导入账本，给出「导入后仍看不到历史会话」的成因结论）。这两行对其他工具隐藏，不影响各区域自适应布局。
+- **菜单（「AI 工具」行右侧）**：**设置 → 更新设置…** 配置「启动时自动检查更新 / 检查频率 / 是否包含预发布版本 / 代理」；**帮助 → 使用说明（`F1`）** 打开纯文字使用说明（与 `--docs` 同源，不显示图片；**表格按查看器当前宽度排版**——列间画 `|` 的等宽网格，放得下的表一行一行铺开、放不下的列**自己折行**（列边界仍对齐，所以把窗口拉宽、表格跟着变宽）；只有窄到每列放不下几个字才改成「条目名 + `列名：值`」的分条样式；**表格与分条之间只有一个切换阈值**，同一宽度下所有表格形态一致——把窗口缩小时变分条的宽度与放大时变回表格的宽度是同一个，不会出现「缩小时先分条、放大要更宽才回来」的错开；也不会出现被窗口裁掉或折行后列错位的表格；正文按字符折行，适配中文）；**帮助 → 关于** 显示版本号、作者与版权、项目主页，并可点「检查更新」查询最新版本（**只查询，不下载、不替换**）。**关于里的项目地址可直接点击打开浏览器**，也可以拖选后 `Ctrl+C` 复制（右键菜单另有「复制链接地址 / 全选」）。菜单与「AI 工具」下拉同处一行，**不额外占用窗口高度**。
 - **高分屏与窗口高度适配**：窗口声明 DPI 感知（Per-Monitor v2），缩放系数超过 100% 时不会被系统虚化放大。**首次打开的默认高度为屏幕高的 75%**（下限 460px），各工具完全一致、与内容多少无关——内容少的工具也不会缩成一小条；之后高度**完全由你控制**：拖高时备份内容区与数据导入说明区**按比例放大**（一屏能看到更多条目），拖矮时**按比例压缩**（为下方区域腾空间）；压到各自下限仍装不下时出现竖向滚动条，**进度条与状态栏始终固定在窗口最下方**，任何窗口高度下都不会被裁掉看不见——小尺寸屏幕上也不会因窗口超高而被遮挡。默认高度按屏幕**比例**而非固定像素计算，故在任意 DPI 缩放下占屏比例恒定。备份内容区高度只取决于窗口高度、与工具项数无关。窗口宽度不足时内容区出现横向滚动条，各区域的文字与控件不会被裁掉。
 
 也可双击仓库内的 `run.bat`（Windows，需本机已装 Python 3.10+）一键启动。
@@ -212,7 +213,7 @@ python -m ai_env_clone --check-update
 （而不是笼统一句「检查更新失败」），便于判断该换网络还是换代理。
 代理地址可在图形界面「设置 → 更新设置」填写，`--check-update` 会自动沿用。
 
-> 打包版 exe 的「属性 → 详细信息」里是**同一个版本号**——它由 `ai_env_clone/version.py` 生成，与窗口标题、`--version` 同源，不会出现「标题一个号、属性页另一个号」。
+> 打包版 exe 的「属性 → 详细信息」里是**同一个版本号**——它由 `ai_env_clone/version.py` 生成，与「帮助 → 关于」对话框、`--version` 同源，不会出现「关于里一个号、属性页另一个号」。
 
 备份 / 还原的 CLI 子命令**尚未实现**：当前 `python -m ai_env_clone` 只会启动图形界面，核心逻辑层 `ai_env_clone.core` 已完全解耦，脚本里可直接调用。
 
@@ -379,7 +380,7 @@ python -m ai_env_clone.dsh_repair repair-data <文件或目录> --apply --fix-du
 ```
 ai_env_clone/                包（import 名 ai_env_clone，产品名 AiEnvClone）
 ├── __init__.py        包初始化（__version__ 由 version.py 再导出）
-├── version.py         产品标识与版本号（唯一来源：窗口标题 / --version / exe 版本资源均由它派生；另含保序版本比较 parse_version/is_newer，供更新检查用）
+├── version.py         产品标识与版本号（唯一来源：关于对话框 / --version / exe 版本资源均由它派生；另含保序版本比较 parse_version/is_newer，供更新检查用）
 ├── doctext.py         使用说明的纯文本处理（剥离图片 + markdown→文本段落，幂等；GUI 与 --docs 共用，不依赖 tkinter）
 ├── resources.py       随包资源定位（使用说明、打赏图片等；源码模式读仓库、打包模式读 sys._MEIPASS）
 ├── prefs.py           用户偏好持久化（记住上次工具 + 更新设置；读-改-写，深度合并）
@@ -639,6 +640,7 @@ GUI highlights:
 - **Estimate size**: click "估算大小" (estimate size) to preview the packed size of selected items.
 - **Data-import area**: sits between "备份内容" and "选项", refreshed for the selected tool. It directly lists **the source tools that can be imported, their tested versions, the importable scope, and the status** (`支持导入` / `仅备份/还原` / `待支持`); when import is possible the "导入会话…" button is enabled and opens the import dialog, while "导入说明" shows the full capability matrix for every tool.
 - **Rows shown only for specific tools**: selecting **DeepSeek Harness** shows a "会话健康 / session health" row (detects ungrouped sessions, old-format `replayState`, etc.); selecting **Qoder CN** shows a "历史会话诊断 / session diagnostics" row (compares the new `main.sqlite` and the legacy `local.db` data roots plus the import ledger, and explains why "history sessions are still missing after import"). Both rows are hidden for other tools and do not affect the adaptive layout.
+- **Menus (right side of the "AI 工具" row)**: **设置 → 更新设置…** configures "check for updates on startup / check frequency / include pre-releases / proxy"; **帮助 → 使用说明 (`F1`)** opens the plain-text manual (same source as `--docs`, no images; **tables are laid out for the viewer's current width** — they render as an aligned grid when they fit, otherwise they **wrap by column while keeping the columns aligned**, so widening the window widens the table; only when a column would be too narrow does it switch to a "record name + `column: value`" list, so nothing is ever clipped or wrapped into misaligned columns; body text wraps by character, which suits Chinese); **帮助 → 关于** shows the version, author, copyright and project home, and offers a "检查更新" button that **only queries — it never downloads or replaces** anything. **The project URLs in 关于 are clickable (they open your browser) and can be selected and copied with `Ctrl+C`** (the right-click menu also offers "copy link address / select all"). The menus share the row with the tool dropdown, so they **add no window height**.
 - **Hi-DPI & adaptive window height**: the window declares DPI awareness (Per-Monitor v2), so it is not blurry-scaled by the OS when the scaling factor exceeds 100%. **On first launch the height is 75% of the screen height** (floored at 460px) — identical for every tool and independent of how much content it has, so a tool with few items no longer opens as a thin strip; afterwards the height is **fully under your control**: drag it taller and the backup content area and the import-notes area **scale up proportionally** (more items visible at once); drag it shorter and they **shrink proportionally** (freeing room for the sections below); once both reach their floors a vertical scrollbar appears, and the **progress bar and status bar stay pinned to the bottom** of the window — they are never clipped out of view at any window height, so small screens won't hide part of the window either. The default height is a **fraction of the screen**, not a fixed pixel value, so its share of the screen stays constant at any DPI scaling. The backup content area's height depends only on the window height, never on the tool or item count. If the window is too narrow, a horizontal scrollbar appears in the content area so labels and controls are never clipped.
 
 On Windows you can also double-click `run.bat` (requires Python 3.10+ installed locally).
@@ -674,7 +676,7 @@ when both fail it reports **each side's own reason** (instead of a vague "check 
 so it is clear whether to change network or proxy. A proxy can be set in
 "设置 → 更新设置" in the GUI and is reused by `--check-update`.
 
-> The packaged `.exe` shows the **same version** under Properties → Details — it is generated from `ai_env_clone/version.py`, the same source as the window title and `--version`, so they cannot disagree.
+> The packaged `.exe` shows the **same version** under Properties → Details — it is generated from `ai_env_clone/version.py`, the same source as the **Help → About** dialog and `--version`, so they cannot disagree.
 
 Backup / restore CLI subcommands are **not implemented yet**: `python -m ai_env_clone` currently just opens the GUI. The core layer `ai_env_clone.core` is fully decoupled and can be called directly from scripts:
 
@@ -838,7 +840,7 @@ Some tools store session message files deeply nested (for example CodeBuddy uses
 ```
 ai_env_clone/                package (import name ai_env_clone, product name AiEnvClone)
 ├── __init__.py        package init (re-exports __version__ from version.py)
-├── version.py         product identity & version (single source for window title / --version / exe version resource; also order-preserving parse_version/is_newer for update checks)
+├── version.py         product identity & version (single source for the About dialog / --version / exe version resource; also order-preserving parse_version/is_newer for update checks)
 ├── doctext.py         plain-text processing for the usage doc (strip images + markdown→paragraphs, idempotent; shared by the GUI viewer and --docs, tkinter-free)
 ├── resources.py       bundled-resource lookup (usage doc, images; repo root in source mode, sys._MEIPASS when packaged)
 ├── prefs.py           user preferences (last tool + update settings; read-modify-write with deep merge)
