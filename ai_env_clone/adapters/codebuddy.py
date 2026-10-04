@@ -84,7 +84,13 @@ import re
 import sys
 from datetime import datetime
 
-from ..core import ORIGIN_NOTE_CONVERSATION, BackupItem
+from .. import merge_plan
+from ..core import (
+    ORIGIN_NOTE_CONVERSATION,
+    BackupItem,
+    _longpath,
+    _write_bytes_atomic,
+)
 from .base import BaseAdapter, register
 
 
@@ -727,6 +733,21 @@ def _rule_item(rules_root: str) -> BackupItem:
     )
 
 
+def _merge_codebuddy_index(relpath: str, target: str, source_bytes: bytes) -> None:
+    """合并钩子：把包内 ``index.json`` 清单与本机清单**并集**后原子写回。
+
+    CodeBuddy 一个会话是「``index.json`` 清单 + ``messages/<mid>.json`` 实体」。
+    还原旧包时若直接覆盖清单，本机新增消息会变成**孤儿文件**（磁盘上有、界面看不见）。
+    并集（本机优先、按 id 补入包内独有项）正是消除该症状的手段，见方案 §2.3 / §3.4。
+    """
+    local = b""
+    if os.path.isfile(_longpath(target)):
+        with open(_longpath(target), "rb") as fh:
+            local = fh.read()
+    merged = merge_plan.union_json_by_id(source_bytes, local)
+    _write_bytes_atomic(target, merged)
+
+
 def build_items(
     root: str | None = None,
     global_root: str | None = None,
@@ -1007,6 +1028,22 @@ class CodeBuddyAdapter(BaseAdapter):
             "other": 0.14,
         },
     }
+
+    #: 增量合并策略（方案 §2.3 / §4）。会话是**目录**结构：``index.json`` 清单走并集，
+    #: ``messages/<mid>.json`` 实体与记忆 / 规则 / 检查点等一律**保留本机**、只补入缺的；
+    #: 唯一配置（settings / mcp / argv）以包为准。未声明项取 :attr:`RESTORE_MERGE_DEFAULT`。
+    RESTORE_POLICY: dict[str, str] = {
+        "index.json": merge_plan.MERGE,
+        "settings.json": merge_plan.REPLACE,
+        "mcp.json": merge_plan.REPLACE,
+        "argv.json": merge_plan.REPLACE,
+    }
+    RESTORE_MERGE_DEFAULT: str = merge_plan.KEEP_LOCAL
+    RESTORE_CONFIG_FILES: tuple[str, ...] = ("settings.json", "mcp.json", "argv.json")
+
+    def restore_merge_target(self) -> "Callable[[str, str, bytes], None] | None":
+        """清单并集钩子：``index.json``（会话级与 ``messages/`` 聚合级）并集后写回。"""
+        return _merge_codebuddy_index
 
     def detect_root(self) -> str | None:
         """探测 CodeBuddy 用户级/全局数据的公共根（用户主目录 ``~``）。始终返回 ``~``。"""

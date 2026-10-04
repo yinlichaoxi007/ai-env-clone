@@ -65,7 +65,10 @@ import tkinter.font as tkfont  # noqa: E402
 from tkinter import filedialog, messagebox, scrolledtext, ttk  # noqa: E402
 
 from ai_env_clone.adapters import get_adapter, list_adapters
-from ai_env_clone.adapters.base import MULTI_MACHINE_CYCLE_HINT
+from ai_env_clone.adapters.base import (
+    MULTI_MACHINE_CYCLE_HINT,
+    MULTI_MACHINE_CYCLE_HINT_MERGE,
+)
 from ai_env_clone import (
     archive_source,
     backup_scan,
@@ -314,6 +317,151 @@ def human_size(n: float) -> str:
             return "%.1f %s" % (n, unit)
         n /= 1024
     return "%.1f GB" % n
+
+
+# --------------------------------------------------------------------------- #
+# 还原方式（「合并 / 全覆盖」二选一）—— 文案与取值抽成纯函数，弹窗只负责渲染
+# --------------------------------------------------------------------------- #
+# 方案 §6.1 的实现注意：确认框改成自建对话框后，若把标题与正文写在对话框类里，
+# 「文案对不对」就再没人测了。故此处把**标题 / 正文 / 单选项**都抽成模块级纯函数，
+# 对话框与测试共用同一份输出（见 tests/test_restore_prompts.py）。
+RESTORE_MODE_MERGE = "merge"
+RESTORE_MODE_REPLACE = "replace"
+
+
+def restore_mode_options(
+    *, merge_supported: bool, merge_notice: str, replace_notice: str
+) -> list[tuple[str, str, str]]:
+    """返回还原方式单选项 ``[(value, label, description), ...]``（纯函数）。
+
+    - 支持增量合并：两项，「合并（推荐）」在前（默认选中，方案 §9 第 7 条）；
+    - 不支持：只返回「全覆盖」一项 —— 界面据此**不显示单选区**（方案 §6.1）。
+    """
+    replace = (RESTORE_MODE_REPLACE, "全覆盖", replace_notice)
+    if not merge_supported:
+        return [replace]
+    return [(RESTORE_MODE_MERGE, "合并（推荐）", merge_notice), replace]
+
+
+def restore_confirm_text(
+    *,
+    kind_label: str,
+    root_dir: str,
+    file_count: int,
+    total_size: str,
+    origin_line: str,
+    display_name: str,
+    notice: str = "",
+) -> tuple[str, str]:
+    """返回「确认还原备份包」弹窗的 ``(标题, 正文)``（纯函数，便于单测断言文案）。
+
+    :param notice: 正文里交代的还原语义说明。**不支持**合并的工具把「全覆盖」说明
+        直接放这里（只有一种方式，无需单选）；**支持**合并的工具传空串 —— 语义随
+        单选项一起渲染（见 :func:`restore_mode_options`），避免同一段话说两遍。
+    """
+    body = (
+        "即将把%s还原到：\n%s\n\n"
+        "将自动解压并写入 %d 个文件（%s），无需手动解压。\n"
+        "%s"
+        "%s"
+        "\n请务必先完全退出 %s，否则可能导致数据损坏。\n是否继续？"
+        % (
+            kind_label,
+            root_dir,
+            file_count,
+            total_size,
+            origin_line,
+            (notice + "\n") if notice else "",
+            display_name,
+        )
+    )
+    return "确认还原备份包", body
+
+
+class RestoreModeDialog:
+    """还原方式二选一（合并 / 全覆盖）弹窗；返回 ``"merge"`` / ``"replace"``，取消为 ``None``。
+
+    与其它子窗口同样的取舍：默认尺寸夹进工作区，内容超出可视高时竖向滚动
+    （见 :class:`_ScrollBody`）。只有支持增量合并的工具才渲染单选区。
+    """
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        title: str,
+        body: str,
+        options: list[tuple[str, str, str]],
+        default: str,
+    ) -> None:
+        self.result: str | None = None
+        self._var = tk.StringVar(value=default)
+        self.win = tk.Toplevel(parent)
+        self.win.title(title)
+        _clamp_dialog_size(self.win, 640, 540)
+        self.win.transient(parent)
+        self.win.rowconfigure(0, weight=1, minsize=0)
+        self.win.columnconfigure(0, weight=1)
+        self._scroll = _ScrollBody(self.win, row=0, column=0)
+        for _seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.win.bind(_seq, self._scroll.wheel)
+        frame = self._scroll.frame
+        ttk.Label(
+            frame, text=body, justify="left", anchor="w", wraplength=580
+        ).pack(fill=tk.X, padx=12, pady=(12, 8))
+        for value, label, desc in options:
+            row = ttk.Frame(frame)
+            row.pack(fill=tk.X, padx=12, pady=(2, 4))
+            ttk.Radiobutton(
+                row, text=label, value=value, variable=self._var
+            ).pack(anchor="w")
+            ttk.Label(
+                row, text=desc, justify="left", anchor="w", wraplength=556,
+                foreground="#555555",
+            ).pack(anchor="w", padx=(22, 0))
+        btns = ttk.Frame(self.win)
+        btns.grid(row=1, column=0, sticky="e", padx=12, pady=(4, 12))
+        ttk.Button(btns, text="确定", command=self._ok, width=10).pack(
+            side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btns, text="取消", command=self._cancel, width=10).pack(side=tk.LEFT)
+        self.win.protocol("WM_DELETE_WINDOW", self._cancel)
+        self._scroll.sync()
+        try:
+            self.win.grab_set()
+        except tk.TclError:
+            pass
+        self.win.wait_window()
+
+    def _ok(self) -> None:
+        self.result = self._var.get()
+        self.win.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.win.destroy()
+
+
+def ask_restore_mode(
+    parent: tk.Misc,
+    *,
+    title: str,
+    body: str,
+    options: list[tuple[str, str, str]],
+    default: str = RESTORE_MODE_MERGE,
+) -> str | None:
+    """弹出还原方式选择；返回 ``"merge"`` / ``"replace"``，取消返回 ``None``。
+
+    无头测试下退化为 ``messagebox.askyesno``（「是」= 默认方式）——自建弹窗会
+    ``grab_set()`` + ``wait_window()`` 阻塞等点击，在无头测试里会永久挂起。
+    """
+    if HEADLESS:
+        head = body + "\n\n" + "\n\n".join(
+            "%s：%s" % (label, desc) for _value, label, desc in options
+        )
+        return default if messagebox.askyesno(title, head, parent=parent) else None
+    return RestoreModeDialog(
+        parent, title=title, body=body, options=options, default=default
+    ).result
 
 
 # --------------------------------------------------------------------------- #
@@ -3350,31 +3498,46 @@ class QoderBackupApp:
             origin_line = ("\n本包携带 %d 处源机器的路径等信息（IDE 工作区记录 / 会话正文等），"
                            "还原时会一并写回本机对应位置。\n" % len(origin_rows))
 
-        # 还原语义按适配器区分措辞：整库覆盖型工具（会话集中在单个库文件）必须
-        # 说清「库里原有记录会被替换」，否则用户会按「只增不删」去理解而误还原。
-        overwrite_notice = self.adapter.restore_overwrite_notice()
-        if not messagebox.askyesno(
-            "确认还原备份包",
-            "即将把%s还原（覆盖写入）到：\n%s\n\n"
-            "将自动解压并写入 %d 个文件（%s），无需手动解压。\n%s\n"
-            "%s\n"
-            "请务必先完全退出 %s，否则可能导致数据损坏。\n是否继续？"
-            % (
-                "回滚快照" if expected_kind == "rollback" else "备份包",
-                self.root_dir,
-                info["file_count"],
-                human_size(info["total_bytes"]),
-                origin_line,
-                overwrite_notice,
-                self.adapter.display_name,
-            ),
-        ):
-            return
+        # 还原方式（方案 §6.1）：支持增量合并的工具弹自建对话框二选一（默认「合并」），
+        # 不支持的工具保持原样——只有「全覆盖」，用 messagebox 确认即可。
+        merge_supported = self.adapter.restore_merge_supported
+        title, body = restore_confirm_text(
+            kind_label="回滚快照" if expected_kind == "rollback" else "备份包",
+            root_dir=self.root_dir,
+            file_count=info["file_count"],
+            total_size=human_size(info["total_bytes"]),
+            origin_line=origin_line,
+            display_name=self.adapter.display_name,
+            notice="" if merge_supported else self.adapter.restore_overwrite_notice("replace"),
+        )
+        if merge_supported:
+            mode = ask_restore_mode(
+                self.root,
+                title=title,
+                body=body,
+                options=restore_mode_options(
+                    merge_supported=True,
+                    merge_notice=self.adapter.restore_overwrite_notice("merge"),
+                    replace_notice=self.adapter.restore_overwrite_notice("replace"),
+                ),
+                default=RESTORE_MODE_MERGE,
+            )
+            if mode is None:
+                return
+        else:
+            if not messagebox.askyesno(title, body):
+                return
+            mode = RESTORE_MODE_REPLACE
 
         # 读取包内 manifest 记录的源路径，与当前目标目录不一致时二次确认，
         # 防止还原到错误目录覆盖掉别的工具/用户的数据。
         recorded_root = manifest.get("source_root")
         if recorded_root and os.path.realpath(recorded_root) != os.path.realpath(self.root_dir):
+            mismatch_tail = (
+                "本次为「合并」还原，不会改动本机已有的会话与记忆。"
+                if mode == RESTORE_MODE_MERGE
+                else "继续还原可能会覆盖目标目录中已有的数据。"
+            )
             if not messagebox.askyesno(
                 "目标路径不一致，请确认",
                 "该备份包记录的数据来源路径为：\n%s\n\n"
@@ -3387,8 +3550,7 @@ class QoderBackupApp:
                 "工作区 ID」索引，若不一致，已还原的会话可能【不被索引显示】。\n"
                 "补救方法（还原前后均可）：把目标机器上的项目放到与源机器"
                 "相同的路径，或先在目标机器用 CodeBuddy 打开该工程，再重启 IDE。\n\n"
-                "继续还原可能会覆盖目标目录中已有的数据。确认仍要还原到该目录吗？"
-                % (recorded_root, self.root_dir),
+                "%s确认仍要还原到该目录吗？" % (recorded_root, self.root_dir, mismatch_tail),
             ):
                 return
 
@@ -3411,9 +3573,12 @@ class QoderBackupApp:
         # 回滚快照与备份文件同目录（<备份工具目录>/backup/<工具名>/），方便按时间信息对比选择
         rollback_dir = self._tool_dir("backup")
         os.makedirs(rollback_dir, exist_ok=True)
-        # 还原结果说明按适配器区分（整库覆盖 vs 文件落盘）——不能在后台线程里读 Tk，
-        # 故在主线程先取好文案。
-        result_note = self.adapter.restore_result_note()
+        # 还原结果说明按适配器 + 本次方式区分（合并 / 整库覆盖 / 文件落盘）——不能在
+        # 后台线程里读 Tk，故在主线程先取好文案。
+        result_note = self.adapter.restore_result_note(mode)
+        # 用法提醒同样按方式三分：合并没有「覆盖掉本机数据」这个前提（方案 §6.3）。
+        cycle_hint = (MULTI_MACHINE_CYCLE_HINT_MERGE if mode == RESTORE_MODE_MERGE
+                      else MULTI_MACHINE_CYCLE_HINT)
 
         def work():
             r = import_backup(
@@ -3429,8 +3594,13 @@ class QoderBackupApp:
                 restore_post_hook=self.adapter.restore_post_hook(),
                 restore_index_merge=self.adapter.restore_index_merge(),
                 restore_index_merge_paths=self.adapter.restore_index_merge_paths(),
+                mode=mode,
+                restore_policy_for=self.adapter.restore_policy_for,
+                restore_merge_target=self.adapter.restore_merge_target(),
             )
             extra = "\n回滚快照：%s" % r["rollback"] if r["rollback"] else ""
+            if r.get("skipped"):
+                extra += "\n保留本机已有 %d 项（未改动）" % r["skipped"]
             if r["blocked"]:
                 extra += "\n\n被跳过 %d 项" % len(r["blocked"])
             self.msg_queue.put(
@@ -3446,7 +3616,7 @@ class QoderBackupApp:
                             result_note,
                             extra,
                             self.adapter.display_name,
-                            MULTI_MACHINE_CYCLE_HINT,
+                            cycle_hint,
                         ),
                     ),
                 )

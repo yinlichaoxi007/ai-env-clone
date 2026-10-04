@@ -87,6 +87,7 @@ import json
 import os
 import sys
 
+from .. import merge_plan
 from ..core import ORIGIN_NOTE_CONVERSATION, ORIGIN_NOTE_SESSION_DB, BackupItem
 from .base import BaseAdapter, register
 
@@ -130,6 +131,11 @@ def _localappdata(name: str) -> str:
 def _db_with_companions(db_path: str) -> list[str]:
     """返回 SQLite 主库及其 -wal/-shm 配套（存在的才返回）。"""
     return [p for p in (db_path, db_path + "-wal", db_path + "-shm") if os.path.exists(p)]
+
+
+def _merge_workbuddy_db(relpath: str, target: str, source_bytes: bytes) -> None:
+    """合并钩子适配：``(relpath, target_abs, source_bytes)`` -> 逐表并入。"""
+    merge_plan.merge_workbuddy_db(target, source_bytes)
 
 
 def build_items(root: str | None = None, wb_home: str | None = None) -> list[BackupItem]:
@@ -454,10 +460,27 @@ class WorkBuddyAdapter(BaseAdapter):
     name = "workbuddy"
     display_name = "WorkBuddy"
 
-    #: 会话记录集中在 ``workbuddy.db`` 的 ``sessions`` 表里 ⇒ 还原 = **整库覆盖**：
-    #: 目标机库中原有的会话会被备份里的内容取代（本工具**不做**库内并集合并，
-    #: 见 README「覆盖 vs 融合」的取舍）。界面据此提示正确的多机用法。
+    #: 会话记录集中在 ``workbuddy.db`` 的 ``sessions`` 表里。「全覆盖」还原 = **整库覆盖**：
+    #: 目标机库中原有的会话会被备份里的内容取代；选择「增量合并」时则改为
+    #: **库内逐表并入**（见下 :attr:`RESTORE_POLICY`），本机已有行不动。
     RESTORE_LIBRARY_FILES: tuple[str, ...] = ("workbuddy.db",)
+
+    #: 增量合并策略（方案 §3.5）：库走记录级并入，``-wal``/``-shm`` 不写（活库自行管理），
+    #: ``settings.json`` 属「唯一配置」以包为准；其余（记忆 / 规则 / 技能 / 会话事件流 /
+    #: 文件历史 …）一律**保留本机**，只补入本机缺的。
+    RESTORE_POLICY: dict[str, str] = {
+        "workbuddy.db": merge_plan.MERGE,
+        "workbuddy.db-wal": merge_plan.KEEP_LOCAL,
+        "workbuddy.db-shm": merge_plan.KEEP_LOCAL,
+        "settings.json": merge_plan.REPLACE,
+    }
+    RESTORE_MERGE_DEFAULT: str = merge_plan.KEEP_LOCAL
+    RESTORE_CONFIG_FILES: tuple[str, ...] = ("settings.json",)
+
+    def restore_merge_target(self) -> "Callable[[str, str, bytes], None] | None":
+        """库内就位合并：把包内 ``workbuddy.db`` 的 ``sessions`` / ``workspaces`` /
+        ``session_usage`` 三表记录并入本机库，其余表（应用自身状态）绝不触碰。"""
+        return _merge_workbuddy_db
 
     #: WorkBuddy 专属压缩经验系数（档位 -> 类别 -> 压缩后/源 占比）。
     #:

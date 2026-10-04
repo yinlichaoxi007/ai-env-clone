@@ -74,7 +74,13 @@ import json
 import os
 import sys
 
-from ..core import ORIGIN_NOTE_CONVERSATION, BackupItem, _longpath
+from .. import merge_plan
+from ..core import (
+    ORIGIN_NOTE_CONVERSATION,
+    BackupItem,
+    _longpath,
+    _write_bytes_atomic,
+)
 from ..redact import redact_config_bytes
 from .base import BaseAdapter, register
 
@@ -248,6 +254,20 @@ def _merge_workspace_index_bytes(
 
     merged = _merge_values(original, source)
     return json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _merge_dsh_workspace(relpath: str, target: str, source_bytes: bytes) -> None:
+    """合并钩子：``storages/workspace.json`` 工作区索引**并集**后原子写回。
+
+    复用 :func:`_merge_workspace_index_bytes`（本机工作区全保留，只并入源机器新增项），
+    区别只是「就地写回」而非「返回字节交给 core 覆盖」。
+    """
+    original = b""
+    if os.path.isfile(_longpath(target)):
+        with open(_longpath(target), "rb") as fh:
+            original = fh.read()
+    merged = _merge_workspace_index_bytes(relpath, source_bytes, original)
+    _write_bytes_atomic(target, merged)
 
 
 def _count_session_files(sessions_root: str) -> int:
@@ -586,6 +606,20 @@ class DSHAdapter(BaseAdapter):
         ``current_uid`` 为兼容性参数（DSH 单用户扁平结构，无 UID 拆分），忽略。
         """
         return build_items(root_dir, _dsh_home())
+
+    #: 增量合并策略（方案 §4）：工作区索引走**并集**（复用既有合并逻辑），
+    #: ``cordis.patch.yml`` 属「唯一配置」以包为准；其余会话 / 指令 / 凭证 / 缓存
+    #: 一律**保留本机**，只补入本机缺的（``sessions/`` 天然按 UUID 落盘 ⇒ 加新不删旧）。
+    RESTORE_POLICY: dict[str, str] = {
+        "storages/workspace.json": merge_plan.MERGE,
+        "cordis.patch.yml": merge_plan.REPLACE,
+    }
+    RESTORE_MERGE_DEFAULT: str = merge_plan.KEEP_LOCAL
+    RESTORE_CONFIG_FILES: tuple[str, ...] = ("cordis.patch.yml",)
+
+    def restore_merge_target(self) -> "Callable[[str, str, bytes], None] | None":
+        """就地并集钩子：``storages/workspace.json``（见 :func:`_merge_dsh_workspace`）。"""
+        return _merge_dsh_workspace
 
     def restore_index_merge_paths(self) -> "Sequence[str] | None":
         """还原时需「合并而非覆盖」的索引文件：DSH 全局工作区索引。

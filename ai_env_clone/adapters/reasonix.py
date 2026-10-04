@@ -54,6 +54,7 @@ from __future__ import annotations
 import os
 import sys
 
+from .. import merge_plan
 from ..core import BackupItem
 from ..redact import redact_config_bytes
 from .base import BaseAdapter, register
@@ -209,6 +210,17 @@ def build_items(
 class ReasonixAdapter(BaseAdapter):
     name = "reasonix"
     display_name = "Reasonix"
+
+    #: 增量合并策略（方案 §4）：Reasonix 会话是**独立文件**
+    #: （``projects/<scope>/sessions/<id>-session.jsonl``，按 id 命名 ⇒ 天然「加新不删旧」），
+    #: 没有需要并集的全局清单文件，故只需「保留本机、只补缺的」。
+    #: 只有唯一配置（config.toml / settings.json）以包为准。
+    RESTORE_POLICY: dict[str, str] = {
+        "config.toml": merge_plan.REPLACE,
+        "settings.json": merge_plan.REPLACE,
+    }
+    RESTORE_MERGE_DEFAULT: str = merge_plan.KEEP_LOCAL
+    RESTORE_CONFIG_FILES: tuple[str, ...] = ("config.toml", "settings.json")
 
     #: Reasonix 专属压缩经验系数（档位 -> 类别 -> 压缩后/源 占比）。
     #:

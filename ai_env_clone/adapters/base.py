@@ -11,9 +11,15 @@ import os
 from abc import ABC, abstractmethod
 from typing import Sequence
 
+from .. import merge_plan
 from ..core import BackupItem, export_backup, import_backup, inspect_backup
 
-__all__ = ["BaseAdapter", "MULTI_MACHINE_CYCLE_HINT", "get_adapter"]
+__all__ = [
+    "BaseAdapter",
+    "MULTI_MACHINE_CYCLE_HINT",
+    "MULTI_MACHINE_CYCLE_HINT_MERGE",
+    "get_adapter",
+]
 
 
 #: 「多机串行使用」的正确姿势（与 README「覆盖 vs 融合」同源）。
@@ -23,6 +29,14 @@ MULTI_MACHINE_CYCLE_HINT = (
     "多台电脑请「串行」使用同一个工作区/会话：换机前先在旧电脑备份，"
     "到新电脑先还原再开始使用，之后如此循环；不要两台电脑交叉使用后互相还原"
     "（覆盖会丢掉其中一侧的增量）。"
+)
+
+#: 「合并」还原后的用法提醒。上面那条的前提是「**还原会覆盖本机数据**」，
+#: 合并模式下该前提不成立，措辞必须跟着换（方案 §5 风险 8），否则会让用户
+#: 以为「合并也把本机数据冲掉了」，反而不敢用。
+MULTI_MACHINE_CYCLE_HINT_MERGE = (
+    "本次为「合并」还原：本机已有会话与记忆未被改动，只把包内新增的补了进来。"
+    "若你想把本机清空重来，请先在「备份」页做一次备份，再改用「全覆盖」还原。"
 )
 
 
@@ -70,9 +84,25 @@ class BaseAdapter(ABC):
     #: 留空 = 数据按文件/目录落盘：还原只补入或更新备份包里的文件，目标机上其他数据不受
     #: 影响（例：DSH 的全局索引走并集合并、CodeBuddy 按 UUID 重映射路径）。
     #:
-    #: ⚠ 这只是**声明**，不改变还原行为（本工具不做库内合并，见 README「覆盖 vs 融合」的
-    #: 取舍说明）；声明与行为不符会让提示失真，改还原实现时务必同步改这里。
+    #: ⚠ 这是「**全覆盖**」方式的声明，不改动 :attr:`RESTORE_POLICY` 驱动的**增量合并**
+    #: 行为（见 README「覆盖 vs 融合」的取舍说明）；声明与行为不符会让提示失真，
+    #: 改还原实现时务必同步改这里。
     RESTORE_LIBRARY_FILES: tuple[str, ...] = ()
+
+    #: 增量合并还原的**策略声明**：``归档内相对路径后缀 -> 策略``（方案 §3.1）。
+    #:
+    #: 仅在还原方式选「合并」时生效（「全覆盖」走原样拷贝，与本声明无关）。
+    #: 取值见 :mod:`ai_env_clone.merge_plan`：``"merge"`` / ``"keep_local"`` / ``"replace"``。
+    #: 未命中声明的成员取 :attr:`RESTORE_MERGE_DEFAULT`（默认 ``"replace"``，即与今天一致）。
+    RESTORE_POLICY: dict[str, str] = {}
+
+    #: 合并模式下**未命中** :attr:`RESTORE_POLICY` 的成员默认策略（方案 §4 的兜底口径）。
+    #: 支持合并的工具通常声明为 ``"keep_local"``：本机已有的不动，包内多出来的才补入。
+    RESTORE_MERGE_DEFAULT: str = merge_plan.REPLACE
+
+    #: 合并模式下**以包内版本替换本机**的唯一配置类文件（相对路径**后缀**）。
+    #: 这是合并模式中唯一会覆盖本机数据之处，界面必须在确认框里**逐项列明**（方案 §4 / §6.1）。
+    RESTORE_CONFIG_FILES: tuple[str, ...] = ()
 
     # ------------------------------------------------------------------ #
     @abstractmethod
@@ -167,6 +197,10 @@ class BaseAdapter(ABC):
             kw["restore_index_merge"] = self.restore_index_merge()
         if "restore_index_merge_paths" not in kw:
             kw["restore_index_merge_paths"] = self.restore_index_merge_paths()
+        if "restore_policy_for" not in kw:
+            kw["restore_policy_for"] = self.restore_policy_for
+        if "restore_merge_target" not in kw:
+            kw["restore_merge_target"] = self.restore_merge_target()
         return import_backup(zip_path, root, progress=progress, **kw)
 
     # ------------------------------------------------------------------ #
@@ -223,6 +257,54 @@ class BaseAdapter(ABC):
         会话），而非简单覆盖。默认返回 ``None``（不做合并）。
         """
         return None
+
+    # ------------------------------------------------------------------ #
+    # 增量合并还原（「合并 / 全覆盖」二选一，可重写）
+    # ------------------------------------------------------------------ #
+    def restore_policy_for(self, relpath_norm: str) -> str:
+        """返回归档内某成员（正斜杠相对路径）在**合并模式**下应走的策略。
+
+        默认实现：按 :attr:`RESTORE_POLICY` 做**后缀匹配**，未命中返回
+        :attr:`RESTORE_MERGE_DEFAULT`。需要按目录（而非固定后缀）区分的适配器
+        （如「``messages/`` 下的消息文件全保留本机」）可重写本方法。
+        """
+        hit = merge_plan.match_policy(relpath_norm, self.RESTORE_POLICY)
+        return hit if hit is not None else self.RESTORE_MERGE_DEFAULT
+
+    def restore_merge_target(self) -> "Callable[[str, str, bytes], None] | None":
+        """返回「就地合并」钩子 ``callback(relpath, target_abs_path, source_bytes) -> None``。
+
+        core 在合并模式下对 :meth:`restore_policy_for` 判定为 ``"merge"`` 的成员调用它
+        **代替**字节拷贝；适配器需自行把 ``source_bytes`` 中的记录并入
+        ``target_abs_path``（典型：把包内 SQLite 的会话行 insert-or-ignore 进本机库、
+        把 ``index.json`` 的清单并集后原子写回）。必须**就地**完成，且**不要**整库读进内存
+        （大库会撑爆内存；参考 :func:`ai_env_clone.merge_plan.merge_sqlite_tables`）。
+
+        默认返回 ``None``（不做记录级合并）；声明了 ``"merge"`` 策略的适配器必须实现它。
+        """
+        return None
+
+    def restore_merge_config_files(self) -> tuple[str, ...]:
+        """合并模式下**以包为准替换本机**的唯一配置类文件（相对路径后缀），供确认框逐项列出。
+
+        默认取 :attr:`RESTORE_CONFIG_FILES`。
+        """
+        return tuple(self.RESTORE_CONFIG_FILES)
+
+    @property
+    def restore_merge_supported(self) -> bool:
+        """本适配器是否支持**增量合并**还原（界面据此决定是否出现「合并」选项）。
+
+        - 未声明任何 ``merge`` / ``keep_local`` 策略 ⇒ ``False``（只有「全覆盖」）；
+        - 声明了 ``merge`` 却未实现 :meth:`restore_merge_target` ⇒ ``False``
+          （声明与实现必须一致，否则会出现「清单没并入、消息却写回」的半合并）。
+        """
+        modes = set(self.RESTORE_POLICY.values()) | {self.RESTORE_MERGE_DEFAULT}
+        if not ({"merge", "keep_local"} & modes):
+            return False
+        if "merge" in modes and self.restore_merge_target() is None:
+            return False
+        return True
 
     def export_transform_paths(self) -> "Sequence[str] | None":
         """
@@ -287,13 +369,29 @@ class BaseAdapter(ABC):
         """
         return bool(self.RESTORE_LIBRARY_FILES)
 
-    def restore_overwrite_notice(self) -> str:
+    def restore_overwrite_notice(self, mode: str = "replace") -> str:
         """还原**之前**的说明：本次还原会对目标机已有数据造成什么影响。
 
         供「确认还原」弹窗按适配器区分措辞 —— 对整库覆盖型工具必须说清「库里原有
         记录会被替换」，否则用户会以为和文件落盘一样「只增不删」而误还原。
         面向用户的文案不写 Markdown 标记（Tk 不渲染 ``**``），如需强调用「」。
+
+        :param mode: 本次选择的还原方式（``"merge"`` / ``"replace"``）。文案由它驱动，
+            而不是写死 —— 声明与行为不符会让提示失真（方案 §6.2）。
         """
+        if mode == "merge":
+            names = "、".join(self.restore_merge_config_files())
+            text = (
+                "本次为「合并」还原：本机已有的会话与记忆不会被改动，"
+                "只把备份包里本机没有的补入；索引与清单会并集写回，"
+                "不会出现「数据在、列表里看不见」。"
+            )
+            if names:
+                text += (
+                    "\n注意：唯一配置（%s）会以包内版本「替换」本机，"
+                    "这是合并模式下唯一会覆盖本机数据之处。" % names
+                )
+            return text
         if self.restore_replaces_library:
             names = "、".join(self.RESTORE_LIBRARY_FILES)
             return (
@@ -308,12 +406,21 @@ class BaseAdapter(ABC):
             "目标机上备份包之外的会话与数据不受影响。"
         )
 
-    def restore_result_note(self) -> str:
+    def restore_result_note(self, mode: str = "replace") -> str:
         """还原**之后**的说明：一句话交代目标机已有数据受到了什么影响。
 
         供「还原成功」提示按适配器区分措辞，替换原先对所有工具都写「会话为新增、
         不会覆盖已有会话」的统一说法 —— 那句话对整库覆盖型工具是不成立的。
         """
+        if mode == "merge":
+            names = "、".join(self.restore_merge_config_files())
+            text = (
+                "本次为「合并」还原：本机原有会话与记忆未被改动，包内新增条目已补入，"
+                "索引与清单已并集写回。"
+            )
+            if names:
+                text += "（唯一配置 %s 已按包内版本替换。）" % names
+            return text
         if self.restore_replaces_library:
             names = "、".join(self.RESTORE_LIBRARY_FILES)
             return (

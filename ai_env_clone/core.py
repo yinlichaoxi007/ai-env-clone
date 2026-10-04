@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Iterable, Mapping, Sequence
 
+from . import merge_plan
+
 #: manifest 中记录类型的字段值（也用于 ``export_backup`` 的 kind 默认值）
 KIND_BACKUP = "backup"
 KIND_ROLLBACK = "rollback"
@@ -705,6 +707,198 @@ def safe_target(root_real: str, member_name: str) -> str | None:
     return target
 
 
+# --------------------------------------------------------------------------- #
+# 还原辅助：原子写文件 / 回滚快照 / 增量合并
+# --------------------------------------------------------------------------- #
+def _write_bytes_atomic(target: str, data: bytes) -> None:
+    """先写 ``<target>.aienv_tmp`` 再 ``os.replace`` 原子替换，避免半截文件。"""
+    tmp = target + ".aienv_tmp"
+    with open(_longpath(tmp), "wb") as fh:
+        fh.write(data)
+    os.replace(_longpath(tmp), _longpath(target))
+
+
+def _create_rollback_snapshot(
+    victims: "Sequence[tuple[str, str]]",
+    rollback_dir: str | None,
+    root_real: str,
+    tool: str | None,
+    zip_path: str,
+    progress: ProgressCb,
+) -> str | None:
+    """把 ``victims``（``(目标绝对路径, 归档内相对路径)``）打包成回滚快照；失败返回 ``None``。
+
+    回滚快照与备份文件同目录，文件名带工具名与时间戳，并写入 manifest，
+    便于后续被识别 / 再次还原。合并与全覆盖两条路径共用本函数。
+    """
+    rb_dir = os.path.realpath(rollback_dir) if rollback_dir else root_real
+    os.makedirs(rb_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tool_tag = (tool or "aienv").replace(" ", "")
+    rollback_path = os.path.join(rb_dir, "%s_rollback_%s.zip" % (tool_tag, ts))
+    rb_manifest = {
+        "version": MANIFEST_VERSION,
+        "kind": KIND_ROLLBACK,
+        "tool": tool or "unknown",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "source_root": root_real,
+        "platform": os.name,
+        "desc": "还原前自动生成的回滚快照",
+        "from_backup": os.path.basename(zip_path),
+    }
+    try:
+        with zipfile.ZipFile(rollback_path, "w", zipfile.ZIP_DEFLATED) as rb:
+            for idx, (t, arc) in enumerate(victims, 1):
+                progress(ProgressInfo(idx, len(victims), "生成回滚快照 %s" % arc))
+                rb.write(_longpath(t), arcname=arc)
+            rb.writestr(
+                MANIFEST_NAME,
+                json.dumps(rb_manifest, ensure_ascii=False, indent=2),
+            )
+    except OSError:
+        return None
+    return rollback_path
+
+
+def _restore_from_snapshot(
+    rollback_path: str | None, created_new: "Sequence[str]", root_real: str
+) -> list[str]:
+    """把本次新写入 / 覆盖的目标恢复到合并前状态，返回未能恢复的路径列表。
+
+    - ``created_new``：合并前**不存在**、本次新建的目标 ⇒ 删除；
+    - 其余被覆盖的目标 ⇒ 从回滚快照写回原字节。
+    """
+    failed: list[str] = []
+    for target in created_new:
+        try:
+            if os.path.isfile(_longpath(target)):
+                os.remove(_longpath(target))
+        except OSError:
+            failed.append(target)
+    if not rollback_path or not os.path.isfile(_longpath(rollback_path)):
+        return failed
+    try:
+        with zipfile.ZipFile(rollback_path, "r") as rb:
+            for m in rb.infolist():
+                if m.is_dir() or m.filename == MANIFEST_NAME:
+                    continue
+                target = safe_target(root_real, m.filename)
+                if target is None:
+                    failed.append(m.filename)
+                    continue
+                try:
+                    os.makedirs(_longpath(os.path.dirname(target)), exist_ok=True)
+                    _write_bytes_atomic(target, rb.read(m))
+                except OSError:
+                    failed.append(target)
+    except (OSError, zipfile.BadZipFile):
+        failed.append(rollback_path)
+    return failed
+
+
+def _run_merge_restore(
+    zf: zipfile.ZipFile,
+    members: "Sequence[zipfile.ZipInfo]",
+    root_real: str,
+    path_rewrite: "Callable[[str], str] | None",
+    restore_policy_for: "Callable[[str], str] | None",
+    restore_merge_target: "Callable[[str, str, bytes], None] | None",
+    make_rollback: bool,
+    rollback_dir: str | None,
+    tool: str | None,
+    zip_path: str,
+    progress: ProgressCb,
+) -> dict:
+    """增量合并还原（方案 §3.4 的两阶段 + 失败整体回滚）。
+
+    阶段 0/1【计算】：分类每个成员并读出合并源字节，**不写任何目标**；
+    阶段 2【快照】：对所有将被写入/合并且目标已存在的文件生成回滚快照；
+    阶段 3【提交】：逐个目标落地（新文件走 tmp+replace，合并走适配器就地钩子）；
+    阶段 5【回滚】：任一目标失败 ⇒ 删除新建文件 + 从快照写回被覆盖文件，再抛错。
+    """
+    restored = skipped = 0
+    blocked: list[str] = []
+    plan: list[tuple[str, str, str, zipfile.ZipInfo]] = []
+
+    for m in members:
+        arcname = path_rewrite(m.filename) if path_rewrite else m.filename
+        target = safe_target(root_real, arcname)
+        if target is None:
+            blocked.append(arcname)
+            continue
+        arc_norm = arcname.replace("\\", "/")
+        policy = (
+            restore_policy_for(arc_norm)
+            if restore_policy_for is not None
+            else merge_plan.REPLACE
+        )
+        if policy == merge_plan.KEEP_LOCAL:
+            if os.path.isfile(_longpath(target)):
+                skipped += 1
+                continue
+            plan.append(("write", arc_norm, target, m))
+        elif policy == merge_plan.MERGE and restore_merge_target is not None:
+            plan.append(("merge", arc_norm, target, m))
+        else:
+            plan.append(("write", arc_norm, target, m))
+
+    # 阶段 1 续：读出合并源字节（只读包，不写盘）。读失败 ⇒ 尚未动过本机，直接中止。
+    merge_bytes: dict[str, bytes] = {}
+    for kind, arc_norm, _target, m in plan:
+        if kind != "merge":
+            continue
+        try:
+            merge_bytes[arc_norm] = zf.read(m)
+        except Exception as exc:  # noqa: BLE001 - 读包失败一律中止且不改本机
+            raise BackupError(
+                "读取备份包内容失败，未改动本机数据：%s（%s）" % (m.filename, exc)
+            ) from exc
+
+    # 阶段 2：回滚快照（覆盖 / 合并的既有目标）。
+    victims = [
+        (target, arc_norm)
+        for _kind, arc_norm, target, _m in plan
+        if os.path.isfile(_longpath(target))
+    ]
+    rollback_path = None
+    if make_rollback and victims:
+        rollback_path = _create_rollback_snapshot(
+            victims, rollback_dir, root_real, tool, zip_path, progress
+        )
+
+    created_new = [
+        target
+        for _kind, _arc, target, _m in plan
+        if not os.path.isfile(_longpath(target))
+    ]
+    written: list[str] = []
+    total = len(plan)
+    try:
+        for idx, (kind, arc_norm, target, m) in enumerate(plan, 1):
+            progress(ProgressInfo(idx, total, "合并 %s" % m.filename))
+            os.makedirs(_longpath(os.path.dirname(target)), exist_ok=True)
+            if kind == "merge":
+                restore_merge_target(arc_norm, target, merge_bytes.get(arc_norm, b""))
+            else:
+                _write_bytes_atomic(target, zf.read(m))
+            written.append(target)
+            restored += 1
+    except Exception as exc:  # noqa: BLE001 - 需要整体回滚后再上抛
+        failed = _restore_from_snapshot(rollback_path, created_new, root_real)
+        tail = ""
+        if failed:
+            tail = "（注意：以下目标回滚失败，请用回滚快照手工恢复：%s）" % "、".join(failed[:5])
+        raise BackupError("合并还原失败，已回滚，本机数据未变%s：%s" % (tail, exc)) from exc
+
+    return {
+        "restored": restored,
+        "skipped": skipped,
+        "blocked": blocked,
+        "rollback": rollback_path,
+        "restored_targets": written,
+    }
+
+
 def inspect_backup(
     zip_path: str,
     verify: bool = False,
@@ -875,6 +1069,9 @@ def import_backup(
     restore_post_hook: "Callable[[str, list[str]], None] | None" = None,
     restore_index_merge: "Callable[[str, bytes, bytes], bytes] | None" = None,
     restore_index_merge_paths: "Sequence[str] | None" = None,
+    mode: str = "replace",
+    restore_policy_for: "Callable[[str], str] | None" = None,
+    restore_merge_target: "Callable[[str, str, bytes], None] | None" = None,
 ) -> dict:
     """
     恢复备份到根目录。
@@ -923,6 +1120,16 @@ def import_backup(
         （如 ``["storages/workspace.json"]``）。匹配采用**后缀判定**：归档内成员名相对公共根
         带根占位前缀（如 ``C__Users_x/.dsh/storages/workspace.json``），故只要成员名以
         ``/<声明片段>`` 结尾即视为命中，避免写死根前缀而失效。``None`` 表示不启用合并。
+    :param mode: 还原方式。``"replace"``（默认）= 全覆盖，逐文件覆盖写入，**与历史行为完全
+        一致**；``"merge"`` = 增量合并，按 :mod:`ai_env_clone.merge_plan` 的策略把包内数据
+        并入目标（本机已有数据不动），并**先算后写 + 失败整体回滚**（见 ``_run_merge_restore``）。
+        合并模式下 ``restore_index_merge`` / ``restore_post_hook`` **不生效**——索引并集改由
+        策略 ``"merge"`` 经 ``restore_merge_target`` 完成。
+    :param restore_policy_for: 仅合并模式使用：``relpath -> "replace"|"merge"|"keep_local"``。
+        通常直接传适配器的 :meth:`BaseAdapter.restore_policy_for`。
+    :param restore_merge_target: 仅合并模式使用：``callback(relpath, target_abs, source_bytes)``，
+        就地完成记录级合并（如把包内 SQLite 的会话行并入本机库）。声明了 ``"merge"`` 策略的
+        适配器必须提供，否则那些成员会退化为覆盖写入。
     :return: {'restored': int, 'skipped': int, 'blocked': [str], 'rollback': str|None,
               'kind': str|None, 'tool': str|None, 'source_root': str|None,
               'structure_match': bool|None, 'structure_missing': list[str]}
@@ -993,6 +1200,34 @@ def import_backup(
         ]
         total = len(members)
 
+        if mode == "merge":
+            # 增量合并：走独立的两阶段实现（先算后写 + 失败整体回滚），
+            # 不使用 restore_index_merge / restore_post_hook（索引并集改由 "merge" 策略钩子完成）。
+            merged = _run_merge_restore(
+                zf,
+                members,
+                root_real,
+                path_rewrite,
+                restore_policy_for,
+                restore_merge_target,
+                make_rollback,
+                rollback_dir,
+                tool,
+                zip_path,
+                progress,
+            )
+            progress(ProgressInfo(total, total, "完成"))
+            merged.update(
+                {
+                    "kind": kind,
+                    "tool": tool,
+                    "source_root": source_root,
+                    "structure_match": info.get("structure_match"),
+                    "structure_missing": info.get("structure_missing"),
+                }
+            )
+            return merged
+
         if make_rollback:
             victims = []
             for m in members:
@@ -1001,37 +1236,9 @@ def import_backup(
                 if t and os.path.isfile(_longpath(t)):
                     victims.append((t, arcname))
             if victims:
-                rb_dir = os.path.realpath(rollback_dir) if rollback_dir else root_real
-                os.makedirs(rb_dir, exist_ok=True)
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                tool_tag = (tool or "aienv").replace(" ", "")
-                rollback_path = os.path.join(rb_dir, "%s_rollback_%s.zip" % (tool_tag, ts))
-                # 回滚快照自身也写入 manifest，便于后续被识别/还原
-                rb_manifest = {
-                    "version": MANIFEST_VERSION,
-                    "kind": KIND_ROLLBACK,
-                    "tool": tool or "unknown",
-                    "created_at": datetime.now().isoformat(timespec="seconds"),
-                    "source_root": root_real,
-                    "platform": os.name,
-                    "desc": "还原前自动生成的回滚快照",
-                    "from_backup": os.path.basename(zip_path),
-                }
-                try:
-                    with zipfile.ZipFile(
-                        rollback_path, "w", zipfile.ZIP_DEFLATED
-                    ) as rb:
-                        for idx, (t, arc) in enumerate(victims, 1):
-                            progress(
-                                ProgressInfo(idx, len(victims), "生成回滚快照 %s" % arc)
-                            )
-                            rb.write(_longpath(t), arcname=arc)
-                        rb.writestr(
-                            MANIFEST_NAME,
-                            json.dumps(rb_manifest, ensure_ascii=False, indent=2),
-                        )
-                except OSError:
-                    rollback_path = None
+                rollback_path = _create_rollback_snapshot(
+                    victims, rollback_dir, root_real, tool, zip_path, progress
+                )
 
         for idx, m in enumerate(members, 1):
             arcname = path_rewrite(m.filename) if path_rewrite else m.filename

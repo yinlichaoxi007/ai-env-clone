@@ -64,6 +64,10 @@ class TestRestorePrompts(unittest.TestCase):
         # mock 弹窗：记录调用，askyesno 默认放行
         self.calls = []
         self._orig = dict(gui.messagebox.__dict__)
+        # codebuddy 支持增量合并 ⇒ 还原确认改走自建「还原方式」对话框；无头下必须置
+        # HEADLESS，否则 grab_set + wait_window 会永久挂起（行为退化为 messagebox）。
+        self._headless_orig = gui.HEADLESS
+        gui.HEADLESS = True
         gui.messagebox.showinfo = lambda title, msg, **k: self.calls.append(("showinfo", title, msg))
         gui.messagebox.showerror = lambda title, msg, **k: self.calls.append(("showerror", title, msg))
         gui.messagebox.askyesno = lambda title, msg, **k: (
@@ -78,6 +82,7 @@ class TestRestorePrompts(unittest.TestCase):
 
     def tearDown(self):
         gui.messagebox.__dict__.update(self._orig)
+        gui.HEADLESS = self._headless_orig
         try:
             self.app._closing = True
             self.tk_root.update_idletasks()
@@ -166,6 +171,64 @@ class TestRestorePrompts(unittest.TestCase):
                    if t == "确认还原备份包"]
         self.assertTrue(confirm)
         self.assertNotIn("携带", confirm[0])
+
+
+class TestRestoreConfirmText(unittest.TestCase):
+    """还原确认文案（纯函数）与「还原方式」单选项：文案必须由本次方式驱动（方案 §6.1/§6.2）。"""
+
+    def test_confirm_text_mentions_target_and_origin(self):
+        title, body = gui.restore_confirm_text(
+            kind_label="备份包",
+            root_dir="C:/target",
+            file_count=12,
+            total_size="3.4 MB",
+            origin_line="\n本包携带 2 处源机器的路径等信息。\n",
+            display_name="CodeBuddy",
+        )
+        self.assertEqual(title, "确认还原备份包")
+        self.assertIn("C:/target", body)
+        self.assertIn("12 个文件", body)
+        self.assertIn("携带", body)
+        self.assertIn("源机器", body)
+        self.assertIn("CodeBuddy", body)
+
+    def test_confirm_text_without_origin_has_no_hint(self):
+        _title, body = gui.restore_confirm_text(
+            kind_label="回滚快照", root_dir="C:/t", file_count=1, total_size="1.0 B",
+            origin_line="", display_name="X",
+        )
+        self.assertIn("回滚快照", body)
+        self.assertNotIn("携带", body)
+
+    def test_confirm_text_includes_notice_when_given(self):
+        """不支持合并的工具：语义说明直接进正文（没有单选区可承载它）。"""
+        _title, body = gui.restore_confirm_text(
+            kind_label="备份包", root_dir="C:/t", file_count=1, total_size="1.0 B",
+            origin_line="", display_name="Qoder", notice="本工具按文件落盘。",
+        )
+        self.assertIn("按文件落盘", body)
+
+    def test_merge_options_list_config_files(self):
+        """确认框必须**逐项列出**合并时会以包内版本替换的唯一配置（方案 §4 / §9 第 8 条）。"""
+        ad = get_adapter("workbuddy")
+        self.assertTrue(ad.restore_merge_supported)
+        opts = gui.restore_mode_options(
+            merge_supported=True,
+            merge_notice=ad.restore_overwrite_notice("merge"),
+            replace_notice=ad.restore_overwrite_notice("replace"),
+        )
+        self.assertEqual([o[0] for o in opts], ["merge", "replace"])
+        self.assertEqual(opts[0][1], "合并（推荐）")
+        merge_desc = opts[0][2]
+        for rel in ad.restore_merge_config_files():
+            self.assertIn(rel, merge_desc)
+
+    def test_no_merge_option_when_unsupported(self):
+        """不支持合并的工具（如 qoder）不出现「合并」选项。"""
+        opts = gui.restore_mode_options(
+            merge_supported=False, merge_notice="M", replace_notice="R")
+        self.assertEqual([o[0] for o in opts], ["replace"])
+        self.assertFalse(get_adapter("qoder").restore_merge_supported)
 
 
 if __name__ == "__main__":
