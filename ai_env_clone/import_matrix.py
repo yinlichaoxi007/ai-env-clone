@@ -69,6 +69,8 @@ class SourceCapability:
     note: str = ""                  # 附加说明（限制、落点提示等）
     parser: str = ""                # session_migration.SessionParser 方法名（仅 SUPPORTED）
     writer: str = ""                # session_migration.SessionWriter 方法名（仅 SUPPORTED）
+    changes: tuple = ()             # 作为导入源时【必然发生】的变化（info 级）
+    losses: tuple = ()              # 需要注意的来源侧损失 / 降级（warn 级）
 
     @property
     def status_label(self) -> str:
@@ -143,14 +145,78 @@ DISPLAY_ALIASES: dict[str, str] = {
 _SESSION_SCOPE = ("历史会话（用户 / 助手消息、推理过程、工具调用）",)
 
 # --------------------------------------------------------------------------- #
+# 变化预告：把「导入后会变成什么样」变成数据（界面直接渲染，见方案 §6.3）
+#
+# 中间模型 Session / SessionMessage 只有 role / content / reasoning_content /
+# tool_calls / created_at / title / scope 七个字段 —— **凡这七个之外的都带不过去**。
+# 在这里声明成数据，是为了让「源侧变化」「目标侧损失」都有单一事实来源，
+# 将来改 writer 忘改文案会被 tests/test_import_notices.py 的契约测试拦下。
+# --------------------------------------------------------------------------- #
+#: 所有来源共有的「必然变化」（A 级，info）。各来源若确有差异可单独覆盖。
+COMMON_CHANGES: tuple = (
+    "会话 id 与消息 id 全部重新生成，不会覆盖目标机已有会话",
+    "没有时间戳的消息会记为「导入时刻」",
+    "模型信息、token 用量、计费统计不带过去",
+    "会话级设置（系统提示词 / 置顶 / 归档 / 标签）不带过去",
+    "多模态内容（图片 / 附件）会被拍平成文本或丢弃",
+)
+
+#: 目标工具 -> 写出时的**内容层损失**（C 级，warn）；键与写出口径一一对应。
+#: 值为 ``(损失标识, 人类可读说明)``；契约测试据此核对 writer 行为。
+TARGET_LOSSES: dict[str, tuple] = {
+    "codebuddy": (
+        ("tool_calls", "工具调用不会写出：目标会话里看不到「调用了什么工具」，只剩文本"),
+    ),
+    "workbuddy": (
+        ("tool_results", "工具执行结果不会作为独立结果块写出，只留在助手正文的文本里"),
+    ),
+    "dsh": (
+        ("tool_results", "工具执行结果不会写出"),
+    ),
+    "reasonix": (),
+}
+
+#: 目标工具 -> 分组 / 归属的重新映射规则（B 级，warn）。
+TARGET_GROUPING: dict[str, tuple] = {
+    "reasonix": (
+        "分组按「项目名」重新映射：项目名里的非字母数字字符会被替换为 '-'，"
+        "取不到时落到 global-workspace",
+    ),
+    "codebuddy": (
+        "分组按目标 workspaceId 重新映射（由项目路径哈希派生、不可逆）："
+        "优先用包内的会话工作区映射反查，反查不到则落到默认落点",
+    ),
+    "workbuddy": (
+        "分组按「工作区路径」重新映射：目标机已有同名工作区时，导入的会话会"
+        "并入该工作区（表现为分组被合并）",
+    ),
+    "dsh": (
+        "分组按「工作区路径」重新映射并登记进 storages/workspace.json："
+        "目标机已有同名工作区时会并入",
+    ),
+}
+
+#: 目标工具 -> 无工作区信息时的兜底落点（B5 级，warn）。
+TARGET_DEFAULT_LANDING: dict[str, str] = {
+    "reasonix": "无工作区信息的会话落到 global-workspace",
+    "codebuddy": "无工作区信息的会话落到目标工具的默认落点",
+    "workbuddy": "无工作区信息的会话落到 ~/WorkBuddy/<时间戳>（本次现造的新目录）",
+    "dsh": "无工作区信息的会话落到用户主目录对应的默认工作区",
+}
+
+
+# --------------------------------------------------------------------------- #
 # 来源能力模板
 # --------------------------------------------------------------------------- #
 def _src(tool: str, scope: Sequence[str] = _SESSION_SCOPE, status: str = SUPPORTED,
-         note: str = "", parser: str = "", writer: str = "") -> SourceCapability:
+         note: str = "", parser: str = "", writer: str = "",
+         changes: Sequence[str] = COMMON_CHANGES,
+         losses: Sequence[str] = ()) -> SourceCapability:
     display, versions = _SRC_META[tool]
     return SourceCapability(
         tool=tool, display=display, versions=versions, scope=tuple(scope),
         status=status, note=note, parser=parser, writer=writer,
+        changes=tuple(changes), losses=tuple(losses),
     )
 
 
@@ -172,35 +238,39 @@ _PLAIN_SOURCES: dict[str, SourceCapability] = {
         scope=("历史会话（事件流：消息 / 推理 / 工具调用 / 工具结果）",),
         parser="parse_workbuddy", writer="write_workbuddy",
         note="明文 JSONL；写出时同时登记 workbuddy.db 的 sessions 行。",
+        losses=("一个助手回合的多条事件（推理 / 工具调用 / 工具结果 / 正文）"
+                "会被聚合为一条助手消息",),
     ),
     "zcode": _src(
         "zcode", status=SUPPORTED,
         scope=("历史会话（message / part 表，含正文与推理）",),
         parser="parse_zcode", writer="",
         note="明文 SQLite，只读解析；ZCode 自身的写出格式尚未实测，暂不作为导入目标。",
+        losses=("未知类型的消息片段会尽量保留可读文本，可能不是原文结构",),
     ),
     "dsh": _src(
         "dsh", status=SUPPORTED,
         scope=("历史会话（事件流：user/assistant message、tool call）",),
         parser="parse_dsh", writer="write_dsh",
         note="Zstandard 压缩 JSONL；读 / 写均需 zstd 后端（工具内可一键安装）。",
+        losses=("相邻的「纯工具调用」助手消息会被合并为一条",),
     ),
 }
 
 # 主库不可解析（列级密文 / 私有格式）→ 只能整库备份/还原
 _ENCRYPTED_SOURCES: dict[str, SourceCapability] = {
     "qoder": _src(
-        "qoder", status=BACKUP_ONLY,
+        "qoder", status=BACKUP_ONLY, changes=(),
         scope=("整库备份 / 还原（会话库不可解析）",),
         note="旧版 local.db 为标准 SQLite 但会话正文列为列级密文、新版会话分散在各自的 SQLite / 明文 JSONL 中，均无法跨软件转换格式。",
     ),
     "trae-cn": _src(
-        "trae-cn", status=BACKUP_ONLY,
+        "trae-cn", status=BACKUP_ONLY, changes=(),
         scope=("整库备份 / 还原（会话库不可解析）",),
         note="智能体会话为产品侧加密的 database.db，非标准 SQLite，无法解析。",
     ),
     "trae-solo-cn": _src(
-        "trae-solo-cn", status=BACKUP_ONLY,
+        "trae-solo-cn", status=BACKUP_ONLY, changes=(),
         scope=("整库备份 / 还原（会话库不可解析）",),
         note="与 TraeCode CN 同族，会话同为产品侧加密，无法解析。",
     ),
@@ -309,6 +379,57 @@ def known_targets() -> list:
 def session_import_targets() -> list:
     """返回**支持接收会话导入**的目标工具标识（即至少有一个 SUPPORTED 来源）。"""
     return [t for t, cap in _MATRIX.items() if cap.importable]
+
+
+def importable_sources_for(target: str) -> tuple:
+    """返回目标工具 ``target`` 可真正导入（status == SUPPORTED）的来源能力元组。
+
+    未登记 / 无可用来源时返回空元组（调用方无需判 None）。
+    """
+    cap = _MATRIX.get(target)
+    return cap.importable if cap is not None else ()
+
+
+def notices_for(source_tool: str, target_tool: str) -> dict:
+    """组装「本次导入的变化预告」三段文案（界面直接渲染）。
+
+    :return: ``{"must": [...], "warn": [...], "keep": [...]}``
+
+        - ``must``：**必然变化**（info 级）—— 来自来源侧的 ``changes``；
+        - ``warn``：**需要注意**（warn 级）—— 来源侧损失 + 目标侧分组重映射 +
+          目标侧兜底落点 + 目标侧内容损失；
+        - ``keep``：**不影响**（info 级）—— 用户真正关心的「什么会被完整保留」，
+          按目标工具是否会丢工具调用 / 工具结果动态生成。
+
+    同工具（``source_tool == target_tool``）不产生预告（不走导入通路）。
+    """
+    if not source_tool or not target_tool or source_tool == target_tool:
+        return {"must": [], "warn": [], "keep": []}
+
+    src = ALL_SOURCES.get(source_tool)
+    must = list(src.changes) if src is not None else []
+
+    warn: list = []
+    if src is not None:
+        warn.extend(src.losses)
+    warn.extend(TARGET_GROUPING.get(target_tool, ()))
+    landing = TARGET_DEFAULT_LANDING.get(target_tool)
+    if landing:
+        warn.append(landing)
+    warn.extend(text for _key, text in TARGET_LOSSES.get(target_tool, ()))
+
+    return {"must": must, "warn": warn, "keep": list(_keep_for(target_tool))}
+
+
+def _keep_for(target_tool: str) -> tuple:
+    """「不影响的」清单：按目标工具是否会丢工具调用 / 工具结果动态生成。"""
+    dropped = {key for key, _text in TARGET_LOSSES.get(target_tool, ())}
+    out = ["用户正文与助手正文均保留", "推理过程（thinking）保留"]
+    if "tool_calls" not in dropped:
+        out.append("工具调用的名称与参数保留")
+    if "tool_results" not in dropped:
+        out.append("工具执行结果保留")
+    return tuple(out)
 
 
 def describe(tool: str) -> dict:

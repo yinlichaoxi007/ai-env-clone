@@ -17,6 +17,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from ai_env_clone import __main__ as gui  # noqa: E402
+from ai_env_clone import backup_scan  # noqa: E402
 from ai_env_clone import import_matrix  # noqa: E402
 from ai_env_clone import workspace_plan  # noqa: E402
 from ai_env_clone.__main__ import QoderBackupApp  # noqa: E402
@@ -772,6 +773,98 @@ class TestUnresolvedWorkspaceConfirm(unittest.TestCase):
                                    return_value=None):
                 self.assertFalse(dlg._confirm_unresolved_workspaces(items, plans))
             self.assertFalse(dlg.manual_var.get())
+        finally:
+            root.destroy()
+
+
+class TestPkgTabInFlightDedup(unittest.TestCase):
+    """页签 B：同一个包**在途只解包一次**（否则线程风暴 + 结果互相判过期）。
+
+    回归 2026-10-04 用户实测：选中包后会话列表一直不显示内容、点几下界面就卡死。
+    成因是 ``_refresh_pkg_view`` 每回一层就重建列表并恢复选中，从而**再次**触发
+    ``<<TreeviewSelect>>`` → ``_on_pkg_pick``；而当时只用「已解包完成的路径」
+    （``_arc_path``）判重，于是同一个包被反复重新解包：既刷出大量后台线程，又让
+    每次新请求把上一个结果判为过期丢弃 ⇒ 列表永远填不上。
+    """
+
+    class _NoThread:
+        """替身线程：只记录 target，不真正启动（让断言与调度无关、可确定）。"""
+
+        started: list = []
+
+        def __init__(self, *args, **kwargs):
+            type(self).started.append(kwargs.get("target"))
+            self._target = kwargs.get("target")
+
+        def start(self):
+            pass
+
+    def _make_dialog(self, tool: str):
+        with mock.patch("ai_env_clone.__main__._load_last_tool", return_value=tool), \
+             mock.patch("ai_env_clone.__main__._save_last_tool", return_value=None):
+            root = tk.Tk()
+            root.withdraw()
+            app = QoderBackupApp(root)
+        with mock.patch("ai_env_clone.session_migration.list_source_sessions",
+                        return_value=[]):
+            dlg = gui.MigrateDialog(app)
+        return root, dlg
+
+    def test_repeated_selection_extracts_once(self):
+        target = import_matrix.session_import_targets()[0]
+        # 来源工具必须与目标不同，包才「可导入」（本工具的包该走还原）。
+        src_tool = next(s.tool for s in import_matrix.importable_sources_for(target))
+        root, dlg = self._make_dialog(target)
+        try:
+            self.assertTrue(dlg._can_import, "用例前提：目标工具可接收导入")
+            path = os.path.abspath(os.path.join(
+                "x", "%s_backup_20260101.zip" % src_tool))
+            dlg._pkg_rows = [
+                backup_scan.BackupEntry(path, os.path.basename(path), 10, 0,
+                                        "backup", src_tool)
+            ]
+            dlg.pkg_tree.insert("", "end", iid=path, values=(
+                os.path.basename(path), "备份", "10B", "2026-01-01 00:00"))
+            dlg.pkg_tree.selection_set(path)
+
+            self._NoThread.started = []
+            with mock.patch.object(gui.threading, "Thread", self._NoThread):
+                dlg._on_pkg_pick()        # 第一次：起一个后台解包
+                dlg._on_pkg_pick()        # 再次触发：应被在途去重拦下
+                dlg._refresh_pkg_view()   # 模拟「扫描回一层」重建列表并恢复选中
+                dlg._on_pkg_pick()        # 恢复选中后可能再触发一次：仍应拦下
+            self.assertEqual(
+                len(self._NoThread.started), 1,
+                "同一个包不应重复起解包线程（实测起了 %d 个）"
+                % len(self._NoThread.started))
+            self.assertEqual(dlg._arc_pending, path)
+        finally:
+            root.destroy()
+
+    def test_switching_package_starts_new_extraction(self):
+        target = import_matrix.session_import_targets()[0]
+        src_tool = next(s.tool for s in import_matrix.importable_sources_for(target))
+        root, dlg = self._make_dialog(target)
+        try:
+            paths = [os.path.abspath(os.path.join("x", "%s_backup_%d.zip" % (src_tool, i)))
+                     for i in (1, 2)]
+            dlg._pkg_rows = [
+                backup_scan.BackupEntry(p, os.path.basename(p), 10, 0, "backup", src_tool)
+                for p in paths
+            ]
+            for p in paths:
+                dlg.pkg_tree.insert("", "end", iid=p, values=(
+                    os.path.basename(p), "备份", "10B", "2026-01-01 00:00"))
+
+            self._NoThread.started = []
+            with mock.patch.object(gui.threading, "Thread", self._NoThread):
+                dlg.pkg_tree.selection_set(paths[0])
+                dlg._on_pkg_pick()
+                dlg.pkg_tree.selection_set(paths[1])
+                dlg._on_pkg_pick()
+            self.assertEqual(len(self._NoThread.started), 2,
+                             "换一个包应重新解包")
+            self.assertEqual(dlg._arc_pending, paths[1])
         finally:
             root.destroy()
 

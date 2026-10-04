@@ -66,10 +66,17 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk  # noqa: E402
 
 from ai_env_clone.adapters import get_adapter, list_adapters
 from ai_env_clone.adapters.base import MULTI_MACHINE_CYCLE_HINT
-from ai_env_clone import import_matrix, session_migration, workspace_plan
+from ai_env_clone import (
+    archive_source,
+    backup_scan,
+    import_matrix,
+    session_migration,
+    workspace_plan,
+)
 from ai_env_clone.compress_estimate import (
     COMPRESS_LEVELS,
     DEFAULT_COMPRESS_LEVEL,
+    cache_dir as _cache_dir,
     category_of,
     estimate_compressed_bytes,
     load_calibration,
@@ -83,7 +90,6 @@ from ai_env_clone.core import (
     companion_notes,
     import_backup,
     inspect_backup,
-    list_backup_dir,
     manifest_origin_info,
     origin_info_lines,
     scan_items,
@@ -170,6 +176,132 @@ def _window_height_ceiling(screen: int) -> int:
     if wa >= _WINDOW_H_MIN:
         return wa
     return max(_WINDOW_H_MIN, int(screen * _WINDOW_H_SCREEN_RATIO))
+
+
+# --------------------------------------------------------------------------- #
+# 子窗口（Toplevel 弹窗）默认尺寸夹紧 + 竖向滚动兜底
+# --------------------------------------------------------------------------- #
+#: 弹窗默认高度下限（px）：再矮也要保证正文与底部按钮可用。
+_DIALOG_H_MIN = 360
+#: 弹窗高度上限相对**工作区**留的边距（px）：不贴着任务栏 / 屏幕边，避免底部按钮
+#: 与窗口边框重叠或被遮挡。
+_DIALOG_H_MARGIN = 48
+#: 取不到工作区（非 Windows / 调用失败）时的兜底上限系数（相对屏幕高）。
+_DIALOG_H_SCREEN_RATIO = 0.9
+
+#: 自带滚动能力的控件：外层滚动容器遇到它们时**放行**，交给它们各自处理，
+#: 避免「外层抢走滚轮、内层滚不动」（与主窗口 ``_on_content_wheel`` 同一判据）。
+_SELF_SCROLLING = (tk.Text, tk.Listbox, tk.Canvas, ttk.Treeview)
+
+
+def _clamp_dialog_size(win: tk.Toplevel, width: int, height: int) -> tuple[int, int]:
+    """把弹窗默认尺寸夹进工作区，避免矮屏 / 高 DPI 下窗口超出屏幕、底部被裁。
+
+    与主窗口同一取舍（见 ``_window_height_ceiling``）：**优先保证窗口完整可见**，
+    内容装不下由内容区的滚动条承载（见 :class:`_ScrollBody`）。只夹**默认**尺寸——
+    之后仍由用户与窗口管理器控制，程序不再改写。
+    """
+    try:
+        screen_h = int(win.winfo_screenheight())
+    except Exception:
+        screen_h = 900
+    try:
+        screen_w = int(win.winfo_screenwidth())
+    except Exception:
+        screen_w = 1280
+    wa = _work_area_height()
+    cap_h = (wa - _DIALOG_H_MARGIN) if wa > _DIALOG_H_MIN \
+        else int(screen_h * _DIALOG_H_SCREEN_RATIO)
+    cap_h = max(_DIALOG_H_MIN, cap_h)
+    h = int(_clamp(height, _DIALOG_H_MIN, cap_h))
+    w = int(min(width, max(320, screen_w - 40)))
+    try:
+        win.geometry("%dx%d" % (w, h))
+    except tk.TclError:
+        pass
+    return w, h
+
+
+class _ScrollBody:
+    """弹窗用的竖向滚动容器：内容放进 :attr:`frame`，超出可视高才出现滚动条。
+
+    与主窗口内容区同一套做法（canvas + 内嵌 frame + 必要时才显示竖向滚动条），
+    只是省掉了「弹性高度」——弹窗内容高度由子控件自然决定，装不下就滚动。
+    滚轮由调用方绑到弹窗 Toplevel 上（子控件的事件会冒泡到 Toplevel）。
+    """
+
+    def __init__(self, parent: tk.Misc, row: int = 0, column: int = 0) -> None:
+        self.outer = ttk.Frame(parent)
+        self.outer.grid(row=row, column=column, sticky="nsew")
+        self.outer.rowconfigure(0, weight=1)
+        self.outer.columnconfigure(0, weight=1)
+        self.canvas = tk.Canvas(self.outer, highlightthickness=0, bd=0, takefocus=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.sb = ttk.Scrollbar(self.outer, orient="vertical",
+                                command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.sb.set)
+        self.frame = ttk.Frame(self.canvas)
+        self._win = self.canvas.create_window((0, 0), window=self.frame, anchor="nw")
+        self._visible = False
+        self.frame.bind("<Configure>", self._on_inner)
+        self.canvas.bind("<Configure>", self._on_canvas)
+
+    # -- 布局联动 --
+    def sync(self) -> None:
+        """内容高度变化后手动同步一次（构建完成后调用，避免首帧判断滞后）。"""
+        self._on_inner()
+
+    def _on_inner(self, _event=None) -> None:
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except tk.TclError:
+            return
+        self._sync_bar()
+
+    def _on_canvas(self, event) -> None:
+        # 内嵌 frame 跟随可视宽：否则长内容会把自身撑宽、右侧被裁。
+        try:
+            self.canvas.itemconfigure(self._win, width=event.width)
+        except tk.TclError:
+            return
+        self._sync_bar()
+
+    def _sync_bar(self) -> None:
+        need = self._needs_bar()
+        if need == self._visible:
+            return
+        self._visible = need
+        if need:
+            self.sb.grid(row=0, column=1, sticky="ns")
+        else:
+            self.sb.grid_remove()
+
+    def _needs_bar(self) -> bool:
+        try:
+            return self.frame.winfo_reqheight() > self.canvas.winfo_height()
+        except tk.TclError:
+            return False
+
+    @property
+    def scrollable(self) -> bool:
+        """当前是否处于「内容超出可视高、滚动条已启用」状态。"""
+        return self._visible
+
+    def wheel(self, event):
+        """滚轮处理（绑到弹窗 Toplevel）。内层自带滚动条时放行、不抢。"""
+        if not self._visible:
+            return None
+        if isinstance(event.widget, _SELF_SCROLLING):
+            return None
+        if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            delta = -1
+        else:
+            delta = 1
+        try:
+            self.canvas.yview_scroll(delta, "units")
+        except tk.TclError:
+            return None
+        return "break"
 
 
 # 无头开关：单元测试置 True 时隐藏备份浏览器子窗口，避免测试闪窗（仅影响测试）。
@@ -1754,7 +1886,7 @@ class QoderBackupApp:
             return
         win = tk.Toplevel(self.root)
         win.title(title)
-        win.geometry("760x560")
+        _clamp_dialog_size(win, 760, 560)
         win.transient(self.root)
         frame = ttk.Frame(win)
         frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -1841,7 +1973,7 @@ class QoderBackupApp:
             return
         win = tk.Toplevel(self.root)
         win.title("使用说明")
-        win.geometry("880x660")
+        _clamp_dialog_size(win, 880, 660)
         win.transient(self.root)
         frame = ttk.Frame(win)
         frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -3166,6 +3298,50 @@ class QoderBackupApp:
             messagebox.showerror("无法读取", str(exc))
             return
 
+        # -------------------------------------------------------------- #
+        # 第一道闸门：先认「包属于哪个工具」，再决定能不能在本窗口还原。
+        #
+        # 收窄后的语义（见 docs/local/从备份包导入方案.md）：**还原只在本工具
+        # 自己的备份上进行**。跨工具的包一律拒绝并指路到「导入会话 → 从备份包
+        # 导入」——不再提供「按当前窗口工具强行还原」的选项。原因是那条路会
+        # 「看着成功」：归档内路径相对**源**适配器的 detect_root()，文件会落对
+        # 地方，但同一次调用里的 path_rewrite / restore_index_merge /
+        # restore_post_hook / 结构校验全都按**错误的工具**规则执行，结果是
+        # 「文件在、列表里看不见」。极端例子是 ZCode（detect_root() 是盘根
+        # C:\，包内多一层 Users/<用户名>/），路径段与指纹都对不上。
+        #
+        # 识别顺序：manifest 的 tool 字段优先；无声明时**跨全部适配器**做结构
+        # 指纹识别（当前窗口工具排最前，保住「老包无清单但本来就是本工具」的
+        # 兼容）——这样「是别的工具但没清单」也能被正确拒绝并点名。
+        # -------------------------------------------------------------- #
+        manifest = info.get("manifest") or {}
+        pkg_tool, _tool_src = backup_scan.identify_tool(
+            info.get("entries") or [], manifest, prefer=self.adapter.name
+        )
+        if not pkg_tool:
+            messagebox.showerror(
+                "不可还原",
+                "该压缩包缺少有效的工具声明，且内部结构指纹与任何已支持工具都不匹配，\n"
+                "无法确认是可还原的备份。\n\n"
+                "如果它是别的工具的备份包，请用「导入会话…」→「从备份包导入」"
+                "取其中的会话。",
+            )
+            return
+        if pkg_tool != self.adapter.name:
+            pkg_display = backup_scan.display_name(pkg_tool)
+            messagebox.showerror(
+                "不可在此还原",
+                "该备份包属于「%s」，而当前窗口是「%s」。\n\n"
+                "还原只在本工具自己的备份上进行：跨工具时，两个工具的\n"
+                "「路径改写 / 索引登记 / 结构校验」规则完全不同，强行还原会把数据\n"
+                "写得「看着在、其实读不到」。\n\n"
+                "要取这个包里的会话内容，请走导入通道：\n"
+                "主窗口「导入会话…」→「从备份包导入」页签，在那里选中这个包。\n\n"
+                "若要整库还原它，请先把主窗口的工具切到「%s」，再重新打开备份浏览器。"
+                % (pkg_display, self.adapter.display_name, pkg_display),
+            )
+            return
+
         # 携带源设备信息（相对路径 / 标记）的条目：还原会写回本机对应位置，
         # 属预期行为且对「归回原工作区」有用，提前说一句即可，不做阻拦。
         origin_rows = manifest_origin_info(info.get("manifest") or {})
@@ -3197,7 +3373,6 @@ class QoderBackupApp:
 
         # 读取包内 manifest 记录的源路径，与当前目标目录不一致时二次确认，
         # 防止还原到错误目录覆盖掉别的工具/用户的数据。
-        manifest = info.get("manifest") or {}
         recorded_root = manifest.get("source_root")
         if recorded_root and os.path.realpath(recorded_root) != os.path.realpath(self.root_dir):
             if not messagebox.askyesno(
@@ -3230,38 +3405,6 @@ class QoderBackupApp:
                 "与源机器一致（CodeBuddy 按项目路径派生工作区 ID 索引会话）。"
                 % self.adapter.display_name,
             )
-
-        # 统一识别「压缩包归属工具」，再与当前窗口工具比对：
-        #   1) manifest 带 tool 字段 -> 以它为准；
-        #   2) 否则（无声明文件，或声明文件未记录 tool）一律回退结构指纹判定，
-        #      指纹匹配当前窗口工具才算可还原，不匹配则直接拦截。
-        # 任何模式下，识别出的工具与当前窗口工具不一致都弹窗确认，防止误还原。
-        pkg_tool = manifest.get("tool")
-        if not pkg_tool:
-            matched, missing = self.adapter.match_structure(info.get("entries") or [])
-            if matched:
-                pkg_tool = self.adapter.name
-            else:
-                messagebox.showerror(
-                    "不可还原",
-                    "该压缩包缺少有效的工具声明，且内部结构指纹与 %s 不匹配，\n"
-                    "无法确认是可还原的备份。\n缺失项：%s"
-                    % (
-                        self.adapter.display_name,
-                        "、".join(missing) or "（无）",
-                    ),
-                )
-                return
-
-        if pkg_tool != self.adapter.name:
-            if not messagebox.askyesno(
-                "工具类型不一致，请确认",
-                "该压缩包识别出的工具为「%s」，\n而当前窗口工具为「%s」。\n\n"
-                "两者不一致，继续还原可能写入错误的位置或覆盖其他数据。\n"
-                "确认仍要按当前窗口工具还原吗？"
-                % (pkg_tool, self.adapter.display_name),
-            ):
-                return
 
         root_dir = self.root_dir
         make_rollback = self.rollback_var.get()
@@ -3350,10 +3493,13 @@ def main() -> None:
 class BackupBrowser:
     """独立的备份浏览器窗口：左侧虚拟加载文件列表，右侧异步显示所选备份详情。
 
-    - 列表只读取目录元数据（``list_backup_dir``，**不打开/不解压 zip**），秒开不卡顿。
+    - 列表走共用模块 ``backup_scan``：**首屏同步只扫一层**（≤5 ms）秒开，
+      随后后台逐层（BFS）递归到 3 层，每层回传一批边扫边填。
     - 点击某文件后，后台线程读取包信息（默认不校验完整性），右侧面板填充；
       读取期间显示「读取中…」，避免大文件阻塞界面。
-    - 用文件名前缀区分「备份」与「回滚快照」并提示二者区别。
+    - **收窄的还原语义**：只有本工具自己的 backup/rollback 才可点「还原此备份」；
+      其他工具的包整行灰显、按钮置灰，详情里点名是谁的包并指路到
+      「导入会话…」→「从备份包导入」。
     """
 
     KIND_LABEL = {
@@ -3375,6 +3521,13 @@ class BackupBrowser:
         self._reading = False
         self._pending_path: str | None = None
         self._result: dict | None = None
+        # 扫描状态：_rows 是「未过滤的候选全集」，_refresh_view 按过滤开关渲染。
+        self._rows: list = []
+        self._scan_cache: dict = {}
+        self._scan_cancel: threading.Event | None = None
+        self._scan_queue: "queue.Queue" = queue.Queue()
+        self._scan_done = True
+        self._scan_progress: backup_scan.ScanProgress | None = None
 
         top = tk.Toplevel(app.root)
         # 创建即隐藏：Toplevel 默认可见，双屏/慢渲染下首帧会闪；正常模式末尾再 deiconify。
@@ -3382,8 +3535,9 @@ class BackupBrowser:
         top.title(BROWSER_TITLE_TPL)
         # 窗口宽度收敛：左侧列表按内容自适应(约503px)，右侧详情框请求宽约344px，
         # 二者加边距/sash 约 880；920 使右侧自然贴合内容、不空。
-        top.geometry("920x640")
-        top.minsize(800, 480)
+        # 默认尺寸夹进工作区：矮屏 / 高 DPI 下不让窗口开出屏幕（底部被裁）。
+        _w, _h = _clamp_dialog_size(top, 920, 640)
+        top.minsize(min(800, _w), min(480, _h))
         self.top = top
 
         # 顶部说明：区分备份/快照
@@ -3429,6 +3583,22 @@ class BackupBrowser:
         self.dir_lbl = ttk.Label(bar, text=backup_dir, foreground="#888")
         self.dir_lbl.pack(side=tk.LEFT, padx=8)
 
+        # 过滤开关 + 扫描进度行。
+        # 这里的「可识别」必须比导入侧的「可导入」**宽**：本工具的包恰恰不可导入
+        # （导入侧会把它排除），但它正是本窗口唯一能还原的东西 ⇒ 两个开关若共用
+        # 同一判定，必然有一边是错的。
+        sub = ttk.Frame(top)
+        sub.pack(fill=tk.X, padx=10, pady=(0, 2))
+        self.filter_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            sub,
+            text="只显示可识别的备份（隐藏无关 zip）",
+            variable=self.filter_var,
+            command=self._refresh_view,
+        ).pack(side=tk.LEFT)
+        self.scan_lbl = ttk.Label(sub, text="", foreground="#888")
+        self.scan_lbl.pack(side=tk.LEFT, padx=10)
+
         # 主体：左列表 + 右详情
         self.body = ttk.PanedWindow(top, orient=tk.HORIZONTAL)
         self.body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
@@ -3463,6 +3633,8 @@ class BackupBrowser:
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         xsb.pack(side=tk.BOTTOM, fill=tk.X)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        # 非本工具的包 / 认不出是备份的 zip：整行灰显（仍可见，但不误导可点）
+        self.tree.tag_configure("dim", foreground="#9a9a9a")
         # 注意：不使用双击自动还原，避免误操作；只允许点「还原此备份」按钮
 
         # 右侧详情
@@ -3492,36 +3664,153 @@ class BackupBrowser:
 
     # ----------------------------------------------------------- 列表加载 --
     def _load_list(self) -> None:
-        # 刷新前先快照各文件的完整性校验结果，重建后回填，避免已校验信息被清掉
+        """刷新列表：**首屏同步只扫一层**（实测 ≤5 ms）→ 立刻渲染，绝不白屏；
+        随后后台逐层（BFS）扫描，每层扫完回传一批，边扫边填。
+
+        逐层而非深度优先：备份包几乎总在 2~3 层以内，深挖会先钻到 ``~/.workbuddy/
+        plugins/...`` 深处，浅层的包反而**最后**才出现（实测见方案 §4.3）。
+        """
+        self._cancel_scan()
+        self._rows = []
+        self.tree.delete(*self.tree.get_children())
+        self._scan_done = True
+        self._scan_progress = None
+        # 首屏：同步只扫一层。不读清单（L2 约 10 ms/包，必须在后台）。
+        top = backup_scan.scan(
+            self.backup_dir, max_depth=0, manifest_limit=0, cache=self._scan_cache
+        )
+        self._rows = top.rows
+        self._refresh_view()
+        self._set_scan_status(top.progress())
+        # 后台：逐层扫到默认深度（3 层），每层回传一批
+        self._start_scan()
+
+    def _cancel_scan(self) -> None:
+        """置取消令牌，让上一轮后台扫描在「一个目录」的粒度上尽快退出。"""
+        ev = self._scan_cancel
+        if ev is not None:
+            ev.set()
+        self._scan_cancel = None
+
+    def _start_scan(self) -> None:
+        """后台逐层扫描（不触碰 Tk：结果全部经线程安全队列回主线程消费）。"""
+        ev = threading.Event()
+        self._scan_cancel = ev
+        self._scan_done = False
+        directory = self.backup_dir
+        cache = self._scan_cache
+
+        def worker() -> None:
+            def on_layer(rows, progress) -> None:
+                self._scan_queue.put(("layer", rows, progress))
+
+            res = backup_scan.scan(directory, cancel=ev, on_layer=on_layer, cache=cache)
+            self._scan_queue.put(("done", res, res.progress()))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.top.after(120, self._poll_scan)
+
+    def _poll_scan(self) -> None:
+        """主线程消费后台扫描回传的批次（每层一批）。"""
+        if not self._alive():
+            return
+        while True:
+            try:
+                kind, payload, progress = self._scan_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "layer":
+                self._rows = payload
+                self._refresh_view()
+                self._set_scan_status(progress)
+            else:  # done
+                self._rows = payload.rows
+                self._scan_done = True
+                self._refresh_view()
+                self._set_scan_status(progress)
+        if not self._scan_done:
+            self.top.after(150, self._poll_scan)
+
+    def _alive(self) -> bool:
+        """窗口是否还在（后台扫描回传时窗口可能已被关掉）。"""
+        try:
+            return bool(self.top.winfo_exists())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _set_scan_status(self, progress) -> None:
+        """刷新进度行：已扫描目录 / 层数 / 命中数 / 隐藏数。"""
+        hidden = len(self._rows) - len(self._filtered_rows())
+        text = "已扫描 %s（第 %d 层 / 共 %d 个目录）· 命中 %d 个包" % (
+            self.backup_dir, progress.layers, progress.dirs_scanned, len(self._rows)
+        )
+        if hidden > 0:
+            text += " · 另有 %d 个无关 zip 已隐藏" % hidden
+        if progress.truncated:
+            text += " · 已停止（%s）" % (progress.reason_label or "达到上限")
+        try:
+            self.scan_lbl.config(text=text)
+        except Exception:  # noqa: BLE001 - 窗口已销毁
+            pass
+
+    def _filtered_rows(self) -> list:
+        """按过滤开关筛出应显示的行。
+
+        关闭开关时**全列**（认不出的行灰显）；开启时只留「可识别」的行。
+        """
+        if not self.filter_var.get():
+            return list(self._rows)
+        return [r for r in self._rows if r.identifiable]
+
+    def _refresh_view(self) -> None:
+        """按当前过滤开关重画列表（保留已有校验结果与当前选中行）。"""
         prev_verify = {
             item: self.tree.set(item, "verify")
             for item in self.tree.get_children()
         }
+        prev_sel = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
-        rows = list_backup_dir(self.backup_dir)
+        rows = self._filtered_rows()
         if not rows:
-            self.tree.insert(
-                "", "end", values=("(该目录暂无备份文件)", "", "", "")
-            )
-            self._set_detail("该目录下还没有任何备份文件。\n\n"
-                             "请在主窗口点「导出备份」生成备份，或把已有的备份包 "
-                             "（%s_backup_*.zip）放到：\n%s"
-                             % (self.app.adapter.name, self.backup_dir))
+            if self._rows:
+                self.tree.insert("", "end", values=("(已按过滤条件隐藏全部文件)", "", "", ""))
+                self._set_detail(
+                    "该目录下扫到 %d 个 zip，但没有一个能被识别为备份/快照。\n\n"
+                    "取消勾选「只显示可识别的备份」可以看到全部文件。" % len(self._rows)
+                )
+            else:
+                self.tree.insert("", "end", values=("(该目录暂无备份文件)", "", "", ""))
+                self._set_detail(
+                    "该目录下还没有任何备份文件。\n\n"
+                    "请在主窗口点「导出备份」生成备份，或把已有的备份包 "
+                    "（%s_backup_*.zip）放到：\n%s"
+                    % (self.app.adapter.name, self.backup_dir)
+                )
+            self._autosize_columns()
             return
+        other = self.app.adapter.name
         for r in rows:
-            label, _ = self.KIND_LABEL.get(r["kind"], self.KIND_LABEL["unknown"])
+            label, _ = self.KIND_LABEL.get(r.kind, self.KIND_LABEL["unknown"])
+            # 灰显：不是本工具的包（可识别但要走导入），或压根认不出是备份
+            dim = (not r.identifiable) or (bool(r.tool) and r.tool != other)
             self.tree.insert(
                 "",
                 "end",
-                iid=r["path"],
+                iid=r.path,
+                tags=("dim",) if dim else (),
                 values=(
-                    r["name"],
+                    r.name,
                     label,
-                    human_size(r["size"]),
-                    datetime.fromtimestamp(r["mtime"]).strftime("%Y-%m-%d %H:%M"),
-                    prev_verify.get(r["path"], ""),  # 已有结果回填，新文件留空待校验
+                    human_size(r.size),
+                    datetime.fromtimestamp(r.mtime).strftime("%Y-%m-%d %H:%M"),
+                    prev_verify.get(r.path, ""),  # 已有结果回填，新文件留空待校验
                 ),
             )
+        # 恢复选中行（后台每扫完一层都会重画，否则会把用户的选择清掉）
+        keep = [p for p in prev_sel if self.tree.exists(p)]
+        if keep:
+            self.tree.selection_set(keep[0])
+            self.tree.see(keep[0])
         self._autosize_columns()
 
     def _autosize_columns(self) -> None:
@@ -3616,17 +3905,10 @@ class BackupBrowser:
         path = sel[0]
         if not os.path.isfile(path):  # 占位行
             return
-        kind = classify_zip_name(path)
-        # 备份与回滚快照都可直接还原；无法识别类型（缺清单且文件名不像）则置灰
-        if kind in ("backup", "rollback"):
-            self.restore_btn.configure(state="normal")
-            self._set_restore_tooltip(None)
-        else:
-            self.restore_btn.configure(state="disabled")
-            self._set_restore_tooltip(
-                "该文件无法识别为备份或回滚快照（缺少清单且文件名不匹配），"
-                "为安全起见不可还原。"
-            )
+        # 先置灰：按钮是否可用由 **包内清单 + 所属工具** 决定（见 _render_detail），
+        # 在读完详情之前不放行，避免「跨工具的包被误点还原」。
+        self.restore_btn.configure(state="disabled")
+        self._set_restore_tooltip(None)
         # 立即显示"读取中"，后台读取，避免大文件卡顿
         self._set_detail("读取中…\n%s" % path)
         self._reading = True
@@ -3663,56 +3945,95 @@ class BackupBrowser:
         kind = mf.get("kind") or classify_zip_name(path)
         kind_label, kind_color = self.KIND_LABEL.get(kind, self.KIND_LABEL["unknown"])
 
-        # 依据 manifest 实际类型 + 结构指纹校正还原按钮状态
         struct_match = info.get("structure_match")
         struct_missing = info.get("structure_missing") or []
-        if kind in ("backup", "rollback"):
-            # 有类型声明：缺 manifest kind 时若结构指纹不匹配则置灰
-            if mf.get("kind") is None and struct_match is False:
-                self.restore_btn.configure(state="disabled")
-                self._set_restore_tooltip(
-                    "该压缩包缺少清单文件，且内部结构不是 %s 的数据结构，"
-                    "无法确认是可还原备份。\n缺失项：%s"
-                    % (self.app.adapter.display_name, "、".join(struct_missing) or "（无）")
-                )
-            else:
-                self.restore_btn.configure(state="normal")
-                self._set_restore_tooltip(None)
-        else:
-            # 无类型声明：依赖结构指纹回退识别
-            if struct_match:
-                self.restore_btn.configure(state="normal")
-                self._set_restore_tooltip(None)
-            else:
-                self.restore_btn.configure(state="disabled")
-                miss_txt = "、".join(struct_missing) or "（无）"
-                self._set_restore_tooltip(
-                    "无法识别为 %s 的备份或回滚快照（缺少清单且内部结构不匹配），"
-                    "为安全起见不可还原。\n缺失项：%s"
-                    % (self.app.adapter.display_name, miss_txt)
-                )
-
         has_manifest = info.get("has_manifest")
-        kind_inferred = info.get("kind_inferred")
-        lines = []
-        lines.append("【%s】%s" % (kind_label, os.path.basename(path)))
-        lines.append("【类型说明】%s"
-                     % ("主动导出的完整数据，可直接还原。"
-                        if kind == "backup"
-                        else "还原前自动保存的当前数据，用于还原失败时回退，也可直接还原。"))
-        lines.append("")
-        lines.append("【文件数】%d" % info["file_count"])
-        lines.append("【原始数据大小】%s （=将被备份的源文件大小，非磁盘占用）"
-                     % human_size(info["total_bytes"]))
-        lines.append("【创建时间】%s" % mf.get("created_at", "未知（清单未记录）"))
-        lines.append("【来源目录】%s" % mf.get("source_root", "未知（清单未记录）"))
+
+        # ---------------- 所属工具：清单声明优先，无声明则跨适配器指纹 ----------------
+        # 收窄后「还原」只对本工具的包开放，所以这里必须把「是谁的包」认准，
+        # 而不是像以前那样只在当前工具上试指纹（那样别的工具的包会显得「无法识别」）。
+        mf_tool = (mf.get("tool") or "").strip() if isinstance(mf, dict) else ""
+        if mf_tool:
+            tool_src = "声明文件记录"
+            if mf_tool not in backup_scan.tool_names():
+                tool_src = "声明文件记录了未知工具，按原文显示"
+        else:
+            mf_tool, fp_src = backup_scan.identify_tool(
+                info.get("entries") or [], mf, prefer=self.app.adapter.name
+            )
+            tool_src = ("结构指纹回退识别" if fp_src == "structure"
+                        else "既无声明也无匹配的结构指纹")
+        is_self = bool(mf_tool) and mf_tool == self.app.adapter.name
+        tool_name = backup_scan.display_name(mf_tool) if mf_tool else "未知"
+        if is_self:
+            tool_name = "%s（本工具）" % tool_name
+
+        # ---------------- 还原可行性三态（按钮 + 结论行 + 悬停提示） ----------------
+        # 跨工具的包**无论类型如何**都不可在本窗口还原：整库还原要用**它自己**的
+        # 路径改写 / 索引登记 / 结构校验规则，用当前工具的规则去写会「看着在、其实
+        # 读不到」。它只能走「导入会话 → 从备份包导入」。
+        self_btn_state = "disabled"
+        tip = None
+        if mf_tool and not is_self:
+            breason = "other"
+            tip = ("这是 %s 的备份。本窗口只能还原本工具的备份；要取其中的会话，"
+                   "请用「导入会话…」→「从备份包导入」。" % tool_name)
+        elif is_self:
+            # 清单声明（或指纹回退识别）确认是本工具：可还原。
+            breason = "ok"
+        elif struct_match:
+            breason = "ok_fp"
+        elif kind in ("backup", "rollback"):
+            # 名字/清单说是备份包，但既没声明所属工具、指纹也不匹配本工具：
+            # 不能凭「它自称是备份」就写盘（可能是别的工具的包）。
+            breason = "no_struct"
+            why = ("该压缩包缺少清单文件" if not has_manifest
+                   else "清单未记录所属工具")
+            tip = ("%s，且内部结构不是 %s 的数据结构，无法确认是可还原本工具的备份。"
+                   "\n缺失项：%s"
+                   % (why, self.app.adapter.display_name,
+                      "、".join(struct_missing) or "（无）"))
+        else:
+            breason = "unknown"
+            tip = ("无法识别为 %s 的备份或回滚快照（缺少清单且内部结构不匹配），"
+                   "为安全起见不可还原。\n缺失项：%s"
+                   % (self.app.adapter.display_name,
+                      "、".join(struct_missing) or "（无）"))
+        if breason in ("ok", "ok_fp"):
+            self.restore_btn.configure(state="normal")
+            self._set_restore_tooltip(None)
+        else:
+            self.restore_btn.configure(state=self_btn_state)
+            self._set_restore_tooltip(tip)
+
+        # 类型说明：跨工具 / 无法归属的包不要写「可直接还原」，否则自相矛盾
+        if breason == "other":
+            type_note = "这是 %s 的备份包，本窗口不还原它（见下方【还原】）。" % tool_name
+        elif breason in ("no_struct", "unknown"):
+            type_note = "疑似备份包，但无法确认是本工具的数据（见下方【还原】）。"
+        elif kind == "backup":
+            type_note = "主动导出的完整数据，可直接还原。"
+        else:
+            type_note = "还原前自动保存的当前数据，用于还原失败时回退，也可直接还原。"
+
+        # 每行是 ``(文本, 颜色标签)``；None = 正文色。真上色（此前 title_color 是死参数）
+        seg: list = []
+        seg.append(("【%s】%s" % (kind_label, os.path.basename(path)), "title:" + kind_color))
+        seg.append(("【类型说明】%s" % type_note, "warn" if breason == "other" else None))
+        seg.append(("", None))
+        seg.append(("【文件数】%d" % info["file_count"], None))
+        seg.append(("【原始数据大小】%s （=将被备份的源文件大小，非磁盘占用）"
+                    % human_size(info["total_bytes"]), None))
+        seg.append(("【创建时间】%s" % mf.get("created_at", "未知（清单未记录）"), None))
+        seg.append(("【来源目录】%s" % mf.get("source_root", "未知（清单未记录）"), None))
         items = mf.get("items", [])
         # 模块名均为英文字符：遵循英文惯例，用「逗号+空格」分隔（而非中文顿号），
         # 标点与下一个模块名之间保留一个空格，阅读更自然。
-        lines.append("【包含模块】%s" % (", ".join(items) if items else "未知（清单未记录）"))
+        seg.append(("【包含模块】%s" % (", ".join(items) if items else "未知（清单未记录）"), None))
         # 类型识别：始终分两行展示「文件类型」与「所属 AI 工具类型」，并标注各自识别来源。
         # 不论有无声明文件，两行都出现，避免「一会儿有一会儿没」看的人发蒙。
         # 1) 文件类型(kind) 来源
+        kind_inferred = info.get("kind_inferred")
         if has_manifest and not kind_inferred:
             kind_src = "声明文件记录"
         elif kind_inferred:
@@ -3721,47 +4042,85 @@ class BackupBrowser:
             kind_src = "无声明文件，结构指纹回退识别"
         else:
             kind_src = "无法识别"
-        lines.append("【文件类型】%s（%s）" % (kind_label, kind_src))
-        # 2) 所属 AI 工具类型 来源
-        mf_tool = (mf.get("tool") or "").strip() if isinstance(mf, dict) else ""
-        if mf_tool:
-            tool_src = "声明文件记录"
-            tool_name = self.app.adapter.display_name if mf_tool == self.app.adapter.name else mf_tool
-        elif not has_manifest and struct_match:
-            tool_src = "结构指纹回退识别"
-            tool_name = self.app.adapter.display_name
+        seg.append(("【文件类型】%s（%s）" % (kind_label, kind_src), None))
+        # 2) 所属 AI 工具类型 + 三态高亮（与本工具不同时可导入 / 不可导入）
+        if not mf_tool:
+            seg.append(("【所属工具】未知（%s）" % tool_src, "muted"))
+        elif is_self:
+            seg.append(("【所属工具】%s（%s）" % (tool_name, tool_src), None))
+        elif import_matrix.ALL_SOURCES.get(mf_tool) is not None and self._can_import_here(mf_tool):
+            seg.append(("【所属工具】%s ← 与本工具（%s）不同，但可导入"
+                        % (tool_name, self.app.adapter.display_name), "warn"))
+            seg.append(("【跨工具导入】可导入为 %s 的原生会话（只有会话过去，不含索引/缓存）。"
+                        "入口：主窗口「导入会话…」→「从备份包导入」。"
+                        % self.app.adapter.display_name, "warn"))
         else:
-            tool_src = "既无声明也无匹配的结构指纹"
-            tool_name = "未知"
-        lines.append("【所属工具】%s（%s）" % (tool_name, tool_src))
+            cap = import_matrix.ALL_SOURCES.get(mf_tool)
+            why = "会话库加密，只能整库还原" if (cap and cap.status == import_matrix.BACKUP_ONLY) \
+                else "该来源暂不可导入"
+            seg.append(("【所属工具】%s ← 与本工具（%s）不同，且无法导入（%s）"
+                        % (tool_name, self.app.adapter.display_name, why), "alert"))
+        seg.append(("【还原】%s" % self._restore_conclusion(breason, tool_name), None if breason in ("ok", "ok_fp")
+                    else ("warn" if breason == "other" else "alert")))
+        if breason == "other":
+            seg.append(("　　要取其中的会话，请用「导入会话…」→「从备份包导入」选中这个包；"
+                        "若要整库还原它，请先把主窗口的工具切到「%s」，再重新打开本窗口。"
+                        % tool_name, "warn"))
 
         # 按文件类型归类展示
         by_cat: dict[str, int] = {}
         for ext, size in info["bytes_by_ext"].items():
             by_cat[category_of(ext)] = by_cat.get(category_of(ext), 0) + size
         if by_cat:
-            lines.append("")
-            lines.append("文件类型分布（按源大小）：")
+            seg.append(("", None))
+            seg.append(("文件类型分布（按源大小）：", None))
             for cat in ("text", "db", "struct", "binary", "other"):
                 if cat in by_cat:
-                    lines.append("  · %s：%s"
-                                 % (self.CATEGORY_LABEL.get(cat, cat),
-                                    human_size(by_cat[cat])))
+                    seg.append(("  · %s：%s"
+                                % (self.CATEGORY_LABEL.get(cat, cat),
+                                   human_size(by_cat[cat])), None))
 
         # 携带的源设备信息：让用户在**打开/分享这个包之前**就知道包里有源机器的路径。
         # 旧备份包没有该字段（origin_info_lines 返回空），此处自然不显示，不报错、不推断。
-        lines.extend(origin_info_lines(mf))
+        for line in origin_info_lines(mf):
+            seg.append((line, None))
         # 包内附带的「会话 -> 原始工作区路径」映射（本工具生成、随包携带）。
-        lines.extend(session_workspaces_lines(mf))
+        for line in session_workspaces_lines(mf):
+            seg.append((line, None))
 
         if info["unsafe"]:
-            lines.append("")
-            lines.append("⚠ 检测到 %d 个非法路径，恢复将被阻止" % len(info["unsafe"]))
-        lines.append("")
-        lines.append("提示：点「校验完整性」可逐文件校验（大文件较慢，结果在左侧「完整性」列）；"
-                     "点「还原此备份」可恢复。")
+            seg.append(("", None))
+            seg.append(("⚠ 检测到 %d 个非法路径，恢复将被阻止" % len(info["unsafe"]), "alert"))
+        seg.append(("", None))
+        if breason in ("ok", "ok_fp"):
+            seg.append(("提示：点「校验完整性」可逐文件校验（大文件较慢，结果在左侧「完整性」列）；"
+                        "点「还原此备份」可恢复。", None))
+        else:
+            seg.append(("提示：点「校验完整性」可逐文件校验（大文件较慢，结果在左侧「完整性」列）；"
+                        "此包不能在本窗口还原，见上方【还原】。", None))
 
-        self._set_detail("\n".join(lines), title_color=kind_color)
+        self._write_detail(seg)
+
+    def _can_import_here(self, src_tool: str) -> bool:
+        """该来源工具的包能否导入为**当前窗口工具**的原生会话。"""
+        if src_tool == self.app.adapter.name:
+            return False
+        cap = import_matrix.matrix_for(self.app.adapter.name)
+        if cap is None:
+            return False
+        return any(s.tool == src_tool and s.status == import_matrix.SUPPORTED
+                   for s in cap.sources)
+
+    def _restore_conclusion(self, breason: str, tool_name: str) -> str:
+        """详情里【还原】那一行的结论文案（与按钮三态一一对应）。"""
+        if breason in ("ok", "ok_fp"):
+            return "可在本窗口直接还原。"
+        if breason == "other":
+            return "不可在此还原 ← 这是 %s 的备份" % tool_name
+        if breason == "no_struct":
+            return "不可还原 ← 未声明所属工具，且内部结构不匹配本工具"
+        return "不可还原 ← 无法识别为备份或回滚快照"
+
 
     # ----------------------------------------------------------- 工具按钮 --
     def verify_one(self, path: str) -> None:
@@ -3808,9 +4167,12 @@ class BackupBrowser:
     def _apply_verify_result(self, path: str, mark: str, msg: str) -> None:
         if self.tree.exists(path):
             self.tree.set(path, "verify", mark)
-        # 仅当该文件仍是当前选中项时，把结论追加到右侧详情，避免写错文件
+        # 仅当该文件仍是当前选中项时，把结论追加到右侧详情，避免写错文件。
+        # 直接追加而非「取全文重设」：重设会丢掉详情里的着色标签。
         if self.tree.selection() and self.tree.selection()[0] == path:
-            self._set_detail(self.detail.get("1.0", "end").rstrip() + "\n\n" + msg)
+            self.detail.configure(state="normal")
+            self.detail.insert(tk.END, "\n\n" + msg, "body")
+            self.detail.configure(state="disabled")
 
     def _on_restore(self) -> None:
         sel = self.tree.selection()
@@ -3873,14 +4235,55 @@ class BackupBrowser:
         """更新「还原此备份」按钮的悬停提示；传 None 则清空（按钮可用时不显示）。"""
         self._restore_tip.set_text(text or "")
 
+    #: 详情 Text 的着色标签 -> 前景色（正文 / 可还原 / 跨工具 / 警示 / 次要）
+    DETAIL_TAGS: dict = {
+        "body": "#333333",
+        "ok": "#1a7f37",
+        "warn": "#b54708",
+        "alert": "#a05a00",
+        "muted": "#57606a",
+    }
+
     def _set_detail(self, text: str, title_color: str | None = None) -> None:
-        self.detail.configure(state="normal")
-        self.detail.delete("1.0", tk.END)
-        if not text:
-            self.detail.insert("1.0", "（未选择备份文件）\n")
-        else:
-            self.detail.insert("1.0", text)
-        self.detail.configure(state="disabled")
+        """把纯文本写入详情；``title_color`` 只给**首行**着色（正文用 body 色）。
+
+        ``title_color`` 此前是个收了却从未使用的死参数，本次真正生效。
+        """
+        seg = []
+        if text:
+            for i, line in enumerate(text.split("\n")):
+                seg.append((line, "title:" + title_color if (i == 0 and title_color) else None))
+        self._write_detail(seg)
+
+    def _write_detail(self, segments) -> None:
+        """写入 ``[(文本, 颜色标签), ...]``；标签见 :attr:`DETAIL_TAGS`。
+
+        以 ``title:#rrggbb`` 形式可**临时**指定颜色（每条详情首行按包类型着色，
+        不新增全局标签）。
+        """
+        detail = self.detail
+        detail.configure(state="normal")
+        detail.delete("1.0", tk.END)
+        for name, color in self.DETAIL_TAGS.items():
+            detail.tag_configure(name, foreground=color)
+        if not segments:
+            detail.insert("1.0", "（未选择备份文件）\n", "body")
+            detail.configure(state="disabled")
+            return
+        first = True
+        for text, tag in segments:
+            if not first:
+                detail.insert(tk.END, "\n", "body")
+            first = False
+            if not text:
+                continue
+            if tag and tag.startswith("title:"):
+                color = tag.split(":", 1)[1]
+                detail.tag_configure("title", foreground=color)
+                detail.insert(tk.END, text, "title")
+            else:
+                detail.insert(tk.END, text, tag or "body")
+        detail.configure(state="disabled")
 
 
 def missing_workspaces_text(plans: list, limit: int = 8) -> str:
@@ -3948,12 +4351,46 @@ class MigrateDialog:
         #: 这里固定一次，保证同一批导入落到同一处（而不是每导入一条就新建一个目录）。
         self._default_ws = workspace_plan.default_workspace(
             self.target_tool, datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
+        #: 目标工具能否接收导入（qoder / trae-* 是 BACKUP_ONLY ⇒ 页签 B 整体置灰）。
+        self._can_import = bool(self.sources)
+
+        # ---- 页签 B（从备份包导入）的状态 ----
+        #: 当前「包解包成来源根」的临时句柄（换包 / 关窗时清理）。
+        self._archive = None
+        self._arc_path = ""
+        #: 正在后台解包的包路径（尚未完成）。**在途去重**的关键：`_arc_path` 只在
+        #: 解包完成后才写入，若只靠它判重，扫描每回一层就重建包列表、恢复选中并再
+        #: 触发一次选择事件，于是同一个包被反复重新解包——既刷出大量后台线程，又让
+        #: 每次新请求都 `_arc_token += 1` 把上一个结果判为过期丢弃，最终会话列表
+        #: 永远填不上、界面被线程拖死（2026-10-04 用户实测反馈）。
+        self._arc_pending = ""
+        self._arc_token = 0
+        #: 包列表：未过滤全集 + 后台扫描状态（与备份浏览器同构）。
+        self._pkg_rows: list = []
+        self._pkg_cache: dict = {}
+        self._pkg_cancel: "threading.Event | None" = None
+        self._pkg_queue: "queue.Queue" = queue.Queue()
+        self._pkg_done = True
+        self._pkg_progress = None
+        #: 变化预告里 warn 级条数（有则需要最终确认时默认按钮改为「否」）。
+        self._warn_count = 0
 
         self.win = tk.Toplevel(app.root)
         self.win.title("导入会话 → %s" % self.target_display)
-        self.win.geometry("780x660")
+        # 默认尺寸夹进工作区：矮屏 / 高 DPI 下不让窗口开出屏幕（底部按钮被裁）。
+        _clamp_dialog_size(self.win, 840, 780)
         self.win.transient(app.root)
+        # 关窗必须清理临时解包目录（方案 §5.5：不复活临时目录）。
+        self.win.protocol("WM_DELETE_WINDOW", self._on_close)
+        # 内容超出窗口高度时竖向滚动；底部操作行固定在 row 1，永远可见、不参与滚动。
+        self.win.rowconfigure(0, weight=1, minsize=0)
+        self.win.columnconfigure(0, weight=1)
+        self._scroll = _ScrollBody(self.win, row=0, column=0)
+        self.body = self._scroll.frame
+        for _seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.win.bind(_seq, self._scroll.wheel)
         self._build()
+        self._scroll.sync()
         if self.cur_source is not None:
             self._on_source_change()
 
@@ -3961,38 +4398,23 @@ class MigrateDialog:
     def _build(self) -> None:
         pad = {"padx": 10, "pady": 6}
 
-        src = ttk.LabelFrame(self.win, text="来源软件（明文可读，可导入到「%s」）" % self.target_display)
-        src.pack(fill=tk.X, **pad)
-
-        row = ttk.Frame(src)
-        row.pack(fill=tk.X, padx=8, pady=(8, 4))
-        ttk.Label(row, text="来源软件：").pack(side=tk.LEFT)
-        self.src_var = tk.StringVar(value=self.cur_source.display if self.cur_source else "")
-        self.src_combo = ttk.Combobox(
-            row, textvariable=self.src_var, width=22, state="readonly",
-            values=[s.display for s in self.sources],
-        )
-        self.src_combo.pack(side=tk.LEFT, padx=(4, 0))
-        self.src_combo.bind("<<ComboboxSelected>>", lambda *_: self._on_source_change())
-        self.src_note = ttk.Label(row, text="", foreground="#666")
-        self.src_note.pack(side=tk.LEFT, padx=(8, 0))
-
-        row2 = ttk.Frame(src)
-        row2.pack(fill=tk.X, padx=8, pady=(0, 4))
-        ttk.Label(row2, text="来源目录：").pack(side=tk.LEFT)
-        self.src_root_var = tk.StringVar()
-        ttk.Entry(row2, textvariable=self.src_root_var).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0)
-        )
-        ttk.Button(row2, text="浏览…", command=self._browse_source, width=8).pack(
-            side=tk.LEFT, padx=(6, 0)
-        )
-        ttk.Button(row2, text="扫描会话", command=self._scan, width=10).pack(
-            side=tk.LEFT, padx=(6, 0)
-        )
+        # 页签只换「来源」：下半部分（会话列表 / 落点 / 变化预告 / 操作）两个页签**共用**，
+        # 一行分支都不加（方案 §3.1）。页签 B 只把「选中的包」变成 (来源工具, 临时来源根)。
+        self.notebook = ttk.Notebook(self.body)
+        self.notebook.pack(fill=tk.X, padx=10, pady=(8, 2))
+        self.tab_dir = ttk.Frame(self.notebook)
+        self.tab_pkg = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_dir, text="从数据目录导入")
+        self.notebook.add(self.tab_pkg, text="从备份包导入")
+        self._build_tab_dir(self.tab_dir)
+        self._build_tab_pkg(self.tab_pkg)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
+        if not self._can_import:
+            # 目标工具会话库为产品侧加密：页签 B 整体置灰并给一行原因。
+            self.notebook.tab(1, state="disabled")
 
         # 会话列表（支持多选：Ctrl / Shift）
-        lst = ttk.LabelFrame(self.win, text="可导入会话（Ctrl / Shift 可多选，一次导入多条）")
+        lst = ttk.LabelFrame(self.body, text="可导入会话（Ctrl / Shift 可多选，一次导入多条）")
         lst.pack(fill=tk.BOTH, expand=True, **pad)
         listwrap = ttk.Frame(lst)
         listwrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -4004,7 +4426,7 @@ class MigrateDialog:
         self.listbox.bind("<<ListboxSelect>>", lambda *_: self._on_pick())
 
         # 落点设置
-        dst = ttk.LabelFrame(self.win, text="导入落点（%s 原生位置）" % self.target_display)
+        dst = ttk.LabelFrame(self.body, text="导入落点（%s 原生位置）" % self.target_display)
         dst.pack(fill=tk.X, **pad)
 
         self.tgt_root_var = tk.StringVar(value=session_migration.default_target_root(self.target_tool))
@@ -4062,18 +4484,133 @@ class MigrateDialog:
         self.hint = ttk.Label(dst, text="", foreground="#a05a00", wraplength=720, justify=tk.LEFT)
         self.hint.pack(fill=tk.X, padx=8, pady=(4, 4))
 
-        # 操作
+        # 变化预告（常驻，随选中实时刷新；两个页签共用）。把「导入后会变成什么样」变成
+        # 用户可见的数据，而不是导入完才发现「工具调用没了」。文案见 import_matrix。
+        notice = ttk.LabelFrame(self.body, text="本次导入的变化预告")
+        notice.pack(fill=tk.X, **pad)
+        self.notice_text = tk.Text(notice, height=7, wrap=tk.WORD, state="disabled",
+                                   padx=8, pady=6)
+        self.notice_text.pack(fill=tk.X, padx=8, pady=8)
+        # 提示行标题用加粗，正文 info 用 #555、warn 用 #b54708（与备份浏览器配色一致）。
+        self.notice_text.tag_configure("head", foreground="#333333",
+                                       font=("", 9, "bold"))
+        self.notice_text.tag_configure("info", foreground="#555555")
+        self.notice_text.tag_configure("warn", foreground="#b54708")
+
+        # 操作（固定在窗口 row 1：不随内容滚动，任何窗口高度下都可见）
         act = ttk.Frame(self.win)
-        act.pack(fill=tk.X, **pad)
+        act.grid(row=1, column=0, sticky="ew", **pad)
         self.status_lbl = ttk.Label(act, text="", foreground="#0a6")
         self.status_lbl.pack(side=tk.LEFT)
-        ttk.Button(act, text="关闭", command=self.win.destroy, width=10).pack(side=tk.RIGHT)
+        ttk.Button(act, text="关闭", command=self._on_close, width=10).pack(side=tk.RIGHT)
         self.import_btn = ttk.Button(
             act, text="导入选中会话", command=self._do_import, width=14
         )
         self.import_btn.pack(side=tk.RIGHT, padx=(0, 8))
 
         self._sync_rows()
+        self._refresh_notices()
+
+    # ---------------------------------------------------- 页签 A：数据目录 --
+    def _build_tab_dir(self, parent) -> None:
+        src = ttk.LabelFrame(parent, text="来源软件（明文可读，可导入到「%s」）" % self.target_display)
+        src.pack(fill=tk.X, padx=8, pady=8)
+
+        row = ttk.Frame(src)
+        row.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Label(row, text="来源软件：").pack(side=tk.LEFT)
+        self.src_var = tk.StringVar(value=self.cur_source.display if self.cur_source else "")
+        self.src_combo = ttk.Combobox(
+            row, textvariable=self.src_var, width=22, state="readonly",
+            values=[s.display for s in self.sources],
+        )
+        self.src_combo.pack(side=tk.LEFT, padx=(4, 0))
+        self.src_combo.bind("<<ComboboxSelected>>", lambda *_: self._on_source_change())
+        self.src_note = ttk.Label(row, text="", foreground="#666")
+        self.src_note.pack(side=tk.LEFT, padx=(8, 0))
+
+        row2 = ttk.Frame(src)
+        row2.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Label(row2, text="来源目录：").pack(side=tk.LEFT)
+        self.src_root_var = tk.StringVar()
+        ttk.Entry(row2, textvariable=self.src_root_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0)
+        )
+        ttk.Button(row2, text="浏览…", command=self._browse_source, width=8).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+        ttk.Button(row2, text="扫描会话", command=self._scan, width=10).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+
+    # ---------------------------------------------------- 页签 B：备份包 --
+    def _build_tab_pkg(self, parent) -> None:
+        box = ttk.LabelFrame(
+            parent, text="备份包（递归子目录；备份与回滚快照都可作为导入来源）"
+        )
+        box.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        if not self._can_import:
+            ttk.Label(
+                box, foreground="#a05a00", wraplength=740, justify=tk.LEFT,
+                text="本工具（%s）的会话库为产品侧加密，只支持整库备份 / 还原，"
+                     "不支持接收外部会话导入。请把包带回其来源工具，或先在主窗口"
+                     "把工具切到该来源工具后再导入。" % self.target_display,
+            ).pack(anchor="w", padx=8, pady=10)
+            return
+
+        row = ttk.Frame(box)
+        row.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Label(row, text="备份包目录：").pack(side=tk.LEFT)
+        self.pkg_dir_var = tk.StringVar(value=self._default_pkg_dir())
+        ttk.Entry(row, textvariable=self.pkg_dir_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0)
+        )
+        ttk.Button(row, text="切换目录", command=self._browse_pkg_dir, width=10).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+        ttk.Button(row, text="刷新", command=self._load_packages, width=8).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+
+        cols = ("name", "kind", "size", "mtime")
+        treewrap = ttk.Frame(box)
+        treewrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 2))
+        self.pkg_tree = ttk.Treeview(
+            treewrap, columns=cols, show="headings", selectmode="browse", height=6
+        )
+        self.pkg_tree.heading("name", text="文件名")
+        self.pkg_tree.heading("kind", text="类型")
+        self.pkg_tree.heading("size", text="大小")
+        self.pkg_tree.heading("mtime", text="修改时间")
+        self.pkg_tree.column("name", width=380)
+        self.pkg_tree.column("kind", width=70, anchor="center")
+        self.pkg_tree.column("size", width=90, anchor="e")
+        self.pkg_tree.column("mtime", width=140)
+        psb = ttk.Scrollbar(treewrap, orient="vertical", command=self.pkg_tree.yview)
+        self.pkg_tree.configure(yscrollcommand=psb.set)
+        self.pkg_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        psb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.pkg_tree.bind("<<TreeviewSelect>>", lambda *_: self._on_pkg_pick())
+        # 不可导入的包（本工具自己的包 / 加密工具 / 认不出的 zip）整行灰显。
+        self.pkg_tree.tag_configure("dim", foreground="#9a9a9a")
+
+        sub = ttk.Frame(box)
+        sub.pack(fill=tk.X, padx=8, pady=(0, 2))
+        self.pkg_filter_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            sub, text="只显示可导入的包", variable=self.pkg_filter_var,
+            command=self._refresh_pkg_view,
+        ).pack(side=tk.LEFT)
+        self.pkg_lbl = ttk.Label(sub, text="", foreground="#888")
+        self.pkg_lbl.pack(side=tk.LEFT, padx=10)
+
+        # 来源软件**从包里认出来**（不是下拉）：声明 > 文件名 > 结构指纹。
+        self.pkg_src_lbl = ttk.Label(box, text="来源软件：（尚未选择备份包）",
+                                     foreground="#555", wraplength=740, justify=tk.LEFT)
+        self.pkg_src_lbl.pack(fill=tk.X, padx=8, pady=(0, 2))
+        self.pkg_detail_lbl = ttk.Label(box, text="", foreground="#555",
+                                        wraplength=740, justify=tk.LEFT)
+        self.pkg_detail_lbl.pack(fill=tk.X, padx=8, pady=(0, 6))
 
     def _sync_rows(self) -> None:
         """按目标工具类型设置「工作区」栏的命名与提示，并重置手动输入行。"""
@@ -4271,6 +4808,7 @@ class MigrateDialog:
         self.src_note.configure(text=src.note)
         self.src_root_var.set(session_migration.default_source_root(src.tool))
         self._scan()
+        self._refresh_notices()
 
     def _browse_source(self) -> None:
         d = filedialog.askdirectory(title="选择来源数据目录")
@@ -4302,6 +4840,372 @@ class MigrateDialog:
         """选中会话变化：只需刷新「目标工作区」预览（工作区由规则自动判定）。"""
         self._refresh_preview()
 
+    # --------------------------------------------- 页签 B：备份包 -> 来源根 --
+    def _on_tab_change(self, _ev=None) -> None:
+        """切页签只换「来源」：回到哪个页签就重算该页签的来源（会话列表共用同一份）。
+
+        页签 B **绝不改动页签 A 的下拉**（方案 §6.2：不静默改判、不自动切下拉）。
+        """
+        try:
+            idx = self.notebook.index(self.notebook.select())
+        except tk.TclError:  # pragma: no cover - 窗口已销毁
+            return
+        if idx == 0:
+            src = self._by_display.get(self.src_var.get())
+            if src is not None:
+                self.cur_source = src
+                self._scan()
+                self._refresh_notices()
+            return
+        if not self._can_import:
+            return
+        if not self._pkg_rows:
+            self._load_packages()
+        if self.pkg_tree.selection():
+            self._on_pkg_pick()
+
+    # ---- 目录记忆（上次使用的备份包目录） ----
+    def _pkg_memory_path(self) -> str:
+        return os.path.join(_cache_dir(), "import_sources.json")
+
+    def _default_pkg_dir(self) -> str:
+        """页签 B 的初始目录：上次用过的（仍在）> 本工具默认备份目录。"""
+        try:
+            with open(self._pkg_memory_path(), "r", encoding="utf-8") as fh:
+                saved = (json.load(fh) or {}).get("backup_dir") or ""
+        except (OSError, ValueError):
+            saved = ""
+        if saved and os.path.isdir(saved):
+            return saved
+        try:
+            return self.app._tool_dir("backup")
+        except Exception:  # noqa: BLE001 - 取不到就用主目录
+            return os.path.expanduser("~")
+
+    def _remember_pkg_dir(self, directory: str) -> None:
+        try:
+            path = self._pkg_memory_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"backup_dir": directory}, fh, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def _browse_pkg_dir(self) -> None:
+        cur = self.pkg_dir_var.get()
+        d = filedialog.askdirectory(
+            title="选择备份包所在目录", initialdir=cur if os.path.isdir(cur) else None
+        )
+        if not d:
+            return
+        self.pkg_dir_var.set(d)
+        self._remember_pkg_dir(d)
+        self._load_packages()
+
+    # ---- 列表：与备份浏览器共用 backup_scan（递归、上限、剪枝、取消全一致） ----
+    def _load_packages(self) -> None:
+        """首屏同步只扫一层 → 立刻渲染；随后后台逐层扫到默认深度。"""
+        if not self._can_import:
+            return
+        self._cancel_pkg_scan()
+        self._pkg_rows = []
+        self.pkg_tree.delete(*self.pkg_tree.get_children())
+        self._pkg_done = True
+        self._pkg_progress = None
+        directory = self.pkg_dir_var.get()
+        top = backup_scan.scan(directory, max_depth=0, manifest_limit=0,
+                              cache=self._pkg_cache)
+        self._pkg_rows = top.rows
+        self._refresh_pkg_view()
+        self._set_pkg_status(top.progress())
+        ev = threading.Event()
+        self._pkg_cancel = ev
+        self._pkg_done = False
+
+        def worker() -> None:
+            res = backup_scan.scan(
+                directory, cancel=ev, cache=self._pkg_cache,
+                on_layer=lambda rows, prog: self._pkg_queue.put(("layer", rows, prog)),
+            )
+            self._pkg_queue.put(("done", res, res.progress()))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.win.after(120, self._poll_pkg_scan)
+
+    def _cancel_pkg_scan(self) -> None:
+        ev = self._pkg_cancel
+        if ev is not None:
+            ev.set()
+        self._pkg_cancel = None
+
+    def _poll_pkg_scan(self) -> None:
+        if not self._alive():
+            return
+        while True:
+            try:
+                kind, payload, progress = self._pkg_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "layer":
+                self._pkg_rows = payload
+                self._refresh_pkg_view()
+                self._set_pkg_status(progress)
+            else:
+                self._pkg_rows = payload.rows
+                self._pkg_done = True
+                self._refresh_pkg_view()
+                self._set_pkg_status(progress)
+        if not self._pkg_done:
+            self.win.after(150, self._poll_pkg_scan)
+
+    def _alive(self) -> bool:
+        try:
+            return bool(self.win.winfo_exists())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _pkg_filtered_rows(self) -> list:
+        """按「只显示可导入的包」过滤。
+
+        与备份浏览器的开关**判定不同**（方案 §4.2）：这里排除本工具自己的包
+        （该走还原）与加密工具的包（永远不可导入）。
+        """
+        if not self.pkg_filter_var.get():
+            return list(self._pkg_rows)
+        return [r for r in self._pkg_rows
+                if backup_scan.is_importable_for(r, self.target_tool)]
+
+    def _refresh_pkg_view(self) -> None:
+        if not self._can_import:
+            return
+        prev_sel = self.pkg_tree.selection()
+        self.pkg_tree.delete(*self.pkg_tree.get_children())
+        rows = self._pkg_filtered_rows()
+        for r in rows:
+            label, _color = BackupBrowser.KIND_LABEL.get(
+                r.kind, BackupBrowser.KIND_LABEL["unknown"])
+            dim = not backup_scan.is_importable_for(r, self.target_tool)
+            self.pkg_tree.insert(
+                "", "end", iid=r.path, tags=("dim",) if dim else (),
+                values=(r.name, label, human_size(r.size),
+                        datetime.fromtimestamp(r.mtime).strftime("%Y-%m-%d %H:%M")),
+            )
+        keep = [p for p in prev_sel if self.pkg_tree.exists(p)]
+        if keep:
+            self.pkg_tree.selection_set(keep[0])
+
+    def _set_pkg_status(self, progress) -> None:
+        if not self._can_import:
+            return
+        hidden = len(self._pkg_rows) - len(self._pkg_filtered_rows())
+        text = "已扫描 %s（第 %d 层 / 共 %d 个目录）· 命中 %d 个包" % (
+            self.pkg_dir_var.get(), progress.layers, progress.dirs_scanned,
+            len(self._pkg_rows),
+        )
+        if hidden > 0:
+            text += " · 另有 %d 个不可导入的包已隐藏" % hidden
+        if progress.truncated:
+            text += " · 已停止（%s）" % (progress.reason_label or "达到上限")
+        try:
+            self.pkg_lbl.config(text=text)
+        except Exception:  # noqa: BLE001 - 窗口已销毁
+            pass
+
+    # ---- 选中包 -> 认工具 -> 解包 -> 扫描会话 ----
+    def _on_pkg_pick(self) -> None:
+        """选中备份包：认出来源工具，后台按需解包并交给既有扫描函数。"""
+        if not self._can_import:
+            return
+        sel = self.pkg_tree.selection()
+        if not sel:
+            return
+        path = sel[0]
+        # 去重：同一个包正在解包（`_arc_pending`）或已解好（`_arc_path`）就直接返回。
+        # 否则每次列表重建 / 切页签都会重开一个后台解包线程，并把上一个结果判为过期。
+        if path == self._arc_pending or path == self._arc_path:
+            return
+        self._arc_pending = path
+        self._arc_token += 1
+        token = self._arc_token
+        self.import_btn.configure(state="disabled")
+        self.items = []
+        self.listbox.delete(0, tk.END)
+        self.pkg_src_lbl.configure(text="来源软件：正在识别…", foreground="#555")
+        self.pkg_detail_lbl.configure(text="")
+        self.status_lbl.configure(text="正在识别并解包该备份包…", foreground="#a05a00")
+
+        def worker() -> None:
+            try:
+                info = inspect_backup(path)
+                mf = info.get("manifest") or {}
+                tool, src = backup_scan.identify_tool(
+                    info.get("entries") or [], mf, prefer=self.target_tool
+                )
+                if not tool:
+                    self.win.after(0, self._apply_archive_meta, token, path, info,
+                                   "", "", None, "无法识别该包属于哪个工具。")
+                    return
+                row = next((r for r in self._pkg_rows if r.path == path), None)
+                importable = (row is not None
+                              and backup_scan.is_importable_for(row, self.target_tool))
+                if not importable:
+                    # 行内 L1/L2 可能没认出（L3 指纹才认出），这里以识别结果为准再判一次
+                    importable = (tool != self.target_tool
+                                  and import_matrix.ALL_SOURCES.get(tool) is not None
+                                  and any(s.tool == tool
+                                          for s in import_matrix.importable_sources_for(
+                                              self.target_tool)))
+                if not importable:
+                    self.win.after(0, self._apply_archive_meta, token, path, info,
+                                   tool, src, None, "")
+                    return
+                arc = archive_source.extract_session_root(path, tool)
+                try:
+                    items = session_migration.list_source_sessions(tool, arc.root)
+                except Exception:
+                    arc.cleanup()
+                    raise
+                self.win.after(0, self._apply_archive, token, path, info, tool, src,
+                               arc, items)
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc) if isinstance(
+                    exc, archive_source.ArchiveSourceError) else "%s: %s" % (
+                        type(exc).__name__, exc)
+                self.win.after(0, self._apply_archive_meta, token, path, None,
+                               "", "", None, msg)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_archive_meta(self, token: int, path: str, info, tool: str,
+                            src: str, arc, error: str) -> None:
+        """主线程：只更新「来源软件 + 包详情 + 提示」，不产生会话列表。"""
+        if token != self._arc_token or not self._alive():
+            if arc is not None:
+                arc.cleanup()
+            return
+        self._arc_pending = ""
+        self._arc_path = path
+        self._show_pkg_meta(info, tool, src)
+        if error:
+            self.pkg_src_lbl.configure(
+                text="来源软件：无法确定（%s）" % error, foreground="#a05a00")
+            self.status_lbl.configure(text=error, foreground="#a05a00")
+            self._refresh_preview()
+            self._refresh_notices()
+            return
+        if self.items == []:
+            self.status_lbl.configure(
+                text="该包不能导入为「%s」的会话（本工具的包请走「还原备份/快照」）。"
+                     % self.target_display,
+                foreground="#a05a00")
+        self._refresh_preview()
+        self._refresh_notices()
+
+    def _apply_archive(self, token: int, path: str, info, tool: str, src: str,
+                       arc, items: list) -> None:
+        """主线程：接住解包结果（过期结果直接丢弃并清理）。"""
+        if token != self._arc_token or not self._alive():
+            arc.cleanup()
+            return
+        old = self._archive
+        self._archive = arc
+        self._arc_pending = ""
+        self._arc_path = path
+        if old is not None:
+            old.cleanup()
+        self.cur_source = import_matrix.ALL_SOURCES.get(tool) or self.cur_source
+        self._show_pkg_meta(info, tool, src)
+        self.items = items
+        self.listbox.delete(0, tk.END)
+        for it in items:
+            title = it["title"] or "(无标题)"
+            self.listbox.insert(tk.END, "%s    —  %s" % (title[:60], it["detail"]))
+        if items:
+            self.listbox.selection_set(0)
+        self.import_btn.configure(state="normal")
+        self.status_lbl.configure(
+            text="已从备份包解出 %d 个可导入会话（按需解出 %d/%d 个条目）"
+                 % (len(items), arc.extracted, arc.total),
+            foreground="#0a6" if items else "#a05a00",
+        )
+        self._refresh_preview()
+        self._refresh_notices()
+
+    def _show_pkg_meta(self, info, tool: str, src: str) -> None:
+        """只读展示「来源软件（依据）+ 包详情」。"""
+        if info is None:
+            return
+        src_label = {"manifest": "包内声明", "filename": "文件名",
+                     "dirname": "父目录名", "structure": "结构指纹"}.get(src, "包内声明")
+        if tool:
+            self.pkg_src_lbl.configure(
+                text="来源软件：%s（依据：%s）" % (backup_scan.display_name(tool), src_label),
+                foreground="#555")
+        mf = info.get("manifest") or {}
+        parts = []
+        if mf.get("kind"):
+            parts.append("类型：%s" % BackupBrowser.KIND_LABEL.get(
+                mf["kind"], (mf["kind"], ""))[0])
+        parts.append("文件数：%d" % info.get("file_count", 0))
+        parts.append("原始大小：%s" % human_size(info.get("total_bytes", 0)))
+        if mf.get("created_at"):
+            parts.append("导出时间：%s" % mf["created_at"])
+        if mf.get("source_root"):
+            parts.append("来源机器：%s" % mf["source_root"])
+        if mf.get("items"):
+            parts.append("包含模块：%s" % ", ".join(mf["items"]))
+        self.pkg_detail_lbl.configure(text="　·　".join(parts))
+
+    # ---- 变化预告 ----
+    def _refresh_notices(self) -> None:
+        """按「当前来源 + 目标工具」重算变化预告（常驻区域，随选中实时刷新）。"""
+        src_tool = self.cur_source.tool if self.cur_source else ""
+        data = import_matrix.notices_for(src_tool, self.target_tool)
+        self._warn_count = len(data["warn"])
+        src_name = (backup_scan.display_name(src_tool) if src_tool
+                    else "（未选择来源）")
+        lines: list = []
+        if not src_tool:
+            lines.append(("请先选择来源（页签一选软件、页签二选备份包）。",
+                          "info"))
+        else:
+            lines.append(("本次导入的变化预告（%s → %s）"
+                          % (src_name, self.target_display), "head"))
+            lines.append(("── 必然变化 ──", "head"))
+            lines.extend(("· " + t, "info") for t in data["must"])
+            lines.append(("── 需要注意 ──", "head"))
+            if data["warn"]:
+                lines.extend(("⚠ " + t, "warn") for t in data["warn"])
+            else:
+                lines.append(("（无）", "info"))
+            lines.append(("── 不影响的 ──", "head"))
+            lines.extend(("· " + t, "info") for t in data["keep"])
+        self._render_notices(lines)
+
+    def _render_notices(self, lines: list) -> None:
+        widget = self.notice_text
+        widget.configure(state="normal")
+        widget.delete("1.0", tk.END)
+        first = True
+        for text, tag in lines:
+            if not first:
+                widget.insert(tk.END, "\n", tag)
+            first = False
+            widget.insert(tk.END, text, tag)
+        widget.configure(state="disabled")
+
+    def _on_close(self) -> None:
+        """关对话框：取消扫描 + 清理临时解包目录（方案 §5.5：不复活临时目录）。"""
+        self._cancel_pkg_scan()
+        self._arc_token += 1
+        if self._archive is not None:
+            self._archive.cleanup()
+            self._archive = None
+        try:
+            self.win.destroy()
+        except tk.TclError:  # pragma: no cover
+            pass
+
     def _selected_items(self) -> list:
         """当前选中的全部会话条目（支持多选）。"""
         return [self.items[i] for i in self.listbox.curselection() if 0 <= i < len(self.items)]
@@ -4311,6 +5215,17 @@ class MigrateDialog:
         return items[0] if items else None
 
     # ------------------------------------------------------------ 导入 --
+    def _warn_summary(self) -> str:
+        """最终确认框里的一行变化预告摘要（复用同一个弹窗，不新增点击）。"""
+        if not self._warn_count:
+            return ""
+        return ("\n\n本次导入有 %d 条需要注意的变化，已在界面的「变化预告」里列出。"
+                % self._warn_count)
+
+    def _confirm_default(self) -> str:
+        """有 warn 级变化时，确认框默认按钮改为「否」（方案 §6.5.3）。"""
+        return messagebox.NO if self._warn_count else messagebox.YES
+
     def _confirm_manual_override(self, items: list, plan) -> bool:
         """手动指定工作区时的确认：明确指出会覆盖「自带工作区」的会话。"""
         owned = [it for it in items
@@ -4322,8 +5237,8 @@ class MigrateDialog:
             "已勾选「手动指定工作区」。\n\n"
             "本次导入的 %d 条会话将全部落到：\n%s\n\n"
             "其中 %d 条本身就自带工作区，它们原本的工作区归属会被覆盖。\n\n是否继续？"
-            % (len(items), plan.value, len(owned)),
-            parent=self.win,
+            % (len(items), plan.value, len(owned)) + self._warn_summary(),
+            parent=self.win, default=self._confirm_default(),
         ))
 
     def _confirm_unresolved_workspaces(self, items: list, plans: list) -> bool:
