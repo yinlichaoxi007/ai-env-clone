@@ -220,13 +220,16 @@ def extract_session_root(zip_path: str, tool: str) -> ArchiveSource:
 
         cleanup_stale()
         tmp = tempfile.mkdtemp(prefix=TEMP_PREFIX)
+        # ``root_real`` 与「已建目录」在循环外算好：``realpath`` / ``makedirs`` 都是
+        # 逐个成员的系统调用，放进循环会让解包慢上数倍（实测 6000 个成员 +5s）。
+        root_real = os.path.realpath(tmp)
         try:
             if prefix is not None:
-                picked = _extract_subtree(zf, infos, prefix, tmp)
+                picked = _extract_subtree(zf, infos, names, prefix, root_real)
                 root = _join_rel(tmp, prefix)
                 reason = "path"
             else:
-                picked = _extract_all(zf, infos, tmp)
+                picked = _extract_all(zf, infos, names, root_real)
                 root = _probe_root(tmp, tool)
                 reason = "fallback"
                 if root is None:
@@ -243,28 +246,42 @@ def extract_session_root(zip_path: str, tool: str) -> ArchiveSource:
                          reason=reason, extracted=picked, total=len(infos))
 
 
-def _write_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, tmp: str,
-                  rel: str) -> bool:
-    """把一个条目写到 ``tmp`` 下（阻断 Zip Slip，长路径加前缀）。"""
-    target = safe_target(os.path.realpath(tmp), rel)
+def _make_dirs(parent: str, made: set) -> None:
+    """建目录（已建过的直接跳过）。
+
+    ``os.makedirs(..., exist_ok=True)`` 每个成员都要一次 ``mkdir`` 系统调用（失败后
+    吞掉异常），同一目录下成百上千个成员时纯属重复劳动；``made`` 记录本次已建目录。
+    """
+    if not parent or parent in made:
+        return
+    os.makedirs(_longpath(parent), exist_ok=True)
+    made.add(parent)
+
+
+def _write_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, root_real: str,
+                  rel: str, made: set) -> bool:
+    """把一个条目写到 ``root_real`` 下（阻断 Zip Slip，长路径加前缀）。
+
+    ``root_real`` 必须是调用方**已 realpath 过**的临时根：本函数按成员被调用，
+    自己再算一次 ``realpath`` 就等于每个文件多两次系统调用。
+    """
+    target = safe_target(root_real, rel)
     if target is None:
         return False
-    parent = os.path.dirname(target)
-    if parent:
-        os.makedirs(_longpath(parent), exist_ok=True)
+    _make_dirs(os.path.dirname(target), made)
     with zf.open(info) as src, open(_longpath(target), "wb") as dst:
         shutil.copyfileobj(src, dst)
     return True
 
 
 def _extract_subtree(zf: zipfile.ZipFile, infos: Sequence[zipfile.ZipInfo],
-                     prefix: str, tmp: str) -> int:
+                     names: Sequence[str], prefix: str, root_real: str) -> int:
     """只解 ``prefix`` 子树 + 同级伴随文件。"""
     inside = (prefix + "/") if prefix else ""
     parent = posixpath.dirname(prefix) if prefix else ""
     picked = 0
-    for info in infos:
-        rel = _norm(info.filename)
+    made: set = set()
+    for info, rel in zip(infos, names):
         keep = rel.startswith(inside) if inside else True
         if not keep and parent:
             # 伴随文件（如 codebuddy 的 session-workspaces.json）与会话根同级
@@ -272,20 +289,21 @@ def _extract_subtree(zf: zipfile.ZipFile, infos: Sequence[zipfile.ZipInfo],
                     and posixpath.basename(rel) in COMPANION_NAMES)
         if not keep:
             continue
-        if _write_member(zf, info, tmp, rel):
+        if _write_member(zf, info, root_real, rel, made):
             picked += 1
     return picked
 
 
 def _extract_all(zf: zipfile.ZipFile, infos: Sequence[zipfile.ZipInfo],
-                 tmp: str) -> int:
+                 names: Sequence[str], root_real: str) -> int:
     """回退路径：全量解包（有条数 / 字节双上限，防大包拖垮磁盘）。"""
     picked = 0
     total_bytes = 0
-    for info in infos:
+    made: set = set()
+    for info, rel in zip(infos, names):
         if picked >= FALLBACK_MAX_ENTRIES or total_bytes > FALLBACK_MAX_BYTES:
             break
-        if _write_member(zf, info, tmp, _norm(info.filename)):
+        if _write_member(zf, info, root_real, rel, made):
             picked += 1
             total_bytes += info.file_size
     return picked
