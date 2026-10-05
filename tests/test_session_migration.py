@@ -15,8 +15,13 @@ import unittest
 from unittest import mock
 
 from ai_env_clone.session_migration import (
+    Session,
+    SessionMessage,
     SessionParser,
     SessionWriter,
+    _dsh_sync_projcache,
+    _dsh_zstd_backend,
+    _register_dsh_session,
     migrate_session,
 )
 
@@ -68,6 +73,26 @@ class TestParseCodeBuddy(unittest.TestCase):
         self.assertIn("闭包是指", s.messages[1].content)
         # reasoning_content 应被提取
         self.assertIn("定义再给示例", s.messages[1].reasoning_content)
+
+    def test_title_falls_back_to_first_message(self):
+        """index.json 无 title 时，解析标题与列表阶段取同一条兜底（首条用户消息）。"""
+        tmp = tempfile.mkdtemp(prefix="cb_title_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        sdir = os.path.join(tmp, "history", "wid", "sid")
+        os.makedirs(os.path.join(sdir, "messages"))
+        with open(os.path.join(sdir, "index.json"), "w", encoding="utf-8") as fh:
+            json.dump({"messages": [
+                {"id": "m1", "type": "message", "role": "user", "isComplete": True},
+            ]}, fh)
+        with open(os.path.join(sdir, "messages", "m1.json"), "w", encoding="utf-8") as fh:
+            json.dump({
+                "role": "user",
+                "message": json.dumps({"role": "user",
+                                       "content": [{"type": "text", "text": "帮我重构这个模块"}]}),
+            }, fh)
+        s = SessionParser.parse_codebuddy(sdir)
+        self.assertEqual(s.title, "帮我重构这个模块")
+        self.assertEqual(len(s.messages), 1)
 
 
 class TestScanCodeBuddyResolvesWorkspace(unittest.TestCase):
@@ -254,6 +279,231 @@ class TestMigrateWarnings(unittest.TestCase):
         self.assertTrue(new_id)
         self.assertFalse(any("目标工作区" in m and "不存在" in m for m in msgs),
                           "目标工作区已存在不应触发不存在警告，实际：%r" % msgs)
+
+
+class TestRegisterDshSessionRequiredFields(unittest.TestCase):
+    """导入会话写 DSH 工作区索引时，记录必须齐备 zod 必填字段。
+
+    回归背景：旧版本创建的工作区记录缺 ``createdAt``/``updatedAt``，DSH 在存储
+    边界用 zod 强校验 ``workspaceRecord``（这些字段无默认值），任一条记录缺字段
+    会让整个 workspace 域解析失败，桌面端一个工作区、一个会话都看不到。
+    """
+
+    REQUIRED = ("path", "title", "sessionIds", "createdAt", "updatedAt")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="reg_dsh_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.dsh = os.path.join(self.tmp, ".dsh")
+        os.makedirs(os.path.join(self.dsh, "storages"), exist_ok=True)
+        self.ws_file = os.path.join(self.dsh, "storages", "workspace.json")
+        # 既有索引：一条旧记录缺时间戳（历史导入写坏），一条合法
+        with open(self.ws_file, "w", encoding="utf-8") as fh:
+            json.dump({
+                "unit": {"name": "workspace", "version": 2},
+                "global": {"initialized": True,
+                           "workspaceIds": ["ws-old", "ws-ok"],
+                           "archivedSessionIds": []},
+                "tables": {"workspaces": {
+                    "ws-old": {"path": "D:\\project\\old", "title": "old",
+                               "sessionIds": ["session-a"]},
+                    "ws-ok": {"path": "D:\\project\\ok", "title": "ok",
+                              "sessionIds": [], "createdAt": "t1", "updatedAt": "t1"},
+                }},
+            }, fh)
+
+    def _read(self):
+        with open(self.ws_file, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_new_record_and_backfill_have_all_required_fields(self):
+        warnings = []
+        _register_dsh_session(self.dsh, "session-new", "--D-project-new--",
+                              "D:\\project\\new", "新会话", 123, warnings.append)
+        data = self._read()
+        for wid, rec in data["tables"]["workspaces"].items():
+            for key in self.REQUIRED:
+                self.assertIn(key, rec, "工作区 %s 缺必填字段 %s" % (wid, key))
+        # 新工作区已建，且新会话登记其中
+        new_ids = [wid for wid, rec in data["tables"]["workspaces"].items()
+                   if rec["path"] == "D:\\project\\new"]
+        self.assertEqual(len(new_ids), 1)
+        self.assertIn("session-new", data["tables"]["workspaces"][new_ids[0]]["sessionIds"])
+        # 旧记录的会话保留（只增不改），时间戳被补齐
+        self.assertEqual(data["tables"]["workspaces"]["ws-old"]["sessionIds"], ["session-a"])
+        self.assertIn("pinnedSessionIds", data["global"])
+        self.assertEqual(warnings, [])
+
+    def test_existing_workspace_appends_session(self):
+        warnings = []
+        _register_dsh_session(self.dsh, "session-b", "--D-project-ok--",
+                              "D:\\project\\ok", "新会话", 1, warnings.append)
+        data = self._read()
+        self.assertEqual(data["tables"]["workspaces"]["ws-ok"]["sessionIds"], ["session-b"])
+        self.assertEqual(data["tables"]["workspaces"]["ws-ok"]["updatedAt"] is not None, True)
+
+
+class TestEmptySessionSkipped(unittest.TestCase):
+    """源会话不含任何消息时不得导入。
+
+    回归背景：CodeBuddy 备份里存在 ``index.json`` 为 ``{"messages": [], "requests": []}``
+    且无消息文件的空会话；旧行为「仍写出空会话」会在目标工具（如 DSH）留下
+    「有标题、无内容」的幽灵会话（用户实测：只看到工作区标题、点开没有会话数据）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="empty_sess_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_empty_codebuddy_session_is_skipped(self):
+        sdir = os.path.join(self.tmp, "history", "wsid", "sessid")
+        os.makedirs(sdir)
+        with open(os.path.join(sdir, "index.json"), "w", encoding="utf-8") as fh:
+            json.dump({"messages": [], "requests": []}, fh)
+        dsh = os.path.join(self.tmp, ".dsh")
+        os.makedirs(os.path.join(dsh, "storages"))
+        with self.assertRaises(ValueError) as cm:
+            migrate_session(source_tool="codebuddy", source_path=sdir,
+                            target_tool="dsh", target_root=dsh,
+                            workspace_id="D:\\project\\x")
+        self.assertIn("空会话", str(cm.exception))
+        # 未写出任何会话目录（不留幽灵会话）
+        self.assertFalse(os.path.isdir(os.path.join(dsh, "sessions")))
+
+
+def _zstd_ready() -> bool:
+    return _dsh_zstd_backend()[1] is not None
+
+
+class TestDshProjcacheSync(unittest.TestCase):
+    """导入会话必须同步 DSH 投影缓存 ``storages/session_projcache/sessions/<sid>.json``。
+
+    回归背景：DSH 侧边栏对**冷会话**（未打开过的）只读该缓存里的
+    ``sessionListMetadata`` 投影——``ui-workspace.sessionVisible()`` 会隐藏
+    ``blank`` 为真的行，标题也来自同一缓存。旧版导入只写会话日志 +
+    ``workspace.json``；更糟的是，早期 DSH 拒绝过导入日志时落下的陈旧检查点
+    （``{blank: true, seq: 3}``）会因 ``identity`` 仍绑定 header 的**不变字段**而被
+    继续采信 —— 界面表现就是「工作区有会话、却看不到 / 未命名空会话」。
+    """
+
+    SID = "session-11111111-2222-3333-4444-555555555555"
+    CWD = r"D:\project\demo"
+    CREATED_MS = 1700000000000
+    PROMPT_MS = 1786116263224
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="projcache_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.dsh = os.path.join(self.tmp, ".dsh")
+        self.cache_dir = os.path.join(
+            self.dsh, "storages", "session_projcache", "sessions")
+
+    @property
+    def cache_fp(self):
+        return os.path.join(self.cache_dir, self.SID + ".json")
+
+    def _text(self, *, has_turn=True, title="导入会话（来自 codebuddy）"):
+        def ev(etype, ms, data):
+            return json.dumps({"type": etype, "seq": 0, "time": ms, "data": data},
+                              ensure_ascii=False)
+        lines = [json.dumps({"type": "session", "version": 4, "id": self.SID,
+                             "createdAt": self.CREATED_MS, "cwd": self.CWD},
+                            ensure_ascii=False)]
+        if has_turn:
+            lines.append(ev("turn/start", self.CREATED_MS + 1, {"turn": 1}))
+        lines.append(ev("session/title", self.CREATED_MS + 2, {"title": title}))
+        lines.append(ev("user/message", self.PROMPT_MS, {"source": {"kind": "user"}}))
+        return "\n".join(lines) + "\n"
+
+    def _read(self):
+        with open(self.cache_fp, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_new_record_is_visible_with_title(self):
+        _dsh_sync_projcache(self.dsh, self.SID, self.CREATED_MS, self.CWD,
+                            False, self._text(), lambda _m: None)
+        doc = self._read()
+        self.assertEqual(doc["version"], 7)
+        rows = doc["record"]["rows"]
+        meta = rows["sessionListMetadata"]["val"]
+        self.assertFalse(meta["blank"], "有 turn/start 的会话不得标为空会话（否则侧边栏隐藏）")
+        self.assertEqual(meta["lastPromptAt"], self.PROMPT_MS)
+        self.assertEqual(rows["title"]["val"], "导入会话（来自 codebuddy）")
+        ident = doc["record"]["identity"]
+        self.assertEqual(ident["formatVersion"], 4)
+        self.assertEqual(ident["createdAt"], self.CREATED_MS)
+        self.assertEqual(ident["cwd"], self.CWD)
+
+    def test_stale_record_corrected_in_place_keeping_other_rows(self):
+        os.makedirs(self.cache_dir, exist_ok=True)
+        other_row = {"ver": 2, "seq": 3, "val": {"turns": 0}}
+        stale = {"version": 7, "record": {
+            "identity": {"formatVersion": 4, "createdAt": self.CREATED_MS,
+                         "cwd": self.CWD, "isSeeded": False,
+                         "inheritedEventCount": 0},
+            "rows": {
+                "title": {"ver": 1, "seq": 3, "val": None},
+                "sessionListMetadata": {"ver": 1, "seq": 3,
+                                        "val": {"blank": True, "lastPromptAt": None}},
+                "sessionStats": other_row,
+            },
+        }}
+        with open(self.cache_fp, "w", encoding="utf-8") as fh:
+            json.dump(stale, fh)
+
+        _dsh_sync_projcache(self.dsh, self.SID, self.CREATED_MS, self.CWD,
+                            False, self._text(), lambda _m: None)
+        rows = self._read()["record"]["rows"]
+        self.assertFalse(rows["sessionListMetadata"]["val"]["blank"])
+        self.assertEqual(rows["title"]["val"], "导入会话（来自 codebuddy）")
+        # 其余行连同各自 ver 原样保留（陈旧但合法，真正打开时会从头重折叠）
+        self.assertEqual(rows["sessionStats"], other_row)
+        # 改写前留了备份
+        baks = [n for n in os.listdir(self.cache_dir)
+                if n.startswith(self.SID + ".json.bak-")]
+        self.assertTrue(baks, "就地修正缓存记录前必须先备份原文件")
+
+    def test_session_without_turn_stays_blank(self):
+        """没有 ``turn/start`` 的会话（真正无对话内容）保持 blank，不伪造可见性。"""
+        _dsh_sync_projcache(self.dsh, self.SID, self.CREATED_MS, self.CWD,
+                            False, self._text(has_turn=False), lambda _m: None)
+        self.assertTrue(self._read()["record"]["rows"]["sessionListMetadata"]["val"]["blank"])
+
+
+@unittest.skipUnless(_zstd_ready(), "需要真实 zstd 后端")
+class TestWriteDshSyncsProjcache(unittest.TestCase):
+    """``write_dsh`` 端到端：导入一条会话后，投影缓存必须已同步且可显示。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="dsh_write_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        os.makedirs(os.path.join(self.tmp, "storages"))
+        with open(os.path.join(self.tmp, "storages", "workspace.json"),
+                  "w", encoding="utf-8") as fh:
+            json.dump({"unit": {"name": "workspace", "version": 2},
+                       "global": {"initialized": True, "workspaceIds": []},
+                       "tables": {"workspaces": {}}}, fh)
+
+    def test_write_dsh_creates_visible_cache_record(self):
+        ses = Session(source_tool="unit", title="端到端导入",
+                      messages=[
+                          SessionMessage(role="user", content="你好",
+                                         created_at="2026-01-01T00:00:00"),
+                          SessionMessage(role="assistant", content="回答",
+                                         created_at="2026-01-01T00:00:01"),
+                      ])
+        warnings = []
+        sid = SessionWriter.write_dsh(ses, self.tmp, cwd=r"D:\project\e2e",
+                                     warn=warnings.append)
+        self.assertEqual(warnings, [])
+        cache_fp = os.path.join(self.tmp, "storages", "session_projcache",
+                                "sessions", sid + ".json")
+        with open(cache_fp, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        rows = doc["record"]["rows"]
+        self.assertFalse(rows["sessionListMetadata"]["val"]["blank"])
+        self.assertEqual(rows["title"]["val"], "端到端导入")
+        self.assertEqual(doc["record"]["identity"]["cwd"], r"D:\project\e2e")
 
 
 if __name__ == "__main__":

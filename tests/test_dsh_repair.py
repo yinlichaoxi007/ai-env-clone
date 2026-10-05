@@ -351,6 +351,68 @@ class TestRepairPlanAndApply(unittest.TestCase):
         self.assertIn(creates[0].workspace_id, after["global"]["workspaceIds"])
 
 
+class TestFixRecordRequiredFields(unittest.TestCase):
+    """记录缺 DSH zod 必填字段的检出与修复。
+
+    背景：DSH 在存储边界用 zod 强校验 ``workspaceRecord``，``path/title/
+    sessionIds/createdAt/updatedAt`` 均**无默认值**；任一条记录缺字段 ⇒ 整个
+    workspace 域解析失败 ⇒ 桌面端一个工作区、一个会话都不显示（连本机原有
+    会话一起看不见）。修复必须只增不改、绝不删除已有会话。
+    """
+
+    def setUp(self):
+        self.fx = _FakeDshHome()
+        self.addCleanup(self.fx.cleanup)
+        # ws-bad 缺 createdAt/updatedAt（旧版本导入写坏）；ws-ok 合法
+        self.index = _make_ws_index({
+            "ws-bad": {"path": "D:\\project\\a", "title": "a", "sessionIds": ["session-x"]},
+            "ws-ok": {"path": "D:\\project\\b", "title": "b", "sessionIds": ["session-z"],
+                      "createdAt": "t1", "updatedAt": "t1"},
+        })
+        self.fx.session("--D-project-a--", "session-x")
+        self.fx.session("--D-project-b--", "session-z")
+        self.fx.write_index(self.index)
+
+    def test_validate_flags_missing_required_fields(self):
+        problems = dr.validate_workspace_index(self.index)
+        self.assertTrue(any("ws-bad" in p and "createdAt" in p for p in problems))
+        self.assertTrue(any("ws-bad" in p and "updatedAt" in p for p in problems))
+        self.assertFalse(any("ws-ok" in p for p in problems))
+
+    def test_plan_detects_fix_record(self):
+        plan, _ = dr.plan_workspace_index_repair(self.fx.dsh)
+        fixes = [m for m in plan.mutations if m.action == "fix-record"]
+        self.assertEqual([m.workspace_id for m in fixes], ["ws-bad"])
+        self.assertIn("createdAt", fixes[0].detail)
+
+    def test_apply_fills_fields_and_backs_up(self):
+        plan, idx = dr.plan_workspace_index_repair(self.fx.dsh)
+        res = dr.apply_workspace_index_repair(self.fx.dsh, plan, dry_run=False, backup=True, idx=idx)
+        self.assertTrue(res.ok)
+        self.assertEqual(res.applied, 1)
+        with open(os.path.join(self.fx.dsh, "storages", "workspace.json"), "r", encoding="utf-8") as fh:
+            after = json.load(fh)
+        rec = after["tables"]["workspaces"]["ws-bad"]
+        for key in ("path", "title", "sessionIds", "createdAt", "updatedAt"):
+            self.assertIn(key, rec)
+        # 只增不改：已有会话一个不少
+        self.assertEqual(rec["sessionIds"], ["session-x"])
+        # 合法记录的时间戳原样保留
+        self.assertEqual(after["tables"]["workspaces"]["ws-ok"]["createdAt"], "t1")
+        backups = [fn for fn in os.listdir(os.path.join(self.fx.dsh, "storages"))
+                   if fn.startswith("workspace.json.bak")]
+        self.assertEqual(len(backups), 1)
+
+    def test_fix_makes_index_healthy_and_is_idempotent(self):
+        plan, idx = dr.plan_workspace_index_repair(self.fx.dsh)
+        dr.apply_workspace_index_repair(self.fx.dsh, plan, dry_run=False, backup=True, idx=idx)
+        with open(os.path.join(self.fx.dsh, "storages", "workspace.json"), "r", encoding="utf-8") as fh:
+            after = json.load(fh)
+        self.assertEqual(dr.validate_workspace_index(after), [])
+        plan2, _ = dr.plan_workspace_index_repair(self.fx.dsh)
+        self.assertTrue(plan2.empty)
+
+
 class TestLegacyReplayDetection(unittest.TestCase):
     def setUp(self):
         _enable_fake_zstd()

@@ -171,6 +171,7 @@ TARGET_LOSSES: dict[str, tuple] = {
         ("tool_results", "工具执行结果不会作为独立结果块写出，只留在助手正文的文本里"),
     ),
     "dsh": (
+        ("tool_calls", "工具调用不会写出：目标会话里看不到「调用了什么工具」，只剩正文文本"),
         ("tool_results", "工具执行结果不会写出"),
     ),
     "reasonix": (),

@@ -280,6 +280,102 @@ class TestDsh(unittest.TestCase):
         self.assertEqual([m.role for m in back.messages], ["user", "assistant"])
         self.assertEqual(back.messages[0].content, "问题")
 
+    def test_written_log_has_single_line_header_frame(self) -> None:
+        """DSH 只解**首帧**取 header，且要求首帧明文恰好一行 ⇒ 必须多帧写。
+
+        若把整份文本压成单帧，DSH 判首帧非法（``SessionPersistenceCorruptionError``）
+        并在 ``listArtifacts`` 里静默跳过该会话：会话列表与工作区归属都看不到它，
+        界面表现为「工作区有标题、里面没有会话」。
+        """
+        from ai_env_clone import dsh_repair as dr
+
+        sid = sm.SessionWriter.write_dsh(
+            self._session(), self.dsh, cwd=r"D:\project\Demo")
+        f = os.path.join(self.dsh, "sessions", "--D-project-Demo--", sid,
+                         "session.v3.jsonl.zstd")
+        with open(f, "rb") as fh:
+            raw = fh.read()
+        _, decompress = ZSTD
+        text = decompress(raw).decode("utf-8")
+        frames = dr._scan_zstd_frames(raw)
+        # 首帧 = 仅 header 一行；事件行在后续帧里拼接
+        self.assertGreaterEqual(len(frames), 2)
+        first = decompress(raw[frames[0][0]:frames[0][1]]).decode("utf-8")
+        self.assertEqual(first.count("\n"), 1)
+        self.assertTrue(first.endswith("\n"))
+        self.assertEqual(json.loads(first)["type"], "session")
+        # 事件行跨帧拼接后仍完整
+        rest = decompress(raw[frames[1][0]:]).decode("utf-8")
+        self.assertIn('"user/message"', rest)
+        self.assertIn('"assistant/message"', rest)
+        self.assertEqual(len(text.rstrip("\n").split("\n")),
+                         first.count("\n") + rest.count("\n"))
+
+    def _written_rows(self, session) -> "list":
+        """写出会话并解压成事件行列表（``rows[0]`` 是 header）。"""
+        sid = sm.SessionWriter.write_dsh(session, self.dsh, cwd=r"D:\project\Demo")
+        f = os.path.join(self.dsh, "sessions", "--D-project-Demo--", sid,
+                         "session.v3.jsonl.zstd")
+        with open(f, "rb") as fh:
+            _, decompress = ZSTD
+            text = decompress(fh.read()).decode("utf-8")
+        return [json.loads(l) for l in text.split("\n") if l.strip()]
+
+    def test_written_log_satisfies_dsh_relationship_rules(self) -> None:
+        """回归：旧 writer 的 v3 不满足 DSH 关系校验 → 加载器静默丢弃成空壳 v4。
+
+        逐条锁定 DSH 官方 session-format 迁移+校验链要求的关系；任一条不成立，
+        会话都会被改写成「有标题、无内容」的空壳（用户实测的空会话根因）。
+        """
+        rows = self._written_rows(self._session())
+        header, events = rows[0], rows[1:]
+        # ① header 无 seq；事件 seq == 数组下标（0 基、稠密），旧实现从 1 起必被拒
+        self.assertNotIn("seq", header)
+        self.assertEqual([e["seq"] for e in events], list(range(len(events))))
+        # ② 首个 surface 事件必须是受保护的系统头
+        surface = [e for e in events if e.get("surfaceOp")]
+        self.assertTrue(surface)
+        self.assertEqual(surface[0]["type"], "system/message")
+        self.assertEqual(surface[0]["data"]["message"]["role"], "system")
+        self.assertEqual(surface[0]["data"]["message"]["source"],
+                         {"kind": "plugin", "plugin": "@deepseek-ai/dsh-system-prompt"})
+        # ③ 预设之后必须 turn / step 成对开合
+        self.assertEqual(events[0]["type"], "permission/preset")
+        kinds = [e["type"] for e in events]
+        self.assertIn("turn/start", kinds)
+        self.assertIn("turn/end", kinds)
+        self.assertEqual(kinds.count("step/start"), kinds.count("step/end"))
+        # ④ 助手消息必须带 stream 数组 + model 来源（缺一即被关系校验拒绝）
+        am = [e for e in events if e["type"] == "assistant/message"]
+        self.assertTrue(am)
+        for e in am:
+            self.assertIsInstance(e["data"]["stream"], list)
+            src = e["data"]["message"]["source"]
+            self.assertEqual(src["kind"], "model")
+            self.assertTrue(src.get("provider"))
+            self.assertTrue(src.get("model"))
+        # ⑤ 标题必须引用一条更早的 user/message（空 messageSeqs 只在无用户消息时合法）
+        title = [e for e in events if e["type"] == "session/title"][-1]
+        self.assertTrue(title["data"]["messageSeqs"])
+        user_seqs = {e["seq"] for e in events if e["type"] == "user/message"}
+        for s in title["data"]["messageSeqs"]:
+            self.assertIn(s, user_seqs)
+            self.assertLess(s, title["seq"])
+        # ⑥ 以 end-seed 收尾
+        self.assertEqual(events[-1]["type"], "session/end-seed")
+
+    def test_empty_assistant_message_is_skipped(self) -> None:
+        """空助手消息不写出（否则界面出现无内容气泡）。"""
+        ses = sm.Session(source_tool="workbuddy", title="t", messages=[
+            sm.SessionMessage(role="user", content="问"),
+            sm.SessionMessage(role="assistant", content="   "),
+            sm.SessionMessage(role="assistant", content="答"),
+        ])
+        rows = self._written_rows(ses)
+        am = [e for e in rows if e.get("type") == "assistant/message"]
+        self.assertEqual(len(am), 1)
+        self.assertEqual(am[0]["data"]["message"]["content"][0]["text"], "答")
+
     def test_multiframe_decompression(self) -> None:
         """多帧 zstd 必须整体解压（否则大文件只解出首帧）。"""
         compress, _ = ZSTD

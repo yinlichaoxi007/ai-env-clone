@@ -335,18 +335,141 @@ def _dsh_read_text(session_file: str) -> str:
 
 
 def _dsh_write_text(session_file: str, text: str) -> None:
-    """把明文 JSONL 以 zstd 压缩写入 DSH 会话文件；后端缺失时抛 RuntimeError。"""
+    """把明文 JSONL 以 zstd 压缩写入 DSH 会话文件；后端缺失时抛 RuntimeError。
+
+    ⚠️ 必须写成**多帧拼接**的 zstd 容器，且**首帧恰好只有 header 一行**，绝不能把
+    整份文本压成单帧。
+
+    DSH 读取会话时只解**第一帧**取 header，且 ``assertZstdHeaderFrame`` 要求首帧
+    明文恰好一行（以单个 ``\\n`` 收尾）；事件行再跨帧拼接。若整份文本压成单帧，
+    首帧就含多行 ⇒ DSH 判为 ``SessionPersistenceCorruptionError``，并在
+    ``listArtifacts`` 里**静默跳过**整个会话：会话列表看不到它，工作区归属索引
+    （按 header 建）也把它过滤掉——界面表现就是「工作区有标题、里面没有会话」。
+
+    这里按本机真实日志的**主流形态**分帧：``[header, 其余事件]``。
+    """
     _decompress, compress, _name = _dsh_zstd_backend()
     if compress is None:
         raise RuntimeError(
             "未检测到可用的 zstd 压缩后端，无法写出 DSH 会话文件。"
             "请安装 zstandard / pyzstd 模块或系统 zstd 命令后重试。"
         )
-    payload = compress(text.encode("utf-8"))
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()  # 文本以 \n 收尾时 split 会多出一个空串
+    if not lines:
+        raise ValueError("会话内容为空，未写出 DSH 会话文件。")
+    payload = compress((lines[0] + "\n").encode("utf-8"))
+    if len(lines) > 1:
+        payload += compress(("\n".join(lines[1:]) + "\n").encode("utf-8"))
     lp = _longpath(session_file)
     os.makedirs(os.path.dirname(lp), exist_ok=True)
     with open(lp, "wb") as f:
         f.write(payload)
+
+
+def _dsh_v3_text(sid: str, session, cwd_val: str) -> "tuple[str, int, str]":
+    """构造一份**格式合法**的 DSH v3 会话日志，返回 ``(文本, createdAt_ms, 标题)``。
+
+    ⚠️ 这里是本工具最容易出错的地方：DSH 加载会话时会先用自带迁移链把存储代际
+    （v3）迁到当前代际（v4），再跑 ``validateInstalledCurrentSessionArtifact``
+    的全套关系校验。任一条不满足，DSH 会**静默丢弃**整份日志、改写成一个只有 5 行的
+    空 v4 —— 界面表现就是「会话有标题、点开没有消息」。历史实现曾因下列问题触发：
+
+    - ``seq`` 不从 0 开始 / 不连续（要求 ``seq`` == 事件数组下标，0 基）；
+    - 缺少受保护的系统头（首个 surface 事件必须是 ``system/message``）；
+    - 助手消息缺 ``stream`` 数组、缺 model 来源（``provider`` / ``model``）；
+    - 没有配对的 ``turn/start`` + ``step/start`` / ``step/end`` + ``turn/end``。
+
+    下面的事件序列已用 DSH 官方 ``session-format-catalog`` 迁移+校验链
+    （``validation='transformed'`` 与 ``'current'`` 双重往返）实测通过。
+    """
+    first_ms = _now_ms()
+    header = {
+        "type": "session", "version": 3, "id": sid,
+        "createdAt": first_ms, "isSeeded": False,
+        "delegationDepth": 0, "agentPreset": "standard",
+    }
+    if cwd_val:
+        header["cwd"] = cwd_val
+
+    events: list = []
+
+    def emit(etype: str, time_ms: int, data: dict,
+             surface_op: "str | None" = None) -> int:
+        ev = {"type": etype, "seq": len(events), "time": time_ms, "data": data}
+        if surface_op is not None:
+            ev["surfaceOp"] = surface_op
+        events.append(ev)
+        return ev["seq"]
+
+    turn = 1
+    # 1) 预设 / 沙箱 / 审批 + 受保护的系统头，全部落在一个已开启的 turn 内。
+    emit("permission/preset", first_ms, {"preset": "workspace-write"})
+    emit("sandbox/mode", first_ms, {"mode": "workspace-write"})
+    emit("approval/policy", first_ms, {"policy": "ask"})
+    emit("session/end-seed", first_ms, {})
+    emit("turn/start", first_ms, {"turn": turn})
+    emit("step/start", first_ms, {"turn": turn, "step": 1})
+    emit("system/message", first_ms, {
+        "turn": turn, "step": 1,
+        "message": {
+            "id": "imported-system-%s" % sid, "role": "system",
+            "source": {"kind": "plugin", "plugin": "@deepseek-ai/dsh-system-prompt"},
+            "content": [],
+        },
+    }, "append")
+    emit("step/end", first_ms, {"turn": turn, "step": 1})
+
+    # 2) 每条消息独占一个 step；空助手消息跳过（避免界面出现空气泡）。
+    step = 1
+    last_ms = first_ms
+    first_user_seq: "int | None" = None
+    for m in session.messages:
+        ms = _iso_to_ms(m.created_at) if m.created_at else _now_ms()
+        last_ms = ms
+        if m.role == "assistant":
+            if not (m.content or "").strip():
+                continue
+            step += 1
+            emit("step/start", ms, {"turn": turn, "step": step})
+            emit("assistant/message", ms, {
+                "turn": turn, "step": step, "stream": [],
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": m.content}],
+                    "source": {"kind": "model", "provider": "imported",
+                               "model": "imported"},
+                    "id": str(uuid.uuid4()),
+                },
+            }, "append")
+            emit("step/end", ms, {"turn": turn, "step": step})
+        else:
+            step += 1
+            emit("step/start", ms, {"turn": turn, "step": step})
+            seq = emit("user/message", ms, {
+                "content": [{"type": "text", "text": m.content or ""}],
+                "source": {"kind": "user"},
+                "role": m.role or "user", "id": str(uuid.uuid4()),
+            }, "append")
+            if first_user_seq is None:
+                first_user_seq = seq
+            emit("step/end", ms, {"turn": turn, "step": step})
+
+    emit("turn/end", last_ms, {"turn": turn, "reason": {"kind": "completed"}})
+
+    title = session.title or "导入会话（来自 %s）" % session.source_tool
+    if first_user_seq is None:
+        title_data = {"title": title, "messageSeqs": [], "source": {"kind": "user"}}
+    else:
+        title_data = {"title": title, "messageSeqs": [first_user_seq],
+                      "source": {"kind": "fallback"}}
+    emit("session/title", last_ms, title_data)
+    emit("session/end-seed", last_ms, {})
+
+    lines = [json.dumps(header, ensure_ascii=False)]
+    lines.extend(json.dumps(ev, ensure_ascii=False) for ev in events)
+    return "\n".join(lines) + "\n", first_ms, title
 
 
 def _register_workbuddy_session(wb_home: str, sid: str, cwd: str, title: str,
@@ -468,42 +591,156 @@ def _register_dsh_session(dsh_home: str, sid: str, workspace_dir: str, cwd: str,
         if ws_id is None:
             ws_id = str(uuid.uuid4())
             base = os.path.basename((cwd or "").rstrip("\\/")) or workspace_dir
-            workspaces[ws_id] = {"path": cwd, "title": base, "sessionIds": []}
+            workspaces[ws_id] = {
+                "path": cwd, "title": base, "sessionIds": [],
+                "createdAt": _now_iso(), "updatedAt": _now_iso(),
+            }
         entry = workspaces[ws_id]
         if not isinstance(entry, dict):
-            entry = workspaces[ws_id] = {"path": cwd, "title": workspace_dir, "sessionIds": []}
+            entry = workspaces[ws_id] = {
+                "path": cwd, "title": workspace_dir, "sessionIds": [],
+                "createdAt": _now_iso(), "updatedAt": _now_iso(),
+            }
         ids = entry.setdefault("sessionIds", [])
         if sid not in ids:
             ids.append(sid)
+        entry["updatedAt"] = _now_iso()
+        # ★ 记录必须齐备 DSH 存储边界的 zod schema 必填字段
+        #   （path/title/sessionIds/createdAt/updatedAt，均无默认值）。
+        #   任一条记录缺字段 ⇒ 整个 workspace 域解析失败 ⇒ 桌面端
+        #   **一个工作区、一个会话都不显示**（连本机原有会话一起看不见）。
+        #   老版本导入写下的记录可能就缺时间戳，故这里对**全表**补齐（只增不改）。
+        now_iso = entry.get("updatedAt")
+        for record in workspaces.values():
+            if not isinstance(record, dict):
+                continue
+            if not isinstance(record.get("path"), str):
+                record["path"] = ""
+            if not isinstance(record.get("title"), str):
+                record["title"] = os.path.basename(
+                    (record.get("path") or "").rstrip("\\/")) or "workspace"
+            if not isinstance(record.get("sessionIds"), list):
+                record["sessionIds"] = []
+            record.setdefault("createdAt", now_iso)
+            record.setdefault("updatedAt", now_iso)
         glob = data.setdefault("global", {})
         if isinstance(glob, dict):
             wids = glob.setdefault("workspaceIds", [])
             if ws_id not in wids:
                 wids.append(ws_id)
+            glob.setdefault("archivedSessionIds", [])
+            glob.setdefault("pinnedSessionIds", [])
         _write_json(ws_file, data)
     except (OSError, ValueError, TypeError) as exc:
         warn("登记 DSH 工作区索引失败：%s（会话文件已写出）" % exc)
-        return
 
-    # 会话投影缓存：尽力更新，失败不影响主流程（DSH 会自行重建）。
-    #
-    # ⚠️ 这里写的是该单元的**旧 ``single`` 布局**单文件。按 DSH ``storage-json`` 后端的
-    #    规则，只有当 per-record 目录树**尚不存在**时，这份整单元文档才会在下次打开时被
-    #    用来初始化目录树；若目录树已存在（升级过的机器都如此），本次写入**不生效**。
-    #    之所以只做「尽力而为」而不去手写目录树里的记录：那是**纯缓存**，官方文档明确
-    #    「日志领先，缓存跟随」，记录还须逐条通过 projection 的 stateSchema 校验，手搓一份
-    #    不完整的记录只会被当作不存在（无害但无用）。DSH 自己会从会话日志冷重折叠重建，
-    #    故这里保持不侵入。
-    cache_file = os.path.join(storages, "session_projcache.json")
+
+def _dsh_cache_defaults(cache_dir: str) -> "tuple[int, int]":
+    """从既有投影缓存记录里取「域信封 version / 当前会话代际」作为兜底。
+
+    取不到时退回 ``(7, 4)``。这两个值必须与实际运行中的 DSH 一致，
+    否则整条记录会被 ``identityMatches`` 拒绝——但那只是「读作无缓存」，
+    即 ``blank`` 默认 false，会话**仍然可见**，只是暂时没有标题。
+    """
+    domain_version, format_version = 7, 4
     try:
-        cdata = _read_json(cache_file)
-        if isinstance(cdata, dict):
-            tbl = cdata.setdefault("tables", {}).setdefault("sessions", {})
-            item = tbl.setdefault(sid, {})
-            item["identity"] = {"createdAt": created_ms, "cwd": cwd}
-            _write_json(cache_file, cdata)
-    except (OSError, ValueError, TypeError):
-        pass
+        names = [n for n in os.listdir(cache_dir) if n.endswith(".json")][:50]
+    except OSError:
+        return domain_version, format_version
+    for name in names:
+        try:
+            doc = _read_json(os.path.join(cache_dir, name))
+            if isinstance(doc.get("version"), int):
+                domain_version = doc["version"]
+            fv = ((doc.get("record") or {}).get("identity") or {}).get("formatVersion")
+            if isinstance(fv, int) and fv > format_version:
+                format_version = fv
+        except (OSError, ValueError, TypeError):
+            continue
+    return domain_version, format_version
+
+
+def _dsh_sync_projcache(dsh_home: str, sid: str, created_ms: int, cwd: str,
+                        is_seeded: bool, text: str, warn) -> None:
+    """把刚写出的 DSH 会话同步进投影缓存 ``session_projcache``。
+
+    ⚠️ 这是「工作区里有会话却看不到」的根因所在，不能省。
+
+    DSH 侧边栏对**冷会话**（未打开过的）只读 ``sessionListMetadata`` 投影，
+    而 ``ui-workspace`` 的 ``sessionVisible()`` 会丢弃 ``blank`` 为真且不是当前
+    会话的行；会话标题同样只来自该缓存。记录的 ``identity``
+    （formatVersion/createdAt/cwd/isSeeded/inheritedEventCount）只绑 header 的
+    不变字段——一旦磁盘日志被**带外**改写而 header 不变，旧记录会继续被采信，
+    界面就永远停在「空会话 / 未命名」。
+
+    因此这里：已有记录**就地修正** ``title`` / ``sessionListMetadata`` /
+    ``identity`` 三处，其余行连同各自 ``ver`` 原样保留（它们的 ``seq`` 偏低，
+    会话被真正打开时会从头重折叠，不会读到错误状态）；无记录则新建。
+    写前备份为 ``<sid>.json.bak-<时间戳>``。
+    """
+    lines = [l for l in text.split("\n") if l.strip()]
+    if len(lines) < 2:
+        return
+    title = None
+    title_seq = None
+    last_prompt = None
+    has_turn = False
+    last_seq = 0
+    for i, line in enumerate(lines[1:]):
+        last_seq = i
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        etype = ev.get("type")
+        if etype == "session/title":
+            title = (ev.get("data") or {}).get("title")
+            title_seq = i
+        elif etype == "turn/start":
+            has_turn = True
+        elif etype == "user/message":
+            if ((ev.get("data") or {}).get("source") or {}).get("kind") == "user":
+                last_prompt = ev.get("time")
+
+    cache_dir = os.path.join(dsh_home, "storages", "session_projcache", "sessions")
+    cache_fp = os.path.join(cache_dir, sid + ".json")
+    domain_version, format_version = _dsh_cache_defaults(cache_dir)
+    doc = None
+    rows = None
+    if os.path.isfile(cache_fp):
+        try:
+            doc = _read_json(cache_fp)
+            rows = doc["record"]["rows"]
+        except (OSError, ValueError, TypeError, KeyError):
+            doc, rows = None, None
+    if not isinstance(rows, dict):
+        doc = {"version": domain_version, "record": {"identity": {}, "rows": {}}}
+        rows = doc["record"]["rows"]
+    rows["title"] = {
+        "ver": int((rows.get("title") or {}).get("ver", 1)),
+        "seq": title_seq if title_seq is not None else last_seq,
+        "val": title,
+    }
+    rows["sessionListMetadata"] = {
+        "ver": int((rows.get("sessionListMetadata") or {}).get("ver", 1)),
+        "seq": last_seq,
+        "val": {"blank": not has_turn, "lastPromptAt": last_prompt},
+    }
+    doc["record"]["identity"] = {
+        "formatVersion": int(format_version),
+        "createdAt": int(created_ms),
+        "cwd": cwd,
+        "isSeeded": bool(is_seeded),
+        "inheritedEventCount": 0,
+    }
+    try:
+        if os.path.isfile(cache_fp):
+            shutil.copy2(_longpath(cache_fp),
+                         _longpath(cache_fp) + ".bak-"
+                         + datetime.now().strftime("%Y%m%dT%H%M%S"))
+        _write_json(cache_fp, doc)
+    except (OSError, ValueError, TypeError) as exc:
+        warn("同步 DSH 投影缓存失败：%s（会话文件已写出，界面可能显示为空会话）" % exc)
 
 
 
@@ -644,6 +881,12 @@ class SessionParser:
                 created_at=mobj.get("createdAt") or mobj.get("created_at") or "",
             ))
         title = idx.get("title") or idx.get("name") or ""
+        if not title:
+            # 与列表阶段 ``_scan_codebuddy`` 取同一条兜底：index.json 无标题时用首条
+            # 用户消息前 40 字。否则列表里明明有标题，导入后却被写成通用占位标题
+            # （「导入会话（来自 codebuddy）」），会话无法辨认。
+            title = _codebuddy_title_from_first_message(
+                session_dir, os.path.join(session_dir, "index.json"))
         return Session(source_tool="codebuddy", title=title, scope="", messages=msgs)
 
     # ---- WorkBuddy ----
@@ -1054,7 +1297,9 @@ class SessionWriter:
         需要**同时**落：
 
         1. ``sessions/<workspace_dir>/<sid>/session.v3.jsonl.zstd``（内容）；
-        2. ``storages/workspace.json`` 的工作区登记（会话列表按此索引）。
+        2. ``storages/workspace.json`` 的工作区登记（会话列表按此索引）；
+        3. ``storages/session_projcache/sessions/<sid>.json`` 的投影缓存
+           （冷会话的 ``blank`` 与标题都只来自这里，缺了就是「工作区有会话却看不到」）。
 
         依赖可用 zstd 后端；缺失时抛 :class:`RuntimeError`。
         """
@@ -1063,64 +1308,16 @@ class SessionWriter:
                 warn(msg)
 
         sid = _new_dsh_id()
-        workspace_dir = _dsh_workspace_dirname(cwd or session.scope or "imported-workspace")
+        cwd_val = cwd or session.scope or ""
+        workspace_dir = _dsh_workspace_dirname(cwd_val or "imported-workspace")
         session_dir = os.path.join(dsh_home, "sessions", workspace_dir, sid)
 
-        first_ms = _now_ms()
-        lines: list = [json.dumps({
-            "type": "session", "version": 3, "id": sid,
-            "createdAt": first_ms, "cwd": cwd or session.scope or "",
-            "isSeeded": False, "delegationDepth": 0, "agentPreset": "standard",
-        }, ensure_ascii=False)]
+        text, first_ms, title = _dsh_v3_text(sid, session, cwd_val)
+        _dsh_write_text(os.path.join(session_dir, "session.v3.jsonl.zstd"), text)
 
-        seq = 0
-        for i, m in enumerate(session.messages):
-            ms = _iso_to_ms(m.created_at) if m.created_at else _now_ms()
-            if i == 0:
-                first_ms = ms
-            if m.role == "assistant":
-                content: list = []
-                if m.content:
-                    content.append({"type": "text", "text": m.content})
-                for tc in (m.tool_calls or []):
-                    content.append({
-                        "type": "tool-call",
-                        "id": tc.get("id") or "call_%d" % seq,
-                        "name": tc.get("name") or "",
-                        "arguments": tc.get("arguments") or "",
-                    })
-                seq += 1
-                lines.append(json.dumps({
-                    "type": "assistant/message", "seq": seq, "time": ms,
-                    "data": {
-                        "turn": 1, "step": seq,
-                        "message": {"role": "assistant", "content": content,
-                                    "source": {"kind": "model"}},
-                    },
-                }, ensure_ascii=False))
-            else:
-                seq += 1
-                lines.append(json.dumps({
-                    "type": "user/message", "seq": seq, "time": ms,
-                    "data": {
-                        "content": [{"type": "text", "text": m.content}],
-                        "role": m.role or "user", "id": str(uuid.uuid4()),
-                    },
-                    "surfaceOp": "append",
-                }, ensure_ascii=False))
-
-        title = session.title or "导入会话（来自 %s）" % session.source_tool
-        seq += 1
-        lines.append(json.dumps({
-            "type": "session/title", "seq": seq, "time": _now_ms(),
-            "data": {"title": title, "messageSeqs": [], "source": {"kind": "fallback"}},
-        }, ensure_ascii=False))
-
-        _dsh_write_text(os.path.join(session_dir, "session.v3.jsonl.zstd"),
-                        "\n".join(lines) + "\n")
-
-        _register_dsh_session(dsh_home, sid, workspace_dir, cwd or session.scope or "",
+        _register_dsh_session(dsh_home, sid, workspace_dir, cwd_val,
                               title, first_ms, _warn)
+        _dsh_sync_projcache(dsh_home, sid, first_ms, cwd_val, False, text, _warn)
         return sid
 
 
@@ -1209,7 +1406,11 @@ def migrate_session(source_tool: str, source_path: str,
         raise ValueError(f"不支持的源工具: {source_tool}")
 
     if not session.messages:
-        _warn("源会话未解析出任何消息（可能文件为空或格式不符），仍将写出空会话。")
+        # 空会话写入目标工具后，只会留下「有标题、无内容」的幽灵条目：DSH / CodeBuddy
+        # 的会话列表按索引展示，点开却什么都没有（实测 CodeBuddy 备份里就存在
+        # ``index.json`` 为 ``{"messages": [], "requests": []}`` 且无任何消息文件的空会话）。
+        # 导入一个不含任何信息的会话没有意义，直接跳过并把原因交给调用方展示。
+        raise ValueError("源会话没有任何消息（空会话），已跳过、未写入。")
 
     # ---------------- 写出 ----------------
     if target_tool == "reasonix":

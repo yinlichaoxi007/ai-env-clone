@@ -662,10 +662,19 @@ def validate_workspace_index(idx: dict) -> list[str]:
         if not isinstance(record, dict):
             problems.append("工作区记录 %s 不是对象" % wid)
             continue
+        # path/title/sessionIds/createdAt/updatedAt 是 DSH 存储边界的 zod 必填字段
+        # （workspaceRecord，均无默认值）。**任一条记录缺字段 ⇒ 整个 workspace 域
+        # 解析失败 ⇒ 桌面端一个工作区、一个会话都不显示**（连本机原有会话一起消失）。
         if not isinstance(record.get("path"), str):
             problems.append("工作区 %s 缺少 path" % wid)
+        if not isinstance(record.get("title"), str):
+            problems.append("工作区 %s 缺少 title" % wid)
         if not isinstance(record.get("sessionIds"), list):
             problems.append("工作区 %s 的 sessionIds 非数组" % wid)
+        if not isinstance(record.get("createdAt"), str):
+            problems.append("工作区 %s 缺少 createdAt（必填，缺失会导致 DSH 整库解析失败）" % wid)
+        if not isinstance(record.get("updatedAt"), str):
+            problems.append("工作区 %s 缺少 updatedAt（必填，缺失会导致 DSH 整库解析失败）" % wid)
         if wid not in order_set:
             problems.append("工作区 %s 未登记进 global.workspaceIds" % wid)
     return problems
@@ -911,7 +920,7 @@ def detect_incompatible_descriptors(dsh_home: str) -> list[str]:
 class RepairMutation:
     """一条索引修复动作（均为纯增量，绝不删除）。"""
 
-    action: str          # attach | create-workspace
+    action: str          # attach | create-workspace | fix-record
     session_id: str
     workspace_id: str
     path: str = ""       # create-workspace 时的新工作区 path
@@ -935,6 +944,8 @@ class RepairPlan:
         for m in self.mutations:
             if m.action == "create-workspace":
                 lines.append("补建工作区 %s（path=%s）并登记会话 %s" % (m.workspace_id, m.path, m.session_id))
+            elif m.action == "fix-record":
+                lines.append("补齐工作区记录 %s 的必填字段：%s" % (m.workspace_id, m.detail))
             else:
                 lines.append("把会话 %s 加入工作区 %s 的 sessionIds" % (m.session_id, m.workspace_id))
         for sid, reason in self.skipped:
@@ -960,6 +971,42 @@ def plan_workspace_index_repair(
         plan.skipped.append(("（全部）", "tables.workspaces 缺失，无法修复索引"))
         return plan, idx
     known = _collect_index_sessions(idx)
+
+    # 记录字段完整性：path/title/sessionIds/createdAt/updatedAt 是 DSH 存储边界的
+    # zod 必填字段（均无默认值），缺任一字段会让整个 workspace 域解析失败、桌面端
+    # 零工作区零会话可见。该修复与「未分组会话」无关，故独立于下面的会话遍历。
+    global_state = idx.get("global")
+    order = global_state.get("workspaceIds") if isinstance(global_state, dict) else None
+    order_set = set(order) if isinstance(order, list) else set()
+    for wid, record in workspaces.items():
+        if not isinstance(record, dict):
+            plan.mutations.append(
+                RepairMutation(
+                    action="fix-record", session_id="", workspace_id=wid,
+                    detail="记录不是对象，重建为最小合法记录",
+                )
+            )
+            continue
+        missing = []
+        if not isinstance(record.get("path"), str):
+            missing.append("path")
+        if not isinstance(record.get("title"), str):
+            missing.append("title")
+        if not isinstance(record.get("sessionIds"), list):
+            missing.append("sessionIds")
+        if not isinstance(record.get("createdAt"), str):
+            missing.append("createdAt")
+        if not isinstance(record.get("updatedAt"), str):
+            missing.append("updatedAt")
+        if wid not in order_set:
+            missing.append("global.workspaceIds 登记")
+        if missing:
+            plan.mutations.append(
+                RepairMutation(
+                    action="fix-record", session_id="", workspace_id=wid,
+                    detail="补齐 " + "、".join(missing),
+                )
+            )
 
     decompress, _compress, _name = zstd_backend() if decompress is None else (decompress, None, "")
 
@@ -1056,6 +1103,25 @@ def apply_workspace_index_repair(
     now = _now_iso()
     applied = 0
     for m in plan.mutations:
+        if m.action == "fix-record":
+            # 补齐记录必填字段（只增不改：已有合法值一律保留）
+            record = workspaces.get(m.workspace_id)
+            if not isinstance(record, dict):
+                record = workspaces[m.workspace_id] = {}
+            if not isinstance(record.get("path"), str):
+                record["path"] = ""
+            if not isinstance(record.get("title"), str):
+                record["title"] = os.path.basename(record["path"].rstrip("\\/")) or "workspace"
+            if not isinstance(record.get("sessionIds"), list):
+                record["sessionIds"] = []
+            if not isinstance(record.get("createdAt"), str):
+                record["createdAt"] = now
+            if not isinstance(record.get("updatedAt"), str):
+                record["updatedAt"] = now
+            if m.workspace_id not in global_state["workspaceIds"]:
+                global_state["workspaceIds"].append(m.workspace_id)
+            applied += 1
+            continue
         if m.action == "create-workspace":
             if m.workspace_id not in workspaces:
                 workspaces[m.workspace_id] = {
