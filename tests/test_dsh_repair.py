@@ -1472,5 +1472,108 @@ class TestCliRepairData(unittest.TestCase):
         self.assertIn("dry-run", out)
 
 
+class TestStaleProjcache(unittest.TestCase):
+    """投影缓存陈旧检测与修复：只认「结论与日志矛盾」，修复 = 移走记录。
+
+    背景：DSH 侧边栏对冷会话只读 ``storages/session_projcache/sessions/<sid>.json``；
+    其 ``identity`` 只绑 header 不变字段——日志被带外改写而 header 不变时旧记录
+    继续被采信（``blank`` 仍为 true → 侧边栏隐藏；``title`` 仍旧 → 标题错）。
+    判据不认 ``seq`` 落后（检查点本就常落在会话中途）。修复 = 把记录改名移走，
+    由 DSH 冷读时按最新日志重算，**绝不就地重写缓存值**。
+    """
+
+    def setUp(self):
+        _enable_fake_zstd(compress=lambda b: b)
+        self.addCleanup(_disable_fake_zstd)
+        self.fx = _FakeDshHome()
+        self.addCleanup(self.fx.cleanup)
+        # 会话已登记进工作区（可见性前提：只有已登记会话的缓存才影响侧边栏）
+        self.fx.write_index(_make_ws_index({
+            "ws-a": {"path": "D:\\project\\a", "title": "a", "sessionIds": ["session-x"],
+                     "createdAt": "t1", "updatedAt": "t1"},
+        }))
+        self.cache_dir = os.path.join(
+            self.fx.dsh, "storages", "session_projcache", "sessions"
+        )
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+    def _session(self, sid="session-x", *, turn=True, title="新标题"):
+        lines = [json.dumps({"type": "session", "version": 0, "id": sid, "createdAt": 1,
+                             "cwd": "D:\\project\\a", "delegationDepth": 0})]
+        if turn:
+            lines.append(json.dumps({"type": "turn/start", "seq": 1, "data": {"turn": 1}}))
+        if title is not None:
+            lines.append(json.dumps({"type": "session/title", "seq": 2,
+                                     "data": {"title": title}}))
+        self.fx.session("--D-project-a--", sid, ("\n".join(lines) + "\n").encode("utf-8"))
+
+    def _cache(self, sid="session-x", *, blank, title, seq=3):
+        doc = {"version": 7, "record": {"identity": {}, "rows": {
+            "title": {"ver": 1, "seq": seq, "val": title},
+            "sessionListMetadata": {"ver": 1, "seq": seq,
+                                    "val": {"blank": blank, "lastPromptAt": None}},
+        }}}
+        path = os.path.join(self.cache_dir, sid + ".json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        return path
+
+    def _detect(self):
+        return dr.detect_stale_projcache(self.fx.dsh, decompress=lambda b: b)
+
+    def test_blank_cache_but_log_has_turn_is_stale_and_hidden(self):
+        self._session(turn=True, title="新标题")
+        self._cache(blank=True, title="新标题")
+        stale = self._detect()
+        self.assertEqual([s.session_id for s in stale], ["session-x"])
+        self.assertTrue(stale[0].hidden)
+        # 检测链路（DetectResult）同步暴露，且不再判健康
+        result = dr.detect_ungrouped(self.fx.dsh, decompress=lambda b: b)
+        self.assertEqual([s.session_id for s in result.projcache_stale], ["session-x"])
+        self.assertFalse(result.healthy)
+        self.assertIn("投影缓存陈旧", "\n".join(result.summary_lines()))
+
+    def test_title_mismatch_is_stale_but_not_hidden(self):
+        self._session(turn=True, title="新标题")
+        self._cache(blank=False, title="旧标题")
+        stale = self._detect()
+        self.assertEqual(len(stale), 1)
+        self.assertFalse(stale[0].hidden)
+
+    def test_fresh_cache_not_flagged(self):
+        self._session(turn=True, title="新标题")
+        self._cache(blank=False, title="新标题")
+        self.assertEqual(self._detect(), [])
+
+    def test_genuinely_blank_session_not_flagged(self):
+        # 无 turn/start 且无标题：缓存 blank:true 与日志一致，不算陈旧
+        self._session(turn=False, title=None)
+        self._cache(blank=True, title=None)
+        self.assertEqual(self._detect(), [])
+
+    def test_no_cache_record_not_flagged(self):
+        self._session(turn=True, title="新标题")
+        self.assertEqual(self._detect(), [])
+
+    def test_plan_includes_and_apply_moves_with_backup(self):
+        self._session(turn=True, title="新标题")
+        cache_fp = self._cache(blank=True, title="新标题")
+        plan = dr.plan_dsh_repair(self.fx.dsh)
+        self.assertEqual([s.session_id for s in plan.projcache_stale], ["session-x"])
+        self.assertFalse(plan.empty)  # empty 必须把陈旧缓存计入
+        self.assertIn("移走陈旧投影缓存", "\n".join(plan.describe()))
+
+        outcome = dr.apply_dsh_repair(self.fx.dsh, plan)
+        self.assertEqual([p["ok"] for p in outcome["projcache"]], [True])
+        # 原记录被移走（不是重写），备份保留且内容一致
+        self.assertFalse(os.path.isfile(cache_fp))
+        backup = outcome["projcache"][0]["backup"]
+        self.assertTrue(os.path.isfile(backup))
+        with open(backup, "r", encoding="utf-8") as fh:
+            self.assertTrue(json.load(fh)["record"]["rows"]["sessionListMetadata"]["val"]["blank"])
+        # 幂等：移走后不再检出，计划为空
+        self.assertTrue(dr.plan_dsh_repair(self.fx.dsh).empty)
+
+
 if __name__ == "__main__":
     unittest.main()

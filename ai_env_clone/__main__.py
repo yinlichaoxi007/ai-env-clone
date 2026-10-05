@@ -892,7 +892,7 @@ class QoderBackupApp:
         )
         self.dsh_check_btn.pack(side=tk.LEFT)
         self.dsh_fix_btn = ttk.Button(
-            health_row, text="修复未分组会话", command=self._dsh_fix, width=16
+            health_row, text="修复会话数据", command=self._dsh_fix, width=16
         )
         self.dsh_fix_btn.pack(side=tk.LEFT, padx=(6, 0))
         # 「修复重复调用 ID」与检测/修复按钮平级，但默认不勾选：它是有语义改动的
@@ -907,16 +907,16 @@ class QoderBackupApp:
         # 末位说明被挤出可视区。独立成行后独占宽度、按宽度自动折行。
         dsh_hint = ttk.Label(
             self.dsh_health_frame,
-            text="检测 DSH 会话是否「未分组」（磁盘存在但索引未登记）或属旧格式无法加载"
-            "（扁平 replayState / 同一步重复调用 ID）",
+            text="检测 DSH 会话是否「未分组」（磁盘存在但索引未登记）、属旧格式无法加载"
+            "（扁平 replayState / 同一步重复调用 ID），或因投影缓存过期而在侧边栏看不到 / 标题错",
             foreground="#666", anchor="w", justify="left", wraplength=760,
         )
         dsh_hint.pack(fill=tk.X, pady=(4, 0))
         self._hint_labels.append(dsh_hint)
         # 默认隐藏；选中 dsh 工具时由 _update_dsh_health_visibility 显示
-        # 是否已检测且存在未分组会话：None=未检测、True/False=已检测结论，
-        # 供修复按钮置灰判断（无未分组会话时禁用，避免无谓点击）。
-        self._dsh_has_ungrouped = None
+        # 是否已检测且存在可修复项（未分组会话 / 陈旧投影缓存）：None=未检测、
+        # True/False=已检测结论，供修复按钮置灰判断（无任何可修项时禁用）。
+        self._dsh_has_fixable = None
         self.dsh_health_frame.pack_forget()
 
         # Qoder 历史诊断行：仅选中 qoder 时显示。新版 Qoder CN 已改为独立桌面端
@@ -2592,11 +2592,12 @@ class QoderBackupApp:
         self._set_status("Qoder 历史会话诊断完成")
 
     def _set_dsh_buttons_state(self) -> None:
-        """数据目录有效时启用检测按钮；修复按钮另需「存在未分组会话」才启用。
+        """数据目录有效时启用检测按钮；修复按钮另需「存在可修复项」才启用。
 
-        修复按钮置灰规则：目录无效 → 禁用；已检测且明确无未分组会话
-        （``_dsh_has_ungrouped is False``）→ 禁用；其余（未检测 / 有无分组）
-        → 可用，避免用户点击后被告知「无需修复」造成困惑。
+        修复按钮置灰规则：目录无效 → 禁用；已检测且明确无任何可修项
+        （``_dsh_has_fixable is False``，即既无未分组会话也无陈旧投影缓存）
+        → 禁用；其余（未检测 / 有可修项）→ 可用，避免用户点击后被告知
+        「无需修复」造成困惑。
         """
         ok = os.path.isdir(self.root_dir)
         check_w = getattr(self, "dsh_check_btn", None)
@@ -2607,15 +2608,15 @@ class QoderBackupApp:
                 pass
         fix_w = getattr(self, "dsh_fix_btn", None)
         if fix_w is not None:
-            has_ungrouped = getattr(self, "_dsh_has_ungrouped", None)
-            fix_ok = ok and (has_ungrouped is not False)
+            has_fixable = getattr(self, "_dsh_has_fixable", None)
+            fix_ok = ok and (has_fixable is not False)
             try:
                 fix_w.configure(state="normal" if fix_ok else "disabled")
             except tk.TclError:
                 pass
 
     def _dsh_check(self) -> None:
-        """检测 DSH 会话健康：未分组会话 / 索引问题 / 旧格式 replayState / 重复调用 ID。"""
+        """检测 DSH 会话健康：未分组 / 索引问题 / 旧格式 replayState / 重复调用 ID / 陈旧投影缓存。"""
         if self.busy:
             messagebox.showwarning("请稍候", "当前有任务正在执行。")
             return
@@ -2682,7 +2683,7 @@ class QoderBackupApp:
         top.wait_window(top)
 
     def _dsh_fix(self) -> None:
-        """修复：workspace 索引归属 + 会话文件内容（勾选时含重复调用 ID 去重）。
+        """修复会话数据：workspace 索引归属 + 会话文件内容 + 移走陈旧投影缓存。
 
         流程：后台生成联合修复计划（dry-run）→ 主线程确认 → 备份并写盘 → 复检。
         """
@@ -2714,8 +2715,10 @@ class QoderBackupApp:
             self.dsh_zstd_install_btn.pack(fill=tk.X, pady=(4, 0))
         else:
             self.dsh_zstd_install_btn.pack_forget()
-        # 记录未分组结论并据此置灰修复按钮（无未分组会话时禁用，避免无谓点击）
-        self._dsh_has_ungrouped = bool(getattr(result, "ungrouped", []))
+        # 记录「是否还有可修项」（未分组会话 / 陈旧投影缓存）并据此置灰修复按钮
+        self._dsh_has_fixable = bool(getattr(result, "ungrouped", [])) or bool(
+            getattr(result, "projcache_stale", [])
+        )
         self._set_dsh_buttons_state()
         self._fit_layout()
         self._set_status("DSH 会话健康检测完成")
@@ -2728,6 +2731,7 @@ class QoderBackupApp:
                 + len(result.legacy_replay_sessions)
                 + len(result.dup_id_sessions)
                 + len(result.descriptor_bad_sessions)
+                + len(getattr(result, "projcache_stale", []))
             )
         self._show_plain_report_dialog(title, text)
 
@@ -2806,6 +2810,7 @@ class QoderBackupApp:
             lines.extend("- 跳过 %s：%s" % (sid, reason) for sid, reason in plan.index_plan.skipped)
             if not plan.data_reports:
                 lines.append("会话文件内容无需修复。")
+            lines.append("投影缓存无陈旧记录。")
             if plan.zstd_note:
                 lines.append(plan.zstd_note)
             self._set_status("无需修复")
@@ -2827,12 +2832,25 @@ class QoderBackupApp:
                 "② 会话文件内容修复（写盘前逐个备份 <文件>.bak.<UTC>）：\n"
                 + "\n".join(rows)
             )
+        if plan.projcache_stale:
+            parts.append(
+                "③ 移走陈旧投影缓存（不重写缓存值，由 DSH 冷读时按最新日志重算，"
+                "原记录备份为 <sid>.json.bak-<时间戳>）：\n"
+                + "\n".join(
+                    "   - %s：%s" % (stale.session_id, stale.reason)
+                    for stale in plan.projcache_stale
+                )
+            )
         note = ""
         if not fix_dup_ids:
             note = "\n\n注：未勾选「同时修复重复调用 ID」，其内容将保持原样（需要时可勾选后重跑）。"
         elif plan.zstd_note:
             note = "\n\n注：%s" % plan.zstd_note
-        total = len(plan.index_plan.mutations) + len(plan.data_reports)
+        total = (
+            len(plan.index_plan.mutations)
+            + len(plan.data_reports)
+            + len(plan.projcache_stale)
+        )
         text = "将执行以下修复：\n\n" + "\n\n".join(parts) + "\n\n共 %d 项。是否继续？" % total + note
         if not messagebox.askyesno("确认修复 DSH 会话数据", text):
             self._set_status("已取消修复")
@@ -2845,13 +2863,25 @@ class QoderBackupApp:
             outcome = apply_dsh_repair(dsh_home, plan, fix_dup_ids=fix_dup_ids, backup=True)
             index_res = outcome["index"]
             file_reports = outcome["files"]
+            projcache = outcome.get("projcache") or []
             backups = [r["backup"] for r in file_reports if r["backup"]]
-            ok = index_res.ok and all(r["status"] != "拒绝" for r in file_reports)
+            ok = (
+                index_res.ok
+                and all(r["status"] != "拒绝" for r in file_reports)
+                and all(p["ok"] for p in projcache)
+            )
             lines = []
             if index_res.applied:
                 lines.append(
                     "索引归属修复 %d 处%s。"
                     % (index_res.applied, "；备份：%s" % index_res.backup_path if index_res.backup_path else "")
+                )
+            if projcache:
+                moved = [p for p in projcache if p["ok"]]
+                lines.append(
+                    "移走陈旧投影缓存 %d 个，备份：%s"
+                    % (len(moved),
+                       "、".join(os.path.basename(p["backup"]) for p in moved) or "（未生成）")
                 )
             if file_reports:
                 fixed = [r for r in file_reports if r["status"] == "已修复"]

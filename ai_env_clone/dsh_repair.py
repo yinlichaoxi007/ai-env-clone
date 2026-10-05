@@ -29,6 +29,17 @@ DSH 旧会话数据「未分组 / 无法加载」检测与修复（纯标准库�
    拒绝（``SessionFormatUnsupportedMigrationError``），会话无法加载；修复
    需要理解子代理描述符 v2→v3 的官方契约，本工具仅检测并如实标记。
 
+4. **投影缓存陈旧（会导致侧边栏看不到 / 标题错）**：DSH 侧边栏对**冷会话**只读
+   ``storages/session_projcache/sessions/<sid>.json`` 的投影；该记录的
+   ``identity`` 只绑 header 的**不变字段**——日志被带外改写而 header 不变时，
+   旧记录继续被采信，于是 ``sessionListMetadata.blank`` 仍为 true（隐藏）或
+   ``title`` 仍是旧值。检测判据只认「缓存结论与日志矛盾」（日志含 ``turn/start``
+   而缓存标 blank；缓存标题与日志不一致），不认 ``seq`` 落后（检查点本就常落在
+   会话中途）。修复 = **把陈旧记录移出**（同目录改名为 ``.bak-<ts>``），由 DSH
+   冷读时自行重算——依据官方 ``session-projection-cache`` spec：陈旧/不可读的
+   缓存「只是多一次尾部重放，绝不给出错误值」，无缓存则 ``blank`` 默认 false
+   故会话可见。**绝不就地重写缓存值**。
+
 zstd 说明：会话日志是 Zstandard 压缩的 JSONL，Python 标准库**没有** zstd。
 本模块按需探测可用后端（``zstandard`` / ``pyzstd`` / 系统 ``zstd`` 命令），
 没有则自动降级为「仅目录级检测」（不读文件内容）；修复仍可完成
@@ -42,7 +53,7 @@ zstd 说明：会话日志是 Zstandard 压缩的 JSONL，Python 标准库**没�
     python -m ai_env_clone.dsh_repair fix  [--dsh-home PATH] [--apply] [--no-backup]
 
 GUI：在主界面选择「DeepSeek Harness」后，数据目录区域会出现
-「检测会话健康」与「修复未分组会话」两个按钮（见 ``__main__.py``）。
+「检测会话健康」与「修复会话数据」两个按钮（见 ``__main__.py``）。
 """
 
 from __future__ import annotations
@@ -73,6 +84,8 @@ __all__ = [
     "validate_workspace_index",
     "detect_ungrouped",
     "detect_legacy_replay_state",
+    "StaleProjcache",
+    "detect_stale_projcache",
     "plan_workspace_index_repair",
     "apply_workspace_index_repair",
     "zstd_backend",
@@ -708,18 +721,20 @@ class DetectResult:
     legacy_replay_sessions: list[str] = field(default_factory=list)
     dup_id_sessions: list[str] = field(default_factory=list)  # 含同 step 重复 tool-call id 的会话
     descriptor_bad_sessions: list[str] = field(default_factory=list)  # 子代理描述符版本不受官方迁移支持、无法加载的会话
+    projcache_stale: list = field(default_factory=list)  # 投影缓存结论与日志矛盾的记录（StaleProjcache）
     zstd_name: str = ""
     zstd_missing: bool = False
 
     @property
     def healthy(self) -> bool:
-        """无未分组、索引无问题、无旧格式 / 重复调用 id / 描述符不兼容会话。"""
+        """无未分组、索引无问题、无旧格式 / 重复调用 id / 描述符不兼容 / 投影缓存陈旧。"""
         return (
             not self.ungrouped
             and not self.index_problems
             and not self.legacy_replay_sessions
             and not self.dup_id_sessions
             and not self.descriptor_bad_sessions
+            and not self.projcache_stale
         )
 
     def summary_lines(self) -> list[str]:
@@ -757,6 +772,13 @@ class DetectResult:
                 "子代理描述符不兼容会话（subagent/descriptor 版本不受官方迁移支持，无法加载）：%d 个%s，"
                 "本工具暂不自动修复，已原样保留"
                 % (len(self.descriptor_bad_sessions), same)
+            )
+        if self.projcache_stale:
+            hidden = sum(1 for s in self.projcache_stale if s.hidden)
+            lines.append(
+                "投影缓存陈旧会话：%d 个（其中 %d 个会被侧边栏隐藏；修复＝移走陈旧缓存，"
+                "由 DSH 冷读时按最新日志重算）"
+                % (len(self.projcache_stale), hidden)
             )
         if self.zstd_missing:
             lines.append(
@@ -825,6 +847,9 @@ def detect_ungrouped(
 
     sessions = scan_sessions(home)
     result.sessions_total = len(sessions)
+    # 投影缓存陈旧与索引无关：索引缺失（早退分支）时同样要报出来
+    if decompress and with_content_check:
+        result.projcache_stale = detect_stale_projcache(home, decompress=decompress, sessions=sessions)
 
     idx = load_workspace_index(home)
     if idx is None:
@@ -910,6 +935,132 @@ def detect_incompatible_descriptors(dsh_home: str) -> list[str]:
     for session in scan_sessions(home):
         if _scan_file_content(session.log_file, decompress)[2]:
             out.append(session.session_id)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 投影缓存陈旧检测（结论与日志矛盾）
+#
+# 判据只认「缓存结论与日志矛盾」，**不认** seq 落后：DSH 的正常检查点常落在
+# 会话中途，`sessionListMetadata.seq` 偏低是常态，据此判定会大面积误报。
+#   a) 日志含 `turn/start`，缓存却标 `blank: true`  ⇒ 侧边栏会隐藏该会话；
+#   b) 缓存 `title` 与日志推导出的标题不一致           ⇒ 界面显示旧标题 / 未命名。
+# 缓存 `identity` 与日志不符时该记录本就被 DSH 读作「不存在」（会话仍可见），
+# 不算可见性故障，故不处理。
+# --------------------------------------------------------------------------- #
+@dataclass
+class StaleProjcache:
+    """一条「结论与日志矛盾」的投影缓存记录。"""
+
+    session_id: str
+    path: str          # 陈旧的缓存记录文件 <sid>.json
+    reason: str
+    hidden: bool = False  # True：会使侧边栏隐藏该会话（blank 判据）
+
+
+def _projcache_dir(dsh_home: str) -> str:
+    """投影缓存记录目录：``<root>/storages/session_projcache/sessions``。"""
+    return os.path.join(
+        resolve_dsh_home(dsh_home), "storages", "session_projcache", "sessions"
+    )
+
+
+def _session_log_projection(
+    log_file: str, decompress: "Callable[[bytes], bytes] | None"
+) -> "tuple[bool, str | None] | None":
+    """从日志推导投影事实 ``(是否含 turn/start, 标题)``；日志不可读时返回 None。
+
+    返回 None 表示「判不了」——调用方必须据此跳过该会话，绝不据此判陈旧。
+    """
+    try:
+        text = _read_log_text(log_file, decompress)
+    except Exception:  # 缺 zstd / 帧损坏等：判不了，跳过
+        return None
+    has_turn = False
+    title = None
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        etype = event.get("type")
+        if etype == "turn/start":
+            has_turn = True
+        elif etype == "session/title":
+            title = (event.get("data") or {}).get("title")
+    return has_turn, title
+
+
+def _stale_projcache_reason(
+    record, has_turn: bool, title: "str | None"
+) -> "tuple[str, bool]":
+    """判断缓存记录是否与日志矛盾，返回 ``(原因, 是否隐藏会话)``；不矛盾返回 ``("", False)``。"""
+    rows = record.get("rows") if isinstance(record, dict) else None
+    if not isinstance(rows, dict):
+        return "", False
+    meta = rows.get("sessionListMetadata")
+    cached_blank = False
+    if isinstance(meta, dict) and isinstance(meta.get("val"), dict):
+        cached_blank = bool(meta["val"].get("blank"))
+    if has_turn and cached_blank:
+        return "缓存标记为空会话，但日志含 turn/start（侧边栏会隐藏该会话）", True
+    if title is not None:
+        title_row = rows.get("title")
+        cached_title = title_row.get("val") if isinstance(title_row, dict) else None
+        if cached_title != title:
+            return (
+                "缓存标题 %r 与日志 %r 不一致（界面显示旧标题或未命名）"
+                % (cached_title, title),
+                False,
+            )
+    return "", False
+
+
+def detect_stale_projcache(
+    dsh_home: str,
+    decompress: "Callable[[bytes], bytes] | None" = None,
+    sessions: "list[SessionOnDisk] | None" = None,
+) -> list[StaleProjcache]:
+    """检测「结论与日志矛盾」的投影缓存记录（只读，不写盘）。
+
+    :param sessions: 预扫的会话列表（避免重复扫盘）；``None`` 则自行扫描。
+    :return: 陈旧记录列表；无 zstd 后端或日志不可读者一律跳过（不误报）。
+    """
+    home = resolve_dsh_home(dsh_home)
+    if decompress is None:
+        decompress, _compress, _name = zstd_backend()
+    if decompress is None:
+        return []
+    cache_dir = _projcache_dir(home)
+    if not os.path.isdir(_longpath(cache_dir)):
+        return []
+    out: list[StaleProjcache] = []
+    for session in scan_sessions(home) if sessions is None else sessions:
+        cache_fp = os.path.join(cache_dir, session.session_id + ".json")
+        if not os.path.isfile(_longpath(cache_fp)):
+            continue
+        try:
+            with open(_longpath(cache_fp), "r", encoding="utf-8-sig") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            continue  # 读不出就当「无缓存」（DSH 亦然），不判定
+        record = doc.get("record") if isinstance(doc, dict) else None
+        facts = _session_log_projection(session.log_file, decompress)
+        if facts is None:
+            continue
+        reason, hidden = _stale_projcache_reason(record, facts[0], facts[1])
+        if not reason:
+            continue
+        out.append(
+            StaleProjcache(
+                session_id=session.session_id, path=cache_fp, reason=reason, hidden=hidden
+            )
+        )
     return out
 
 
@@ -2036,17 +2187,24 @@ class DshRepairPlan:
     index_plan: RepairPlan = field(default_factory=RepairPlan)  # workspace.json 索引
     index_idx: "dict | None" = None                              # 读入的索引
     data_reports: list[dict] = field(default_factory=list)       # 需修的会话文件报告
+    projcache_stale: list[StaleProjcache] = field(default_factory=list)  # 需移走的陈旧投影缓存
     zstd_note: str = ""                                           # zstd 不可用时的说明
 
     @property
     def empty(self) -> bool:
-        return not self.index_plan.mutations and not self.data_reports
+        return (
+            not self.index_plan.mutations
+            and not self.data_reports
+            and not self.projcache_stale
+        )
 
     def describe(self) -> list[str]:
         lines = self.index_plan.describe()
         for report in self.data_reports:
             rules = "、".join("%s×%d" % (a["rule"], a["count"]) for a in report["actions"])
             lines.append("修复会话文件 %s：%s" % (report["file"], rules))
+        for stale in self.projcache_stale:
+            lines.append("移走陈旧投影缓存 %s：%s" % (stale.session_id, stale.reason))
         return lines
 
 
@@ -2054,7 +2212,8 @@ def plan_dsh_repair(dsh_home: str, fix_dup_ids: bool = False) -> DshRepairPlan:
     """生成联合修复计划（不写盘）。
 
     范围：① workspace.json 索引归属修复；② 会话文件内容（默认只把扁平
-    ``replayState`` 升级为信封；``fix_dup_ids=True`` 才连重复 tool-call id 一起修）。
+    ``replayState`` 升级为信封；``fix_dup_ids=True`` 才连重复 tool-call id 一起修）；
+    ③ 移走结论与日志矛盾的陈旧投影缓存记录。
     """
     home = resolve_dsh_home(dsh_home)
     index_plan, index_idx = plan_workspace_index_repair(home)
@@ -2066,6 +2225,7 @@ def plan_dsh_repair(dsh_home: str, fix_dup_ids: bool = False) -> DshRepairPlan:
     plan.data_reports = [
         r for r in summary["results"] if r["status"] in ("需要修复", "已修复")
     ]
+    plan.projcache_stale = detect_stale_projcache(home, decompress=decompress)
     if not decompress:
         plan.zstd_note = (
             "缺少 zstd 解压支持（%s）：zstd 会话文件内容无法检测/修复，仅处理了明文 JSONL"
@@ -2076,15 +2236,31 @@ def plan_dsh_repair(dsh_home: str, fix_dup_ids: bool = False) -> DshRepairPlan:
     return plan
 
 
+def _move_stale_projcache(stale: StaleProjcache) -> dict:
+    """把一条陈旧投影缓存记录改名移走（同目录 ``<sid>.json.bak-<ts>``）。
+
+    不写值、不删除：DSH 冷读时按最新日志自行重算；``.bak-`` 文件不匹配
+    ``<sid>.json``，不会被 DSH 读作记录。失败不抛出，交由调用方汇总上报。
+    """
+    stamp = _now_iso().replace(":", "").replace(".", "-")
+    backup = "%s.bak-%s" % (stale.path, stamp)
+    try:
+        os.replace(_longpath(stale.path), _longpath(backup))
+    except OSError as exc:
+        return {"session_id": stale.session_id, "ok": False, "backup": "", "error": str(exc)}
+    return {"session_id": stale.session_id, "ok": True, "backup": backup, "error": ""}
+
+
 def apply_dsh_repair(
     dsh_home: str,
     plan: DshRepairPlan,
     fix_dup_ids: bool = False,
     backup: bool = True,
 ) -> dict:
-    """执行联合修复：先修会话文件内容，再修 workspace 索引（各自自动备份）。
+    """执行联合修复：先修会话文件内容，再移走陈旧投影缓存，最后修 workspace 索引。
 
-    :return: ``{"files": [每个文件的修复报告], "index": ApplyResult}``。
+    :return: ``{"files": [每个文件的修复报告], "projcache": [每条缓存的移走结果],
+        "index": ApplyResult}``。
     """
     home = resolve_dsh_home(dsh_home)
     results: list[dict] = []
@@ -2092,10 +2268,11 @@ def apply_dsh_repair(
         file = report.get("file")
         if file:
             results.append(repair_session_file(file, apply=True, fix_dup_ids=fix_dup_ids))
+    projcache = [_move_stale_projcache(stale) for stale in plan.projcache_stale]
     index_result = apply_workspace_index_repair(
         home, plan.index_plan, dry_run=False, backup=backup, idx=plan.index_idx
     )
-    return {"files": results, "index": index_result}
+    return {"files": results, "projcache": projcache, "index": index_result}
 
 
 # --------------------------------------------------------------------------- #
@@ -2104,11 +2281,11 @@ def apply_dsh_repair(
 def _print_plan(plan) -> None:
     """打印修复计划（支持索引计划与联合计划）。"""
     if isinstance(plan, DshRepairPlan):
-        if not plan.index_plan.mutations and not plan.data_reports:
+        if plan.empty:
             if plan.zstd_note:
-                print("未分组会话无可自动修复项；会话文件内容检测未执行（%s）。" % plan.zstd_note)
+                print("无可自动修复项；会话文件内容检测未执行（%s）。" % plan.zstd_note)
             else:
-                print("无需修复：未发现可自动归属的未分组会话，会话文件内容也无需修复。")
+                print("无需修复：未发现可自动归属的未分组会话，会话文件内容与投影缓存也无需修复。")
             for sid, reason in plan.index_plan.skipped:
                 print("  - 跳过 %s：%s" % (sid, reason))
             return
@@ -2132,9 +2309,9 @@ def main(argv: "list[str] | None" = None) -> int:
     """命令行入口：``scan`` / ``plan`` / ``fix`` / ``repair-data``。
 
     - ``scan``：检测并输出摘要（``--json`` 输出结构化结果）。
-    - ``plan``：输出将执行的索引修复动作（不写盘）。
-    - ``fix``：执行索引修复；默认 dry-run，加 ``--apply`` 才写盘
-      （写盘前自动备份原文件，``--no-backup`` 可关）。
+    - ``plan``：输出将执行的修复动作（索引归属 / 会话文件内容 / 陈旧投影缓存）。
+    - ``fix``：执行索引与会话文件修复，并移走陈旧投影缓存；默认 dry-run，
+      加 ``--apply`` 才写盘（写盘前自动备份原文件，``--no-backup`` 可关）。
     - ``repair-data <文件或目录>``：检测/修复会话文件内容（扁平 replayState
       升级为信封，可选重复 tool-call id 去重）；默认 dry-run，加 ``--apply`` 写盘
       并自动备份。
@@ -2231,6 +2408,14 @@ def main(argv: "list[str] | None" = None) -> int:
                         "legacy_replay_sessions": result.legacy_replay_sessions,
                         "dup_id_sessions": result.dup_id_sessions,
                         "descriptor_bad_sessions": result.descriptor_bad_sessions,
+                        "projcache_stale": [
+                            {
+                                "session_id": s.session_id,
+                                "reason": s.reason,
+                                "hidden": s.hidden,
+                            }
+                            for s in result.projcache_stale
+                        ],
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -2267,6 +2452,11 @@ def main(argv: "list[str] | None" = None) -> int:
             "索引修复 %d 处；备份：%s"
             % (index_result.applied, index_result.backup_path or "（未生成）")
         )
+    for item in outcome["projcache"]:
+        if item["ok"]:
+            print("移走陈旧投影缓存 %s；备份：%s" % (item["session_id"], item["backup"]))
+        else:
+            print("移走陈旧投影缓存 %s 失败：%s" % (item["session_id"], item["error"]))
     for report in outcome["files"]:
         if report["status"] not in ("已修复", "拒绝"):
             continue
@@ -2278,7 +2468,9 @@ def main(argv: "list[str] | None" = None) -> int:
             print("      %s（%d 处）：%s" % (action["rule"], action["count"], action["detail"]))
         for problem in report["problems"]:
             print("      问题：%s" % problem["detail"])
-    if any(r["status"] == "拒绝" for r in outcome["files"]):
+    if any(r["status"] == "拒绝" for r in outcome["files"]) or any(
+        not item["ok"] for item in outcome["projcache"]
+    ):
         return 1
     return 0
 

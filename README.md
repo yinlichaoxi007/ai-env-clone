@@ -332,11 +332,13 @@ from ai_env_clone.core import export_backup, import_backup
   - 索引结构问题（如 `workspaceIds` 引用不存在的记录）；
   - 旧格式（扁平 `replayState`）会话数量；
   - 含同一步重复 tool-call id 的会话数量；
-  - 子代理描述符不兼容会话数量（`subagent/descriptor` 的 `version` 不是官方迁移要求的 3，会话无法加载）——**只检测标记，暂不自动修复**。
+  - 子代理描述符不兼容会话数量（`subagent/descriptor` 的 `version` 不是官方迁移要求的 3，会话无法加载）——**只检测标记，暂不自动修复**；
+  - **投影缓存陈旧**会话数量（缓存结论与日志矛盾：日志含 `turn/start` 而缓存标 `blank: true` 会让侧边栏隐藏该会话；缓存 `title` 与日志不一致会显示旧标题 / 未命名）。
 - **「同时修复重复调用 ID（会改写数据）」**：复选框，**默认不勾选**。勾选后修复流程才会处理重复 tool-call id（有语义改动，id 会被加 `#2`/`#3` 后缀）；不勾选则只做 replayState 信封升级与索引归属。
-- **「修复未分组会话」**：先展示将执行的修改清单（dry-run）并请你确认，确认后**逐个自动备份**再增量写盘：
+- **「修复会话数据」**：先展示将执行的修改清单（dry-run）并请你确认，确认后**逐个自动备份**再增量写盘：
   - 索引：按会话 header 的 `cwd`（无 zstd 时按项目目录名 `projectKey` 匹配）把会话 id 补进对应工作区记录的 `sessionIds`（置顶，与 DSH 官方 `attachSession` 语义一致）；目录存在但没有工作区记录的，**补建工作区记录**并登记进 `global.workspaceIds`（等价 DSH 官方 `workspaceRegistry.bootstrap` 的离线版）；`workspace.json` 备份为 `workspace.json.bak-<utc>`；
   - 会话文件：把扁平 `replayState` **双侧同值**升级为 `{response, blocks}` 信封后写回（同一事件的 `message.source` 与内嵌 stream finish 块升级为同一个信封，保证镜像一致；max-tokens 剪枝场景跳过并上报），文件备份为 `<原文件>.bak.<UTC>`；**只重压缩命中的帧，其余帧保持原字节**，尾部不完整的帧（torn tail）原样保留；勾选复选框时一并去重重复的 tool-call id；
+  - 投影缓存：把**结论与日志矛盾**的陈旧记录（日志含 `turn/start` 而缓存标 `blank`，或标题不一致）改名移走为 `<sid>.json.bak-<时间戳>`，**不重写缓存值**，由 DSH 冷读时按最新日志重算——依据官方 `session-projection-cache` spec：陈旧 / 不可读的缓存「只是多一次尾部重放，绝不给出错误值」，无缓存则 `blank` 默认 false、会话照常可见；
   - **绝不删除任何条目**，`archivedSessionIds` 不动；修复幂等（重复执行不产生新命中）；修改后自动复检。
 
 同一功能也可作为**自动化脚本**在命令行使用（默认 dry-run，`--apply` 才写盘）：
@@ -794,11 +796,13 @@ When **DeepSeek Harness** is selected in the dropdown, the data-directory area s
   - index structure problems (e.g. `workspaceIds` referencing missing records);
   - number of legacy flat-`replayState` sessions;
   - number of sessions with duplicate tool-call ids inside one step;
-  - number of sessions with an incompatible subagent descriptor (`subagent/descriptor` whose `version` is not the officially required 3, so the session cannot be loaded) — **detected and flagged only; not auto-repaired**.
+  - number of sessions with an incompatible subagent descriptor (`subagent/descriptor` whose `version` is not the officially required 3, so the session cannot be loaded) — **detected and flagged only; not auto-repaired**;
+  - number of sessions with a **stale projection cache** (the cache contradicts the log: the log has `turn/start` but the cache marks `blank: true`, which hides the session from the sidebar; or the cached `title` disagrees with the log).
 - **「同时修复重复调用 ID（会改写数据）」(also fix duplicate call ids)**: a checkbox, **unchecked by default**. Only when checked does the repair flow touch duplicate tool-call ids (a semantic change — ids get `#2` / `#3` suffixes); unchecked, only the replayState envelope upgrade and the index are repaired.
-- **「修复未分组会话」(fix ungrouped sessions)**: first shows the exact changes as a dry-run for confirmation, then **backs up each file individually** and writes incrementally:
+- **「修复会话数据」(repair session data)**: first shows the exact changes as a dry-run for confirmation, then **backs up each file individually** and writes incrementally:
   - index: matches each session's header `cwd` (or, without zstd, its `projectKey` directory name) and prepends the session id to that workspace record's `sessionIds` (same semantics as DSH's official `attachSession`); when a directory exists but no workspace record does, **creates the record** and registers it in `global.workspaceIds` (an offline equivalent of DSH's `workspaceRegistry.bootstrap`); `workspace.json` is backed up as `workspace.json.bak-<utc>`;
   - session files: upgrades flat `replayState` into the `{response, blocks}` envelope with **the same value on both sides** (within one event, `message.source` and the embedded stream's finish chunk become the same envelope, keeping the mirror consistent; the max-tokens pruning case is skipped and reported), backing up the file as `<file>.bak.<UTC>`; **only the frames that changed are recompressed, all other frames keep their original bytes**, and an incomplete trailing frame (torn tail) is preserved verbatim; with the checkbox ticked, duplicate tool-call ids are de-duplicated too;
+  - projection cache: renames **stale records that contradict the log** (log has `turn/start` but the cache marks `blank`, or titles disagree) to `<sid>.json.bak-<timestamp>` instead of rewriting cache values, letting DSH recompute on a cold read — per the official `session-projection-cache` spec, a stale/unreadable cache "costs a longer tail replay, never a wrong value"; with no cache, `blank` defaults to false so the session stays visible;
   - **never deletes any entry**, leaves `archivedSessionIds` untouched, the fix is idempotent, then re-checks automatically.
 
 The same feature works as an **automated script** (dry-run by default; `--apply` writes):
