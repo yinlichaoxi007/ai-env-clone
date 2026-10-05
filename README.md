@@ -470,7 +470,7 @@ build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 /
 
 ## 许可证
 
-[MIT](./LICENSE) —— 可自由使用、修改、分发，包括商业用途。
+[MIT](./LICENSE) —— 可自由使用、修改、分发。
 
 ---
 
@@ -936,7 +936,7 @@ Issues and PRs are welcome — especially adapters for more **domestic AI tools*
 
 ## License
 
-[MIT](./LICENSE) — free to use, modify and distribute, including commercially.
+[MIT](./LICENSE) — free to use, modify and distribute.
 
 ## About this project / 关于本项目
 
