@@ -258,6 +258,22 @@ from ai_env_clone.core import export_backup, import_backup
 
 点击「导入会话…」即打开导入对话框：选择来源软件与来源目录 → 扫描出可导入会话（`Ctrl` / `Shift` 可多选，一次导入多条）→ **目标工作区自动判定，无需填写**（该栏只读展示**实际会落到的**工作区，并随选中项实时刷新）→ 导入。
 
+#### 子代理会话：默认不导入，导入时按目标工具的原生结构挂到父会话下
+
+来源工具里除了用户自己的会话，还有 AI 自己拉起的**子代理（子会话）记录**：ZCode 用 `session.task_type = 'subagent_child'` + `parent_id` 标记它们（实测一个备份包里 34 条会话有 23 条是这种），DSH 的子代理会话则是**裸 uuid** 的会话目录。这类记录的「用户消息」是父代理写下的任务提示词，正文只有推理与工具调用，所以看起来「只有 AI 干活过程」——**这不是导入丢了内容，源数据本来如此**。
+
+处理方式：
+
+- 列表上方的「**包含子代理会话（AI 内部过程，默认不导入）**」开关默认关闭，扫描阶段就把它们**隐藏**（`list_source_sessions(..., include_subagents=False)`），避免被当成用户会话导入；顶部会提示「另有 N 条子代理会话（勾选后显示）」。条目始终带 `subagent` / `parent_id` / `parent_title` 三个字段，子代理条目紧跟在各自父会话之后排列，副标题注明它属于哪个父会话。
+- 勾选后导入 **DSH** 时按 DSH 原生子代理形态写出（实测契约，已用 DSH 自带 `session-format-catalog` 的「严格 + 当前代际」校验链复算通过）：
+  - 会话目录名 / header `id` 是**裸 uuid**（顶层为 `session-<uuid>`）；
+  - header 追加 `parentSession`（父会话 id）/ `origin: "subagent"` / `delegationDepth: 1`（三者均在官方 released v2/v3 header 的 `HEADER_OPTIONAL` 内，`origin` 只允许该取值）；
+  - **seq 0** 是 `subagent/descriptor`，`data.version` 必须为 **3**（官方对 v0 代际是硬拒绝），`mode` 取 `one-shot`、`provider` 取官方实测值 `spawn`；
+  - **不登记** `workspace.json`、不预写投影缓存 ⇒ 它**不会**作为平级会话出现在侧边栏；归属靠父会话日志里的 `subagent/catalog` 建立。
+- 因为 `subagent/catalog` 写在**父会话日志**里，且其中含子会话 id，所以批处理必须「先分配 id / 创建时间 → 再写父会话 → 最后写子会话」：`plan_dsh_import()`（纯函数，见 `session_migration.py`）负责补父会话、建立挂接、排序并生成目录条目；父会话的 `subagent/catalog.childCreatedAt` 与子会话 header 的 `createdAt` 严格相等（官方 v3→v4 的「已有自身父目录项」分支会**校验**这一致性，不一致直接拒绝）。
+- 父会话不在本次选择里时会**弹框确认「一并导入」**（它们在列表里就是普通会话）；来源没记住父会话 id 的条目（例如从 DSH 自身导入的子代理会话）会**跳过并如实告知**，不会被偷偷降级成顶层会话。
+- 导入 Reasonix / CodeBuddy / WorkBuddy 时没有子代理结构，勾选开关后子代理条目按普通会话写出。
+
 #### 目标工作区：默认自动判定
 
 把会话写进目标工具时**必须决定它归到哪个工作区**（填错就等于「写了但看不到」）。本工具把这一步收敛成一条规则，默认不需要用户输入（实现见 `ai_env_clone/workspace_plan.py`）：
@@ -291,7 +307,7 @@ from ai_env_clone.core import export_backup, import_backup
 
 实现要点：
 
-- **不覆盖目标已有会话**：新会话一律使用全新生成的 id（WorkBuddy / CodeBuddy 为 UUID，DSH 为 `session-<uuid>`，Reasonix 为时间戳 id），天然避开碰撞。
+- **不覆盖目标已有会话**：新会话一律使用全新生成的 id（WorkBuddy / CodeBuddy 为 UUID，DSH 顶层为 `session-<uuid>`、子代理为裸 uuid，Reasonix 为时间戳 id），天然避开碰撞。
 - **写「原生落点」而非只写文件**：部分工具界面按索引读取，只落文件是看不到的。因此 WorkBuddy 会同时把会话登记进 `workbuddy.db` 的 `sessions` 表（`insert or ignore`，绝不改写既有行）；DSH 会同时把会话登记进 `storages/workspace.json` 的工作区索引（**界面列表靠的就是它**），并尽力在新的 `session_projcache*` 缓存里补一条标题记录（该缓存可由 DSH 自行从日志重建，且换布局后旧单文件的写入只在目录树尚不存在时生效，故属「尽力而为」）。CodeBuddy / Reasonix 则遵循其「项目路径 / 工作区」派生规则，落点不一致会明确提示。
 - **只读解析来源**：ZCode 的 `db.sqlite` 一律以 `mode=ro` 只读打开，绝不写入来源库。
 - **中文/长文本安全**：DSH 的会话文件是**多帧** Zstandard 流，本工具按多帧语义整体解压（早期实现只解首帧，会把 4MB 的会话误判为「无消息」，已修复）。
@@ -325,21 +341,26 @@ from ai_env_clone.core import export_backup, import_backup
 
 另外，DSH 一个会话目录内可能存在**多个格式代际**（`session.jsonl.zstd` = v0、`session.v1.jsonl.zstd` … `session.v2.jsonl.zstd`），加载器只读**版本号最高**的那个；本工具按同一规则定位生效文件，因此「只有 `session.v2.jsonl.zstd`」的会话也能被发现（只看 `session.jsonl.zstd` 会漏掉这类会话，本机实测曾漏 5 个）。
 
-在主界面下拉选择 **DeepSeek Harness** 后，数据目录区域会出现两个按钮和一个复选框（仅 dsh 显示，切换其他工具自动隐藏，不影响各区域自适应布局）：
+在主界面下拉选择 **DeepSeek Harness** 后，数据目录区域会出现两个按钮、一个复选框和一行「子代理修复来源」（仅 dsh 显示，切换其他工具自动隐藏，不影响各区域自适应布局）：
 
-- **「检测会话健康」**：扫描全部会话目录并与 `storages/workspace.json` 交叉核对（**内容扫描覆盖全部会话，不只未分组**），报告：
+- **「检测会话健康」**：扫描全部会话目录并与 `storages/workspace.json` 交叉核对（**内容扫描覆盖全部会话，不只未分组**）。**每一类可修复问题都给出数量（为 0 也列出，只给数量、不展开具体哪几条）**，末尾给出「需注意项合计」，并回显**子代理关系判定实际用到的来源**：
   - 未分组会话数量（及其中多少可自动归属、多少需人工确认）；
-  - 索引结构问题（如 `workspaceIds` 引用不存在的记录）；
+  - 索引结构问题数量（如 `workspaceIds` 引用不存在的记录，逐条列出）；
   - 旧格式（扁平 `replayState`）会话数量；
   - 含同一步重复 tool-call id 的会话数量；
-  - 子代理描述符不兼容会话数量（`subagent/descriptor` 的 `version` 不是官方迁移要求的 3，会话无法加载）——**只检测标记，暂不自动修复**；
-  - **投影缓存陈旧**会话数量（缓存结论与日志矛盾：日志含 `turn/start` 而缓存标 `blank: true` 会让侧边栏隐藏该会话；缓存 `title` 与日志不一致会显示旧标题 / 未命名）。
+  - 子代理描述符版本不合规会话数量（`subagent/descriptor` 的 `version` 不是官方迁移要求的 3：v0→v1 迁移直接拒绝，报 `subagent/descriptor 0 uses unsupported descriptor version 2` ⇒ 会话加载报错）——**可自动修复**（见「修复会话数据」的第 4 条；本工具**导入**子代理会话时一律写 `version: 3`，不会产生这类记录，见「子代理会话」一节）；
+  - **投影缓存陈旧**会话数量（缓存结论与日志矛盾：日志含 `turn/start` 而缓存标 `blank: true` 会让侧边栏隐藏该会话；缓存 `title` 与日志不一致会显示旧标题 / 未命名）；
+  - **工作区 path 缺失 / 目录不存在**：`path` 字段缺失或为空时按名下会话 header 的 `cwd` 推断补齐（一致才采用，否则退空串占位并写明原因）；`path` 合法但目录在本机不存在时，健康检测给出数量、修复时**补建空目录**（纯增量、可回退）；
+  - **旧版导入的子代理会话**数量（当前是顶层会话、会被误当用户会话；含「其中多少条无法判定父子关系、保持原样」）。
+- **「外部导入会话的来源」**：一行输入框 + 「选数据目录…」「选备份包…」。**留空即自动查找这些会话原本来自哪个工具**（本机数据 → 本工具备份目录与上次用过的包目录里的 `zcode_backup_*.zip` / `dsh_backup_*.zip`，凑齐即停）；指定后只按该来源判定。留空时输入框下方常驻提示写明这一点，检测/修复的报告里回显本次实际使用的来源。界面上**不点名具体工具**——用户只需要知道「按需要修复的那批会话原本来自哪个工具去选目录或备份包」。
 - **「同时修复重复调用 ID（会改写数据）」**：复选框，**默认不勾选**。勾选后修复流程才会处理重复 tool-call id（有语义改动，id 会被加 `#2`/`#3` 后缀）；不勾选则只做 replayState 信封升级与索引归属。
-- **「修复会话数据」**：先展示将执行的修改清单（dry-run）并请你确认，确认后**逐个自动备份**再增量写盘：
-  - 索引：按会话 header 的 `cwd`（无 zstd 时按项目目录名 `projectKey` 匹配）把会话 id 补进对应工作区记录的 `sessionIds`（置顶，与 DSH 官方 `attachSession` 语义一致）；目录存在但没有工作区记录的，**补建工作区记录**并登记进 `global.workspaceIds`（等价 DSH 官方 `workspaceRegistry.bootstrap` 的离线版）；`workspace.json` 备份为 `workspace.json.bak-<utc>`；
+- **「修复会话数据」**：先展示将执行的修改清单（dry-run）并请你确认，确认后**逐个自动备份**再增量写盘。**确认窗口默认尺寸受工作区限制、正文可滚动、按钮固定在底部**——计划条目多到几十行也不会把「继续 / 取消」顶出屏幕：
+  - 索引：按会话 header 的 `cwd`（无 zstd 时按项目目录名 `projectKey` 匹配）把会话 id 补进对应工作区记录的 `sessionIds`（置顶，与 DSH 官方 `attachSession` 语义一致）；目录存在但没有工作区记录的，**补建工作区记录**并登记进 `global.workspaceIds`（等价 DSH 官方 `workspaceRegistry.bootstrap` 的离线版）；工作区记录的 `path` 缺失/为空时按名下会话的 `cwd` 推断补齐；`path` 指向的目录在本机不存在时**补建空目录**（`makedirs`，纯增量、失败逐条上报）；`workspace.json` 备份为 `workspace.json.bak-<utc>`；
   - 会话文件：把扁平 `replayState` **双侧同值**升级为 `{response, blocks}` 信封后写回（同一事件的 `message.source` 与内嵌 stream finish 块升级为同一个信封，保证镜像一致；max-tokens 剪枝场景跳过并上报），文件备份为 `<原文件>.bak.<UTC>`；**只重压缩命中的帧，其余帧保持原字节**，尾部不完整的帧（torn tail）原样保留；勾选复选框时一并去重重复的 tool-call id；
+  - 会话文件（**子代理描述符版本升级**）：`subagent/descriptor.data.version` 不为 3 时，若载荷满足官方 v3 语义（`provider` 非空、`mode` 为 `one-shot`/`continuable`、continuable 要求非空 `label` 且 `agentProvider`/`agentModel` 成对、`toolFilter` 只含 `allow`/`deny`）就把它改成 **3**——这是 v0→v1 迁移的硬校验，不改就会「会话加载错误」（实测 TeaVision 的 6 个 v0 子代理会话正是 `version: 2`，官方链复算确认「改前被拒、改后通过」）；载荷不满足 v3 语义时**跳过并上报**，不拼凑语义不同的描述符；
   - 投影缓存：把**结论与日志矛盾**的陈旧记录（日志含 `turn/start` 而缓存标 `blank`，或标题不一致）改名移走为 `<sid>.json.bak-<时间戳>`，**不重写缓存值**，由 DSH 冷读时按最新日志重算——依据官方 `session-projection-cache` spec：陈旧 / 不可读的缓存「只是多一次尾部重放，绝不给出错误值」，无缓存则 `blank` 默认 false、会话照常可见；
-  - **绝不删除任何条目**，`archivedSessionIds` 不动；修复幂等（重复执行不产生新命中）；修改后自动复检。
+  - **子代理关系修复**（**来源自动查找，无需指定**）：把早期版本导入留下的**顶层子代理会话**就地改造成 DSH 原生子代理会话——正文一字不改，只改结构（裸 uuid 目录、header 追加 `parentSession` / `origin: "subagent"` / `delegationDepth: 1`、seq 0 插入 `subagent/descriptor` 并把其余事件整体后移一位、同步日志内 `messageSeqs` 引用）；旧顶层会话目录整体移到 `sessions/.removed/<工作区>/<旧 id>/`、其 id 从 `sessionIds` 摘除、旧投影缓存改名移走。父会话日志**不动**：DSH 加载 v3 父会话时按「子会话证据完整 ⇒ 追加 version-0 目录事实」自动补 `subagent/catalog`；仅当父会话**已发布 v4** 时把那份 v4 改名移走让它重新迁移（先核对 v3/v4 用户消息数一致，不一致则跳过上报）。判定依据是来源侧的 `parent_id`（ZCode 的 `task_type = 'subagent_child'` / DSH 的 `origin: "subagent"`）+ 「标题 + 首条用户正文」指纹；来源按 **本机 ZCode 数据 → 本工具备份目录与上次用过的包目录里的 `zcode_backup_*.zip` / `dsh_backup_*.zip`** 顺序自动查找并凑齐即停（DSH **实时**数据不自动采用：本机通常只有「正在修的这个主目录」，拿它当来源会匹配到自己的孪生而掩盖真来源；另一个 DSH 主目录用 `--relink-source` / 面板输入框指定）。来源彻底找不到时**只上报、不猜**，对不上的条目绝不降级为顶层会话。实现见 `ai_env_clone/subagent_relink.py`；
+  - **绝不删除任何条目**，`archivedSessionIds` 不动（唯一的「摘除」是子代理关系修复把子会话 id 移出 `sessionIds`，且旧目录与旧缓存都只改名移走、可回退）；修复幂等（重复执行不产生新命中）；修改后自动复检。
 
 同一功能也可作为**自动化脚本**在命令行使用（默认 dry-run，`--apply` 才写盘）：
 
@@ -722,6 +743,22 @@ With a target tool selected, the "数据导入 / Data import" area lists:
 
 Clicking "导入会话…" (import session) opens the import dialog: pick a source tool and its source directory → scan for importable sessions (`Ctrl` / `Shift` multi-select, import several at once) → **the target workspace is resolved automatically — nothing to fill in** (that row is read-only and shows the workspace actually in use, refreshing as the selection changes) → import.
 
+#### Subagent sessions: not imported by default; when imported they attach to their parent in the target's native structure
+
+Besides the user's own sessions, a source tool also records **subagent (child) runs** that the AI spawned itself: ZCode marks them with `session.task_type = 'subagent_child'` + `parent_id` (measured: 23 of 34 sessions in one backup archive), and DSH's subagent sessions are **bare-uuid** session directories. Their "user message" is the task prompt the parent agent wrote, and their body is reasoning plus tool calls — which is why they look like "nothing but AI process". **That is the source data, not content lost during import.**
+
+How this is handled:
+
+- The "**包含子代理会话** (include subagent sessions; AI-internal, off by default)" switch above the list is off by default and they are **hidden at scan time** (`list_source_sessions(..., include_subagents=False)`), so they cannot be mistaken for the user's sessions; a hint reads "N more subagent sessions (check to show)". Items always carry `subagent` / `parent_id` / `parent_title`, subagent items are listed right after their parent, and the subtitle names the parent they belong to.
+- With the switch on and **DSH** as the target, they are written in DSH's native subagent shape (measured contract, re-checked with DSH's own `session-format-catalog` "strict + current" validation chain):
+  - the session directory name / header `id` is a **bare uuid** (top-level sessions use `session-<uuid>`);
+  - the header gains `parentSession` (the parent session id) / `origin: "subagent"` / `delegationDepth: 1` (all three are in the official released v2/v3 header's `HEADER_OPTIONAL`, and `origin` only accepts that value);
+  - **seq 0** is `subagent/descriptor` with `data.version` **3** (officially rejected for v0 artifacts), `mode` = `one-shot`, `provider` = the measured official value `spawn`;
+  - it is **not** registered in `workspace.json` and no projection cache is pre-written ⇒ it never appears as a sibling session in the sidebar; the relationship is carried by the parent log's `subagent/catalog`.
+- Because `subagent/catalog` lives in the **parent's** log and contains the child's id, the batch must "allocate ids / created-at first → write the parent → write the children last": `plan_dsh_import()` (a pure function in `session_migration.py`) adds missing parents, wires the links, orders the writes, and builds the catalog entries; the parent's `subagent/catalog.childCreatedAt` equals the child header's `createdAt` exactly (the official v3→v4 "parent already has its own catalog entry" branch **validates** this consistency and rejects a mismatch).
+- When a parent is not part of the selection, the dialog **asks before importing it too** (in the list it is just a normal session); items whose source never recorded a parent id (for example subagent sessions imported from DSH itself) are **skipped and reported**, never silently downgraded to top-level sessions.
+- When importing into Reasonix / CodeBuddy / WorkBuddy there is no subagent structure, so with the switch on those items are written as ordinary sessions.
+
 #### Target workspace: auto-resolved by default
 
 Writing a session into a target tool **requires deciding which workspace it belongs to** (getting this wrong means "written, but invisible"). This tool reduces that to one rule and needs no input by default (implemented in `ai_env_clone/workspace_plan.py`):
@@ -755,7 +792,7 @@ Writing a session into a target tool **requires deciding which workspace it belo
 
 Implementation notes:
 
-- **Never overwrites existing target sessions**: new sessions always get a freshly generated id (UUID for WorkBuddy / CodeBuddy, `session-<uuid>` for DSH, timestamp id for Reasonix), so collisions are impossible by construction.
+- **Never overwrites existing target sessions**: new sessions always get a freshly generated id (UUID for WorkBuddy / CodeBuddy, `session-<uuid>` for DSH top-level and a bare uuid for DSH subagents, timestamp id for Reasonix), so collisions are impossible by construction.
 - **Writes the "native landing spot", not just files**: some UIs read from an index, so dropping files alone is invisible. WorkBuddy therefore also registers the session in `workbuddy.db`'s `sessions` table (`insert or ignore`, never rewriting existing rows); DSH also registers it in `storages/workspace.json`'s workspace index (**this is what the UI list reads**) and best-effort adds a title record to the `session_projcache*` cache (DSH can rebuild that cache from the log itself, and after the layout change the legacy single-file write only takes effect when the per-record tree does not yet exist — hence "best effort"). CodeBuddy / Reasonix follow their "project path / workspace" derivation rules, and a mismatch is reported explicitly.
 - **Read-only source parsing**: ZCode's `db.sqlite` is always opened `mode=ro` — the source DB is never written to.
 - **CJK / long-text safe**: DSH session files are **multi-frame** Zstandard streams; this tool decompresses the whole stream with multi-frame semantics (an early implementation decoded only the first frame and misjudged a 4 MB session as "no messages" — fixed).
@@ -789,21 +826,26 @@ The first two are fixable **by repairing the data**: every flat `replayState` oc
 
 A session directory may also hold **several format generations** (`session.jsonl.zstd` = v0, `session.v1.jsonl.zstd`, … `session.v2.jsonl.zstd`); the loader reads only the **highest-numbered** one. This tool locates the effective file by the same rule, so a session that only has `session.v2.jsonl.zstd` is still discovered (looking for `session.jsonl.zstd` alone used to miss 5 such sessions on this machine).
 
-When **DeepSeek Harness** is selected in the dropdown, the data-directory area shows two buttons and one checkbox (dsh-only; hidden for other tools, so the adaptive layout of every section is untouched):
+When **DeepSeek Harness** is selected in the dropdown, the data-directory area shows two buttons, one checkbox and one source row (dsh-only; hidden for other tools, so the adaptive layout of every section is untouched):
 
-- **「检测会话健康」(check session health)**: cross-checks every session directory against `storages/workspace.json` and reports (the **content scan covers all sessions, not just ungrouped ones**):
+- **「查会话健康」/「check session health」**: cross-checks every session directory against `storages/workspace.json` and reports (the **content scan covers all sessions, not just ungrouped ones**). **Every repairable category is listed with its count (zero included; counts only, no per-session detail)**, followed by an "items needing attention" total and the **source actually used for the subagent-relationship judgement**:
   - number of ungrouped sessions (and how many can be auto-attached vs. need manual confirmation);
-  - index structure problems (e.g. `workspaceIds` referencing missing records);
+  - number of index structure problems (e.g. `workspaceIds` referencing missing records; listed individually);
   - number of legacy flat-`replayState` sessions;
   - number of sessions with duplicate tool-call ids inside one step;
-  - number of sessions with an incompatible subagent descriptor (`subagent/descriptor` whose `version` is not the officially required 3, so the session cannot be loaded) — **detected and flagged only; not auto-repaired**;
-  - number of sessions with a **stale projection cache** (the cache contradicts the log: the log has `turn/start` but the cache marks `blank: true`, which hides the session from the sidebar; or the cached `title` disagrees with the log).
+  - number of sessions with an incompatible subagent descriptor (`subagent/descriptor` whose `version` is not the officially required 3: the v0→v1 migration rejects it with `subagent/descriptor 0 uses unsupported descriptor version 2`, so the session fails to load) — **now auto-repaired** (see the 4th item under "repair session data");
+  - number of sessions with a **stale projection cache** (the cache contradicts the log: the log has `turn/start` but the cache marks `blank: true`, which hides the session from the sidebar; or the cached `title` disagrees with the log);
+  - **workspace path missing / directory absent**: a missing or empty `path` field is inferred from the `cwd` in the headers of that workspace's sessions (only when they agree; otherwise a placeholder empty string plus a stated reason), while a valid `path` whose directory does not exist on this machine is counted here and **created as an empty directory** by the repair (purely additive, reversible);
+  - number of **top-level subagent sessions left by earlier importer versions** (plus how many could not be judged and are left untouched).
+- **「外部导入会话的来源」/ source of the externally imported sessions**: one entry field plus "选数据目录…" / "选备份包…". **Leaving it empty means auto-discovery of whichever tool those sessions originally came from** (live data → `zcode_backup_*.zip` / `dsh_backup_*.zip` in this tool's backup directory and the last used package directory, stopping as soon as everything is resolved); specifying one restricts the judgement to it. A permanent hint under the field spells this out, and both the health report and the fix plan echo the source actually used. The UI deliberately **does not name specific tools** — the user only needs to know "pick the data directory or backup package of whichever tool those sessions came from".
 - **「同时修复重复调用 ID（会改写数据）」(also fix duplicate call ids)**: a checkbox, **unchecked by default**. Only when checked does the repair flow touch duplicate tool-call ids (a semantic change — ids get `#2` / `#3` suffixes); unchecked, only the replayState envelope upgrade and the index are repaired.
-- **「修复会话数据」(repair session data)**: first shows the exact changes as a dry-run for confirmation, then **backs up each file individually** and writes incrementally:
-  - index: matches each session's header `cwd` (or, without zstd, its `projectKey` directory name) and prepends the session id to that workspace record's `sessionIds` (same semantics as DSH's official `attachSession`); when a directory exists but no workspace record does, **creates the record** and registers it in `global.workspaceIds` (an offline equivalent of DSH's `workspaceRegistry.bootstrap`); `workspace.json` is backed up as `workspace.json.bak-<utc>`;
+- **「修复会话数据」(repair session data)**: first shows the exact changes as a dry-run for confirmation, then **backs up each file individually** and writes incrementally. The confirmation window has a **workspace-clamped default size, a scrollable body and buttons pinned to the bottom**, so a plan with dozens of lines can never push "continue / cancel" off screen:
+  - index: matches each session's header `cwd` (or, without zstd, its `projectKey` directory name) and prepends the session id to that workspace record's `sessionIds` (same semantics as DSH's official `attachSession`); when a directory exists but no workspace record does, **creates the record** and registers it in `global.workspaceIds` (an offline equivalent of DSH's `workspaceRegistry.bootstrap`); a missing/empty workspace `path` is inferred from its sessions' `cwd`; a valid `path` whose directory is absent is **created as an empty directory** (`makedirs`, purely additive, per-path failures reported); `workspace.json` is backed up as `workspace.json.bak-<utc>`;
   - session files: upgrades flat `replayState` into the `{response, blocks}` envelope with **the same value on both sides** (within one event, `message.source` and the embedded stream's finish chunk become the same envelope, keeping the mirror consistent; the max-tokens pruning case is skipped and reported), backing up the file as `<file>.bak.<UTC>`; **only the frames that changed are recompressed, all other frames keep their original bytes**, and an incomplete trailing frame (torn tail) is preserved verbatim; with the checkbox ticked, duplicate tool-call ids are de-duplicated too;
+  - session files (**subagent descriptor version upgrade**): when `subagent/descriptor.data.version` is not 3 and the payload satisfies the official v3 semantics (non-empty `provider`; `mode` `one-shot`/`continuable`; continuable requires a non-empty `label` and `agentProvider`/`agentModel` paired; `toolFilter` limited to `allow`/`deny`), it is set to **3** — a hard check in the v0→v1 migration, and the cause of the "session load error" (measured: TeaVision's six v0 subagent sessions carry `version: 2`; the official chain rejects before and accepts after). Payloads that cannot be v3 are **skipped and reported** rather than patched into something with different semantics;
   - projection cache: renames **stale records that contradict the log** (log has `turn/start` but the cache marks `blank`, or titles disagree) to `<sid>.json.bak-<timestamp>` instead of rewriting cache values, letting DSH recompute on a cold read — per the official `session-projection-cache` spec, a stale/unreadable cache "costs a longer tail replay, never a wrong value"; with no cache, `blank` defaults to false so the session stays visible;
-  - **never deletes any entry**, leaves `archivedSessionIds` untouched, the fix is idempotent, then re-checks automatically.
+  - **subagent-relationship repair** (**the source is auto-discovered; nothing to specify**): converts **top-level subagent sessions left behind by earlier importer versions** into native DSH subagent sessions in place — the body text is not touched at all, only the structure (bare-uuid directory, header gains `parentSession` / `origin: "subagent"` / `delegationDepth: 1`, a `subagent/descriptor` is inserted at seq 0 while every other event shifts by one and the in-log `messageSeqs` references are bumped). The old top-level session directory is moved wholesale to `sessions/.removed/<workspace>/<old id>/`, its id is dropped from `sessionIds`, and its old projection-cache record is renamed aside. The parent's log is **not** modified: when DSH loads a v3 parent it appends the missing `subagent/catalog` fact from complete child evidence; only a parent that already **published v4** has that v4 renamed aside so it re-migrates (its v3/v4 user-message counts are compared first; a mismatch is skipped and reported). Matching uses the source-side `parent_id` (ZCode's `task_type = 'subagent_child'`, DSH's `origin: "subagent"`) plus a "title + first user message" fingerprint; sources are searched automatically in order **live ZCode data → `zcode_backup_*.zip` / `dsh_backup_*.zip` in this tool's backup directory and the last used package directory**, stopping as soon as every pending session is resolved (a *live* DSH home is deliberately not auto-adopted: the only one on a machine is usually the home being repaired, and matching against itself would hide the real source — point at another DSH home explicitly with `--relink-source`). When no source can be found at all it **reports instead of guessing**, and unmatched items are never downgraded to top-level. Implementation: `ai_env_clone/subagent_relink.py`;
+  - **never deletes any entry**, leaves `archivedSessionIds` untouched (the one "detach" is the subagent repair removing a child id from `sessionIds`, with the old directory and cache only renamed aside and fully reversible), the fix is idempotent, then re-checks automatically.
 
 The same feature works as an **automated script** (dry-run by default; `--apply` writes):
 

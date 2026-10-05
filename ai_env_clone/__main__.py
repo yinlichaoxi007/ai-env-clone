@@ -903,12 +903,35 @@ class QoderBackupApp:
             variable=self.dsh_fix_dup_var,
         )
         self.dsh_fix_dup_check.pack(side=tk.LEFT, padx=(6, 0))
+        # 子代理关系修复的来源：这里指的是**这些外部导入会话原本来自哪个工具**（用户视角），
+        # 不是「必须选 ZCode」——留空即自动查找，找不到时再按需要修复的那批会话的来源
+        # 去选对应工具的**数据目录或备份包**。措辞不点名具体工具，免得用户误以为只能选 ZCode。
+        relink_row = ttk.Frame(self.dsh_health_frame)
+        relink_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(relink_row, text="外部导入会话的来源：").pack(side=tk.LEFT)
+        self.dsh_relink_source_var = tk.StringVar(value="")
+        ttk.Entry(relink_row, textvariable=self.dsh_relink_source_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        ttk.Button(relink_row, text="选数据目录…", width=11,
+                   command=lambda: self._pick_relink_source(False)).pack(side=tk.LEFT)
+        ttk.Button(relink_row, text="选备份包…", width=10,
+                   command=lambda: self._pick_relink_source(True)).pack(side=tk.LEFT, padx=(4, 0))
+        # 留空＝自动查找：把这层含义常驻写在界面上（用户不必猜「不填会怎样」），
+        # 并在检测/修复的报告里回显**实际用了哪个来源**。
+        self.dsh_relink_hint_var = tk.StringVar(value="")
+        relink_hint = ttk.Label(self.dsh_health_frame, textvariable=self.dsh_relink_hint_var,
+                                foreground="#666", anchor="w", justify="left", wraplength=760)
+        relink_hint.pack(fill=tk.X)
+        self._hint_labels.append(relink_hint)
+        self.dsh_relink_source_var.trace_add("write", lambda *_: self._refresh_relink_hint())
+        self._refresh_relink_hint()
         # 说明文字另起一行：与三个按钮挤在同一行时整行请求宽达 1122px（可用仅 899），
         # 末位说明被挤出可视区。独立成行后独占宽度、按宽度自动折行。
         dsh_hint = ttk.Label(
             self.dsh_health_frame,
             text="检测 DSH 会话是否「未分组」（磁盘存在但索引未登记）、属旧格式无法加载"
-            "（扁平 replayState / 同一步重复调用 ID），或因投影缓存过期而在侧边栏看不到 / 标题错",
+            "（扁平 replayState / 同一步重复调用 ID），或因投影缓存过期而在侧边栏看不到 / 标题错；"
+            "「修复会话数据」还会按上面的来源修复「旧版导入留下的顶层子代理会话」",
             foreground="#666", anchor="w", justify="left", wraplength=760,
         )
         dsh_hint.pack(fill=tk.X, pady=(4, 0))
@@ -2608,15 +2631,48 @@ class QoderBackupApp:
                 pass
         fix_w = getattr(self, "dsh_fix_btn", None)
         if fix_w is not None:
-            has_fixable = getattr(self, "_dsh_has_fixable", None)
-            fix_ok = ok and (has_fixable is not False)
+            # 数据目录可用即允许点「修复」：健康检测看不到「子代理关系修复」的待办
+            # （那要靠来源数据现算，来源还是自动查找的），用检测结论去置灰会让用户
+            # 明明有问题却点不动。真没可修项时，修复流程自己会如实说「无需修复」。
+            fix_ok = ok
             try:
                 fix_w.configure(state="normal" if fix_ok else "disabled")
             except tk.TclError:
                 pass
 
+    def _pick_relink_source(self, as_package: bool) -> None:
+        """选「外部导入会话的来源」——**只在自动查找不到时才需要**。
+
+        按「需要修复的那批外部导入会话原本来自哪个工具」来选：那个工具的**数据目录**，
+        或它的**备份包**（zip）。
+        """
+        if as_package:
+            path = filedialog.askopenfilename(
+                title="选择外部导入会话的备份包",
+                filetypes=[("备份包", "*.zip"), ("全部文件", "*.*")])
+        else:
+            path = filedialog.askdirectory(title="选择外部导入会话的数据目录")
+        if path:
+            self.dsh_relink_source_var.set(path)
+            self._set_dsh_buttons_state()
+
+    def _refresh_relink_hint(self) -> None:
+        """回显「来源留空＝自动查找」这层含义（用户不必猜不填会怎样）。"""
+        var = getattr(self, "dsh_relink_hint_var", None)
+        if var is None:
+            return
+        if (self.dsh_relink_source_var.get() or "").strip():
+            var.set("将只用你指定的这个来源判定父子关系（外部导入会话原本所属工具的数据目录"
+                    "或备份包），不再自动查找其它数据与备份包")
+        else:
+            var.set("未指定来源：会自动查找这些外部导入会话原本来自哪个工具（本机数据、"
+                    "本工具的备份包与上次用过的备份包目录都会找一遍）。若自动找不到，请按"
+                    "「需要修复的那批会话原本来自哪个工具」选它的数据目录或备份包；"
+                    "「检测会话健康」会列出本次实际使用的来源")
+
     def _dsh_check(self) -> None:
-        """检测 DSH 会话健康：未分组 / 索引问题 / 旧格式 replayState / 重复调用 ID / 陈旧投影缓存。"""
+        """检测 DSH 会话健康：未分组 / 索引问题 / 旧格式 replayState / 重复调用 ID /
+        陈旧投影缓存 / 旧版导入的子代理会话（含判定所用的来源）。"""
         if self.busy:
             messagebox.showwarning("请稍候", "当前有任务正在执行。")
             return
@@ -2624,63 +2680,104 @@ class QoderBackupApp:
 
         dsh_home = self._dsh_home_for_check()
         decompress, _compress, zstd_name = zstd_backend()
+        relink_source = (self.dsh_relink_source_var.get() or "").strip()
         self._set_status("正在检测 DSH 会话健康…")
 
         def work():
-            result = detect_ungrouped(dsh_home, decompress=decompress)
+            result = detect_ungrouped(dsh_home, decompress=decompress,
+                                      relink_source=relink_source)
             self.msg_queue.put(("dsh_report", (result, zstd_name)))
 
         self._run_bg(work)
 
-    def _show_plain_report_dialog(self, title: str, text: str) -> None:
-        """显示白底黑字的自定义只读报告弹窗，避免系统暗色主题下 messagebox 文字看不清。
+    def _show_plain_report_dialog(self, title: str, text: str,
+                                  ask: bool = False) -> bool:
+        """显示白底黑字的自定义报告弹窗（可滚动、按钮常驻可见）。
 
-        工具无关：DSH「会话健康」与 Qoder「历史会话诊断」等报告共用。
+        工具无关：DSH「会话健康」、修复计划确认、Qoder「历史会话诊断」等报告共用。
 
-        ``HEADLESS``（单元测试）下退化为 ``messagebox.showinfo``：自定义弹窗会
-        ``grab_set()`` + ``wait_window()`` 阻塞等用户点击，在无头测试里会**永久挂起**，
-        故必须避开；测试侧已 mock ``messagebox``，行为等价且不阻塞。
+        为什么不用 ``messagebox``：它的尺寸由系统决定，正文一长（修复计划会逐条列几十行）
+        就把底部按钮顶出屏幕，用户连「继续 / 取消」都点不到（2026-10-05 实测反馈）。
+        这里：默认尺寸用 ``_clamp_dialog_size`` 夹进工作区，正文放**只读 Text + 滚动条**，
+        按钮单独占一行固定在底部——内容再多也点得到。
+
+        :param ask: ``True`` 时给「继续 / 取消」两个按钮并返回用户选择；``False`` 只给「确定」。
+        ``HEADLESS``（单元测试）下退化为 ``messagebox``：自定义弹窗会 ``grab_set()`` +
+        ``wait_window()`` 阻塞等用户点击，在无头测试里会**永久挂起**，故必须避开；
+        测试侧已 mock ``messagebox``，行为等价且不阻塞。
         """
         if HEADLESS:
+            if ask:
+                return bool(messagebox.askyesno(title, text))
             messagebox.showinfo(title, text)
-            return
+            return True
+
+        answer = {"ok": False}
         top = tk.Toplevel(self.root)
         top.title(title)
         top.transient(self.root)
         top.configure(bg="white")
-        top.resizable(False, False)
+        # 正文可滚动 ⇒ 窗口高度只受工作区限制，不再随内容无限增高
+        top.rowconfigure(0, weight=1)
+        top.columnconfigure(0, weight=1)
         try:
             icon = self.root.wm_iconbitmap()
             if icon:
                 top.iconbitmap(icon)
         except Exception:
             pass
+        wrap = tk.Frame(top, bg="white")
+        wrap.grid(row=0, column=0, sticky="nsew")
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+        body = tk.Text(wrap, wrap="word", height=16, width=64, bg="white", fg="black",
+                       relief="flat", padx=12, pady=12, font=("", 10), takefocus=0)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=body.yview)
+        body.configure(yscrollcommand=sb.set)
+        body.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        body.insert("1.0", text)
+        body.configure(state="disabled")     # 只读：可选中复制，不可编辑
+        body.yview_moveto(0.0)
 
-        lbl = tk.Label(
-            top,
-            text=text,
-            bg="white",
-            fg="black",
-            justify=tk.LEFT,
-            anchor="nw",
-            wraplength=460,
-            padx=12,
-            pady=12,
-            font=("", 10),
-        )
-        lbl.pack(fill=tk.BOTH, expand=True)
+        def _wheel(event):
+            step = -1 if (getattr(event, "num", None) == 4
+                          or getattr(event, "delta", 0) > 0) else 1
+            body.yview_scroll(step, "units")
+            return "break"
 
-        btn = ttk.Button(top, text="确定", command=top.destroy, width=10)
-        btn.pack(pady=(0, 12))
-        btn.focus_set()
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            top.bind(seq, _wheel)
 
+        row = ttk.Frame(top)
+        row.grid(row=1, column=0, sticky="ew", pady=(8, 10))
+
+        def _close(ok: bool) -> None:
+            answer["ok"] = ok
+            top.destroy()
+
+        if ask:
+            ttk.Button(row, text="继续", command=lambda: _close(True),
+                       width=10).pack(side=tk.RIGHT, padx=(6, 12))
+            ttk.Button(row, text="取消", command=lambda: _close(False),
+                       width=10).pack(side=tk.RIGHT)
+        else:
+            ttk.Button(row, text="确定", command=lambda: _close(True),
+                       width=10).pack(side=tk.RIGHT, padx=(6, 12))
+
+        w, h = _clamp_dialog_size(top, 780, 560)
+        top.minsize(420, 260)
+        top.protocol("WM_DELETE_WINDOW", lambda: _close(False))
         top.update_idletasks()
         x = self.root.winfo_x() + (self.root.winfo_width() - top.winfo_width()) // 2
         y = self.root.winfo_y() + (self.root.winfo_height() - top.winfo_height()) // 2
-        top.geometry(f"+{x}+{y}")
+        # 位置与尺寸**一次**给出：分成「先尺寸、后位置」两次调用时，几何管理器可能按
+        # 控件的请求尺寸重排，窗口会缩成没法用的大小（实测退化成 1x1）。
+        top.geometry("%dx%d+%d+%d" % (w, h, max(0, x), max(0, y)))
 
         top.grab_set()
         top.wait_window(top)
+        return bool(answer["ok"])
 
     def _dsh_fix(self) -> None:
         """修复会话数据：workspace 索引归属 + 会话文件内容 + 移走陈旧投影缓存。
@@ -2694,10 +2791,12 @@ class QoderBackupApp:
 
         dsh_home = self._dsh_home_for_check()
         fix_dup_ids = bool(self.dsh_fix_dup_var.get())
+        relink_source = (self.dsh_relink_source_var.get() or "").strip()
         self._set_status("正在生成修复计划（dry-run）…")
 
         def work():
-            plan = plan_dsh_repair(dsh_home, fix_dup_ids=fix_dup_ids)
+            plan = plan_dsh_repair(dsh_home, fix_dup_ids=fix_dup_ids,
+                                   relink_source=relink_source)
             self.msg_queue.put(("dsh_fix_plan", plan))
 
         self._run_bg(work)
@@ -2715,9 +2814,11 @@ class QoderBackupApp:
             self.dsh_zstd_install_btn.pack(fill=tk.X, pady=(4, 0))
         else:
             self.dsh_zstd_install_btn.pack_forget()
-        # 记录「是否还有可修项」（未分组会话 / 陈旧投影缓存）并据此置灰修复按钮
-        self._dsh_has_fixable = bool(getattr(result, "ungrouped", [])) or bool(
-            getattr(result, "projcache_stale", [])
+        # 记录「是否还有可修项」（未分组会话 / 陈旧投影缓存 / 待改造的旧导入子代理会话）
+        self._dsh_has_fixable = bool(
+            getattr(result, "ungrouped", [])
+            or getattr(result, "projcache_stale", [])
+            or getattr(result, "relink_targets", [])
         )
         self._set_dsh_buttons_state()
         self._fit_layout()
@@ -2725,14 +2826,7 @@ class QoderBackupApp:
         if result.healthy:
             title = "DSH 会话健康：正常"
         else:
-            title = "DSH 会话健康：发现 %d 项需注意" % (
-                len(result.ungrouped)
-                + len(result.index_problems)
-                + len(result.legacy_replay_sessions)
-                + len(result.dup_id_sessions)
-                + len(result.descriptor_bad_sessions)
-                + len(getattr(result, "projcache_stale", []))
-            )
+            title = "DSH 会话健康：发现 %d 项需注意" % result.attention_total
         self._show_plain_report_dialog(title, text)
 
     def _dsh_install_zstd(self) -> None:
@@ -2803,6 +2897,7 @@ class QoderBackupApp:
         from ai_env_clone.dsh_repair import apply_dsh_repair
 
         fix_dup_ids = bool(self.dsh_fix_dup_var.get())
+        relink = getattr(plan, "relink", None)
         if plan.empty:
             lines = []
             if not plan.index_plan.mutations:
@@ -2811,16 +2906,21 @@ class QoderBackupApp:
             if not plan.data_reports:
                 lines.append("会话文件内容无需修复。")
             lines.append("投影缓存无陈旧记录。")
+            if relink is not None:
+                lines.append("未发现需要修复的子代理会话关系。")
+                if relink.source_note:
+                    lines.append("（子代理关系判定所用的来源：%s）" % relink.source_note)
             if plan.zstd_note:
                 lines.append(plan.zstd_note)
             self._set_status("无需修复")
-            messagebox.showinfo("修复 DSH 会话数据", "\n".join(lines) or "无需修复")
+            self._show_plain_report_dialog("修复 DSH 会话数据", "\n".join(lines) or "无需修复")
             return
 
         parts = []
         if plan.index_plan.mutations:
             parts.append(
-                "① 索引归属修复（仅增量登记，绝不删除任何条目）：\n"
+                "① 索引归属修复与工作区目录补建（仅增量：登记会话、补齐字段、补建缺失"
+                "目录，绝不删除任何条目）：\n"
                 + "\n".join("   - " + line for line in plan.index_plan.describe())
             )
         if plan.data_reports:
@@ -2841,18 +2941,41 @@ class QoderBackupApp:
                     for stale in plan.projcache_stale
                 )
             )
+        relink = getattr(plan, "relink", None)
+        if relink is not None and getattr(relink, "targets", None):
+            parts.append(
+                "④ 子代理关系修复（把旧版导入留下的顶层子代理会话改成 DSH 原生子代理会话，"
+                "会话正文一字不改；旧会话目录整体移到 sessions/.removed/、其 id 从工作区列表"
+                "摘除、原投影缓存移走，均保留备份，可用 .removed 里的目录回退）：\n"
+                + "\n".join("   - " + line for line in relink.describe()
+                            if not line.startswith("跳过"))
+            )
+        relink_skipped = [line for line in
+                          (getattr(relink, "describe", lambda: [])() if relink else [])
+                          if line.startswith("跳过")]
         note = ""
         if not fix_dup_ids:
             note = "\n\n注：未勾选「同时修复重复调用 ID」，其内容将保持原样（需要时可勾选后重跑）。"
         elif plan.zstd_note:
             note = "\n\n注：%s" % plan.zstd_note
+        if relink_skipped:
+            note += "\n\n子代理关系修复中未能处理的条目：\n" + "\n".join(relink_skipped[:8])
         total = (
             len(plan.index_plan.mutations)
             + len(plan.data_reports)
             + len(plan.projcache_stale)
+            + len(getattr(relink, "targets", []) if relink else [])
         )
+        if total == 0:
+            # 只有「跳过」没有可执行项：别让用户对着「共 0 项」点确认。
+            self._set_status("无需修复")
+            self._show_plain_report_dialog(
+                "修复 DSH 会话数据",
+                "\n".join([line for line in (relink.describe() if relink else [])]
+                          or ["无需修复"]) + note)
+            return
         text = "将执行以下修复：\n\n" + "\n\n".join(parts) + "\n\n共 %d 项。是否继续？" % total + note
-        if not messagebox.askyesno("确认修复 DSH 会话数据", text):
+        if not self._show_plain_report_dialog("确认修复 DSH 会话数据", text, ask=True):
             self._set_status("已取消修复")
             return
 
@@ -2869,6 +2992,7 @@ class QoderBackupApp:
                 index_res.ok
                 and all(r["status"] != "拒绝" for r in file_reports)
                 and all(p["ok"] for p in projcache)
+                and all(c["ok"] for c in (getattr(index_res, "created", None) or []))
             )
             lines = []
             if index_res.applied:
@@ -2876,6 +3000,13 @@ class QoderBackupApp:
                     "索引归属修复 %d 处%s。"
                     % (index_res.applied, "；备份：%s" % index_res.backup_path if index_res.backup_path else "")
                 )
+            created = getattr(index_res, "created", None) or []
+            if created:
+                good = [c for c in created if c["ok"]]
+                failed = [c for c in created if not c["ok"]]
+                lines.append("补建缺失的工作区目录 %d 个。" % len(good))
+                for c in failed:
+                    lines.append("  · 未能补建 %s：%s" % (c["path"], c["error"]))
             if projcache:
                 moved = [p for p in projcache if p["ok"]]
                 lines.append(
@@ -2892,8 +3023,25 @@ class QoderBackupApp:
                 for report in file_reports:
                     for action in report["actions"]:
                         lines.append("  · %s（%d 处）" % (action["rule"], action["count"]))
+            relink_res = (outcome.get("relink") or {})
+            relink_targets = relink_res.get("targets") or []
+            if relink_targets:
+                good = [r for r in relink_targets if r["ok"]]
+                lines.append(
+                    "子代理关系修复 %d 条（旧目录已移到 sessions/.removed/，可回退）"
+                    % len(good))
+                for r in relink_targets:
+                    if not r["ok"]:
+                        lines.append("  · %s 失败：%s" % (r["child_id"], r["error"]))
+                moved_parents = relink_res.get("parents") or []
+                if moved_parents:
+                    lines.append(
+                        "父会话已发布的 v4 移走 %d 个（DSH 下次加载会按子会话证据重新迁移并"
+                        "补上 subagent/catalog）：%s"
+                        % (len(moved_parents),
+                           "、".join(p["parent_id"] for p in moved_parents)))
             if not ok:
-                detail = index_res.error or "、".join(
+                detail = relink_res.get("error") or index_res.error or "、".join(
                     r["problems"][0]["detail"] for r in file_reports
                     if r["status"] == "拒绝" and r["problems"]
                 )
@@ -4544,6 +4692,9 @@ class MigrateDialog:
         self._by_display = {s.display: s for s in self.sources}
         self.cur_source = self.sources[0] if self.sources else None
         self.items: list = []
+        #: 本次扫描到的**全部**会话（含子代理）；``items`` 是其中按开关过滤后的可见子集，
+        #: 两者必须逐项对齐，`_selected_items` 才能按列表下标取到正确条目。
+        self._all_items: list = []
         self._result = None
         #: 导入过程中的 warn 回调累计（落点同源提示等），导入**执行后**一次性汇总展示。
         self.warns: list = []
@@ -4616,6 +4767,18 @@ class MigrateDialog:
         # 会话列表（支持多选：Ctrl / Shift）
         lst = ttk.LabelFrame(self.body, text="可导入会话（Ctrl / Shift 可多选，一次导入多条）")
         lst.pack(fill=tk.BOTH, expand=True, **pad)
+        # 子代理会话开关：默认隐藏。子代理记录的「用户消息」是父代理写的任务提示词，
+        # 正文只有 AI 干活过程；列出来会被当成用户自己的会话（2026-10-05 实测反馈）。
+        opt_row = ttk.Frame(lst)
+        opt_row.pack(fill=tk.X, padx=8, pady=(6, 0))
+        self.subagent_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            opt_row, text="包含子代理会话（AI 内部过程，默认不导入）",
+            variable=self.subagent_var, command=self._on_subagent_toggle,
+        ).pack(side=tk.LEFT)
+        self.subagent_hint_var = tk.StringVar(value="")
+        ttk.Label(opt_row, textvariable=self.subagent_hint_var,
+                  foreground="#a05a00").pack(side=tk.LEFT, padx=(8, 0))
         listwrap = ttk.Frame(lst)
         listwrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.listbox = tk.Listbox(listwrap, activestyle="dotbox", selectmode="extended")
@@ -5020,21 +5183,50 @@ class MigrateDialog:
         if self.cur_source is None:
             return
         self.listbox.delete(0, tk.END)
-        self.items = session_migration.list_source_sessions(
-            self.cur_source.tool, self.src_root_var.get()
+        # 一次扫全（含子代理），由开关决定**显示**哪些：勾选/取消勾选无需重新扫描。
+        self._all_items = session_migration.list_source_sessions(
+            self.cur_source.tool, self.src_root_var.get(), include_subagents=True
         )
-        for it in self.items:
-            title = it["title"] or "(无标题)"
-            self.listbox.insert(tk.END, "%s    —  %s" % (title[:60], it["detail"]))
-        self.status_lbl.configure(
-            text="共扫描到 %d 个会话" % len(self.items),
-            foreground="#0a6" if self.items else "#a05a00",
-        )
+        self._render_items()
         if self.items:
             self.listbox.selection_set(0)
             self._on_pick()
         else:
             self._refresh_preview()
+
+    def _on_subagent_toggle(self) -> None:
+        """勾选/取消「包含子代理会话」：只重排当前已扫描到的条目，不重新扫描。"""
+        self._render_items()
+        if self.items:
+            self.listbox.selection_set(0)
+        self._on_pick()
+
+    def _render_items(self) -> None:
+        """按「包含子代理会话」开关把 ``_all_items`` 渲染进列表，并维护 ``items``。
+
+        ``items`` 必须与列表**逐项对齐**（``_selected_items`` 用列表下标取条目）。
+        """
+        show_sub = bool(self.subagent_var.get())
+        all_items = list(self._all_items)
+        self.items = [it for it in all_items
+                      if show_sub or not it.get("subagent")]
+        hidden = len(all_items) - len(self.items)
+        self.listbox.delete(0, tk.END)
+        for it in self.items:
+            title = it["title"] or "(无标题)"
+            mark = "〔子代理〕" if it.get("subagent") else ""
+            self.listbox.insert(tk.END, "%s%s    —  %s" % (mark, title[:60], it["detail"]))
+        if hidden:
+            self.subagent_hint_var.set("另有 %d 条子代理会话（勾选后显示）" % hidden)
+        elif any(it.get("subagent") for it in all_items):
+            self.subagent_hint_var.set("已显示子代理会话：导入时会挂到父会话下，不占会话列表")
+        else:
+            self.subagent_hint_var.set("")
+        self.status_lbl.configure(
+            text="共扫描到 %d 个会话%s" % (
+                len(self.items), ("（已隐藏 %d 条子代理会话）" % hidden) if hidden else ""),
+            foreground="#0a6" if self.items else "#a05a00",
+        )
 
     def _on_pick(self) -> None:
         """选中会话变化：只需刷新「目标工作区」预览（工作区由规则自动判定）。"""
@@ -5261,7 +5453,8 @@ class MigrateDialog:
                     return
                 arc = archive_source.extract_session_root(path, tool, light=True)
                 try:
-                    items = session_migration.list_source_sessions(tool, arc.root)
+                    items = session_migration.list_source_sessions(
+                        tool, arc.root, include_subagents=True)
                 except Exception:
                     arc.cleanup()
                     raise
@@ -5315,19 +5508,16 @@ class MigrateDialog:
             old.cleanup()
         self.cur_source = import_matrix.ALL_SOURCES.get(tool) or self.cur_source
         self._show_pkg_meta(info, tool, src)
-        self.items = items
-        self.listbox.delete(0, tk.END)
-        for it in items:
-            title = it["title"] or "(无标题)"
-            self.listbox.insert(tk.END, "%s    —  %s" % (title[:60], it["detail"]))
-        if items:
+        self._all_items = items
+        self._render_items()
+        if self.items:
             self.listbox.selection_set(0)
         self.import_btn.configure(state="normal")
         note = ("；会话正文将在导入时解出" if arc.deferred else "")
         self.status_lbl.configure(
             text="已从备份包解出 %d 个可导入会话（按需解出 %d/%d 个条目%s）"
-                 % (len(items), arc.extracted, arc.total, note),
-            foreground="#0a6" if items else "#a05a00",
+                 % (len(self.items), arc.extracted, arc.total, note),
+            foreground="#0a6" if self.items else "#a05a00",
         )
         self._refresh_preview()
         self._refresh_notices()
@@ -5535,6 +5725,13 @@ class MigrateDialog:
             messagebox.showinfo("不支持", "目标工具暂不支持导入。", parent=self.win)
             return
 
+        # ---- 子代理会话：必须连同父会话一起导入（DSH 侧父子关系是双向写的） ----
+        resolved = self._resolve_subagent_items(items)
+        if resolved is None:
+            self.status_lbl.configure(text="已取消导入（子代理会话未处理）", foreground="#a05a00")
+            return
+        items = resolved
+
         # ---- 工作区：自动判定（源会话自带 > 工具默认），手动指定则覆盖全部 ----
         manual = self._manual_value()
         plans = [self._plan_for(None if manual else it, manual) for it in items]
@@ -5564,7 +5761,20 @@ class MigrateDialog:
 
         # ---- 逐条组装导入参数（每条会话用自己的落点） ----
         jobs = self._build_jobs(items, plans)
+        # 子代理条目可能因父会话线索缺失被跳过：如实告知，不静默吞掉。
+        done_items = {id(it) for it, _kw in jobs}
+        skipped = [it for it in items
+                   if it.get("subagent") and id(it) not in done_items]
+        if skipped:
+            self.warns.append(
+                "以下子代理会话的来源里没有记住父会话 id，已跳过（未写出）：\n"
+                + "\n".join("· %s" % (it.get("title") or "(无标题)") for it in skipped))
         if not jobs:
+            if skipped:
+                messagebox.showinfo(
+                    "没有可导入的会话",
+                    "选中的条目都是无法挂接父会话的子代理会话，本次没有导入任何会话。",
+                    parent=self.win)
             return
 
         self._result = None
@@ -5577,10 +5787,26 @@ class MigrateDialog:
         self.win.after(150, self._poll_import)
 
     def _build_jobs(self, items: list, plans: list) -> list:
-        """把「会话 + 落点计划」翻译成 ``migrate_session`` 的调用参数（纯函数，便于测试）。"""
+        """把「会话 + 落点计划」翻译成 ``migrate_session`` 的调用参数（纯函数，便于测试）。
+
+        导入 DSH 时额外走 :func:`session_migration.plan_dsh_import`：它先给每条会话
+        分配好目标 id / 创建时间，并建立子代理 → 父会话的挂接（父会话日志要写
+        ``subagent/catalog``，其中含子会话 id，故必须先分配再写）。父会话排在其子代理
+        之前写出。
+        """
         tool = self.target_tool
+        order = list(items)
+        info: dict = {}
+        if tool == "dsh":
+            sub_plan = session_migration.plan_dsh_import(items)
+            order = list(sub_plan["ordered"])
+            info = {id(job["item"]): job for job in sub_plan["jobs"]}
+        plan_of = {id(it): p for it, p in zip(items, plans)}
         jobs: list = []
-        for it, plan in zip(items, plans):
+        for it in order:
+            plan = plan_of.get(id(it))
+            if plan is None:
+                continue
             kwargs = {
                 "source_tool": self.cur_source.tool,
                 "source_path": it["path"],
@@ -5595,8 +5821,57 @@ class MigrateDialog:
                 kwargs["workspace_id"] = plan.value
             if self.cur_source.tool == "zcode":
                 kwargs["source_session_id"] = it["id"]
+            extra = info.get(id(it))
+            if extra is not None:
+                kwargs["session_id"] = extra["session_id"]
+                kwargs["created_ms"] = extra["created_ms"]
+                if extra["parent_session_id"]:
+                    kwargs["parent_session_id"] = extra["parent_session_id"]
+                if extra["subagent_catalog"]:
+                    kwargs["subagent_catalog"] = extra["subagent_catalog"]
             jobs.append((it, kwargs))
         return jobs
+
+    def _resolve_subagent_items(self, items: list):
+        """把子代理会话的父会话补进本次导入，返回补全后的条目列表。
+
+        为什么必须补：DSH 的父子关系写两份——子会话 header 的 ``parentSession``
+        与**父会话日志**里的 ``subagent/catalog``。父会话不在本批时，写出的子代理会话
+        既不进侧边栏（子代理不登记工作区）又挂不到任何父会话，等于凭空多出一份没人能
+        打开的记录。故：父会话可选时**显式询问后一并导入**；来源没记住父会话 id 的
+        条目则跳过并如实告知，绝不降级成顶层会话。
+
+        :return: 补全后的条目列表；用户取消时返回 ``None``（中止导入）。
+        """
+        if self.target_tool != "dsh":
+            # 其它目标工具没有子代理结构：条目录入前已由开关决定是否显示，
+            # 这里原样透传（子代理正文按普通会话写出）。
+            return list(items)
+        plan = session_migration.plan_dsh_import(items, available=self._all_items)
+        if plan["missing_parents"] and not HEADLESS:
+            names = "\n".join("· %s" % (it.get("title") or "(无标题)")[:60]
+                              for it in plan["missing_parents"][:6])
+            if not messagebox.askyesno(
+                "有子代理会话无法挂接",
+                "以下子代理会话的来源里没有记住父会话 id：\n\n%s\n\n"
+                "DSH 不接受没有父会话的子代理会话，本次会**跳过**这些条目，"
+                "其余会话正常导入。是否继续？" % names,
+                parent=self.win,
+            ):
+                return None
+        if plan["extra_parents"] and not HEADLESS:
+            names = "\n".join("· %s" % (it.get("title") or "(无标题)")[:60]
+                              for it in plan["extra_parents"][:6])
+            if not messagebox.askyesno(
+                "需要连同父会话一起导入",
+                "选中的子代理会话在 DSH 里要挂到父会话下，而父会话日志需要先写出"
+                "（含子会话 id 的 subagent/catalog）。\n\n"
+                "以下父会话不在本次选择里，将**一并导入**（它们会像普通会话一样"
+                "出现在会话列表里）：\n\n%s\n\n是否继续？" % names,
+                parent=self.win,
+            ):
+                return None
+        return list(plan["ordered"])
 
     def _run_jobs(self, jobs: list) -> None:
         """逐条导入（在后台线程执行），结果写入 ``self._result``。"""

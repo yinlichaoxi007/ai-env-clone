@@ -55,6 +55,23 @@ DeepSeek Harness（DSH，Zstandard 压缩 JSONL）
     探测逻辑复用 :func:`ai_env_clone.dsh_repair.zstd_backend`）；后端缺失时
     相关操作会明确报错而非静默失败。
 
+**子代理会话**（AI 自己拉起的子会话，不是用户的会话）
+    来源工具都记录这类「AI 内部过程」：ZCode 用 ``session.task_type =
+    'subagent_child'`` + ``parent_id`` 标记（实测一个备份包里 34 条会话有 23 条属此类），
+    DSH 的子代理会话则是**裸 uuid** 的会话目录。它们的「用户消息」是父代理写下的任务
+    提示词，正文只有推理与工具调用，故看起来「只有 AI 干活过程」。本模块的处理：
+
+    - 列出来源会话时**默认不列**（``list_source_sessions(..., include_subagents=False)``），
+      条目另带 ``subagent`` / ``parent_id`` / ``parent_title`` 三个字段供界面识别与挂接；
+    - 导入 DSH 时按**原生子代理结构**写出（见 :func:`_dsh_v3_text` 与
+      :meth:`SessionWriter.write_dsh`）：裸 uuid 目录、header 带
+      ``parentSession`` / ``origin: "subagent"`` / ``delegationDepth: 1``、
+      seq 0 为 ``subagent/descriptor``（``data.version`` 必须为 3），且**不登记**
+      ``workspace.json``（故不会作为平级会话出现在侧边栏）；
+    - 父子关系要写两份（子会话 header + 父会话日志的 ``subagent/catalog``），故批量
+      导入必须先规划再写：:func:`plan_dsh_import` 分配 id / 创建时间 → 写父会话 →
+      最后写子会话，且父会话要写全自己名下子代理的目录条目。
+
 说明：CodeBuddy 路径嵌套 UUID 极易超过 Windows MAX_PATH(260)，统一用 ``\\\\?\\``
 长路径前缀读写。
 
@@ -86,7 +103,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 from .adapters.codebuddy import detect_current_uid, detect_session_root
 
@@ -368,7 +385,23 @@ def _dsh_write_text(session_file: str, text: str) -> None:
         f.write(payload)
 
 
-def _dsh_v3_text(sid: str, session, cwd_val: str) -> "tuple[str, int, str]":
+def _subagent_label(source_tool: str, title: str) -> str:
+    """子代理描述符 / 目录条目的 ``label``（官方要求非空，故缺标题时给可读兜底）。"""
+    label = " ".join((title or "").split()).strip()
+    if not label:
+        label = "导入的子代理会话（来自 %s）" % (source_tool or "其它工具")
+    return label[:120]
+
+
+def _dsh_subagent_label(session, title: str) -> str:
+    """``Session`` 版的子代理 label（见 :func:`_subagent_label`）。"""
+    return _subagent_label(session.source_tool, title)
+
+
+def _dsh_v3_text(sid: str, session, cwd_val: str,
+                 parent_session_id: str = "",
+                 subagent_catalog: "Sequence[dict]" = (),
+                 created_ms: int = 0) -> "tuple[str, int, str]":
     """构造一份**格式合法**的 DSH v3 会话日志，返回 ``(文本, createdAt_ms, 标题)``。
 
     ⚠️ 这里是本工具最容易出错的地方：DSH 加载会话时会先用自带迁移链把存储代际
@@ -383,15 +416,49 @@ def _dsh_v3_text(sid: str, session, cwd_val: str) -> "tuple[str, int, str]":
 
     下面的事件序列已用 DSH 官方 ``session-format-catalog`` 迁移+校验链
     （``validation='transformed'`` 与 ``'current'`` 双重往返）实测通过。
+
+    子代理会话（``parent_session_id`` 非空）按 DSH **原生子代理结构**写出，契约取自
+    本机真实子代理会话 + 安装包内的官方校验器：
+
+    - header 追加 ``parentSession`` / ``origin: "subagent"`` / ``delegationDepth: 1``
+      （三者都在官方 released v2/v3 header 的 ``HEADER_OPTIONAL`` 里；``origin``
+      只允许 ``"subagent"``）；
+    - **seq 0** 必须是 ``subagent/descriptor``，``data.version`` 必须为 **3**
+      （官方 ``assertReleasedEventPayload`` 对 v0 代际是硬拒绝；必填
+      ``mode`` / ``version`` / ``provider``，``provider`` 非空，本工具取实测值
+      ``"spawn"``，``mode`` 取 ``"one-shot"``）；
+    - 子代理会话**不写** ``workspace.json`` 登记（当前代 DSH 的子代理会话不在
+      侧边栏列表里，而是挂在父会话的 ``subagent/catalog`` 下），故额外的
+      ``parentSession`` 是它唯一的归属线索。
+
+    ``subagent_catalog`` 是**本会话（父会话）**名下的子代理目录条目，每项含
+    ``childId`` / ``childCreatedAt`` / ``mode`` / ``label``：官方
+    ``subagent/catalog`` 事件必填 ``childId`` + ``childCreatedAt`` + ``version``，
+    ``version: 0`` 时另需 ``mode``（``one-shot`` 时 ``label`` 可省）。因为
+    ``childId`` 要在写父会话时已知，调用方必须**先分配**子代理会话 id 再写父会话
+    （批处理见 :func:`plan_dsh_import`）。
+
+    :param created_ms: 复用调用方预先分配的创建时间（毫秒）。父会话的
+        ``subagent/catalog`` 要写子会话的 ``childCreatedAt``，只有让子会话沿用
+        计划阶段分配的时间戳，两处才会严格相等。
     """
-    first_ms = _now_ms()
+    first_ms = int(created_ms) if created_ms else _now_ms()
+    title = session.title or "导入会话（来自 %s）" % session.source_tool
+    #: 子代理会话的 id 是**裸 uuid**（顶层是 ``session-<uuid>``），调用方负责传入；
+    #: 这里只负责把它写进 header 与系统头消息 id。
     header = {
         "type": "session", "version": 3, "id": sid,
         "createdAt": first_ms, "isSeeded": False,
-        "delegationDepth": 0, "agentPreset": "standard",
+        "delegationDepth": 1 if parent_session_id else 0,
+        "agentPreset": "standard",
     }
     if cwd_val:
         header["cwd"] = cwd_val
+    if parent_session_id:
+        # 官方 released v2/v3 header 的 HEADER_OPTIONAL 允许 parentSession / origin；
+        # origin 只能是 "subagent"（其它取值会被 assertReleasedV2Header 拒绝）。
+        header["parentSession"] = parent_session_id
+        header["origin"] = "subagent"
 
     events: list = []
 
@@ -402,6 +469,18 @@ def _dsh_v3_text(sid: str, session, cwd_val: str) -> "tuple[str, int, str]":
             ev["surfaceOp"] = surface_op
         events.append(ev)
         return ev["seq"]
+
+    # 0) 子代理会话：seq 0 必须是 subagent/descriptor，且 version 必须为 3。
+    #    官方 released v0 校验（assertReleasedEventPayload）对 descriptor 的版本是
+    #    硬性要求：version 不是 3 时 v0 代际直接拒绝整份日志 ⇒ 会话无法加载。
+    #    必填字段 mode / version / provider；mode 取 one-shot 时 label 可选
+    #    （见 subagentDescriptorValue）。来源工具记不下「能否续话」，故按一次性
+    #    子代理复刻为 one-shot；provider 沿用官方实测值 "spawn"。
+    if parent_session_id:
+        emit("subagent/descriptor", first_ms, {
+            "version": 3, "mode": "one-shot", "provider": "spawn",
+            "label": _dsh_subagent_label(session, title),
+        })
 
     turn = 1
     # 1) 预设 / 沙箱 / 审批 + 受保护的系统头，全部落在一个已开启的 turn 内。
@@ -456,9 +535,26 @@ def _dsh_v3_text(sid: str, session, cwd_val: str) -> "tuple[str, int, str]":
                 first_user_seq = seq
             emit("step/end", ms, {"turn": turn, "step": step})
 
+    # 3) 本会话名下的子代理目录条目（官方 ``subagent/catalog``）。
+    #    真实 DSH 把它写在拉起子代理的那个 step 里；本工具的历史会话没有工具调用，
+    #    故单独占一个 step，仍落在同一个已开启的 turn 内（关系校验只配对 step/turn）。
+    for entry in subagent_catalog:
+        child_id = str((entry or {}).get("childId") or "").strip()
+        if not child_id:
+            continue
+        step += 1
+        emit("step/start", last_ms, {"turn": turn, "step": step})
+        emit("subagent/catalog", last_ms, {
+            "version": 0,
+            "childId": child_id,
+            "childCreatedAt": int((entry or {}).get("childCreatedAt") or last_ms),
+            "mode": (entry or {}).get("mode") or "one-shot",
+            "label": (entry or {}).get("label") or "",
+        })
+        emit("step/end", last_ms, {"turn": turn, "step": step})
+
     emit("turn/end", last_ms, {"turn": turn, "reason": {"kind": "completed"}})
 
-    title = session.title or "导入会话（来自 %s）" % session.source_tool
     if first_user_seq is None:
         title_data = {"title": title, "messageSeqs": [], "source": {"kind": "user"}}
     else:
@@ -763,6 +859,15 @@ class Session:
     title: str = ""                # 会话标题
     scope: str = ""                # 项目/作用域标识
     messages: list = field(default_factory=list)  # List[SessionMessage]
+    #: 该记录在来源工具里是**子代理（子会话）**，不是用户自己发起的会话。
+    #: 例：ZCode 的 ``session.task_type = 'subagent_child'``（``parent_id`` 非空）。
+    #: 这类记录的「用户消息」是父代理写下的任务提示词，正文只有 AI 干活过程，
+    #: 故默认**不导入**（见 :func:`list_source_sessions` 的 ``include_subagents``）。
+    is_subagent: bool = False
+    #: 子代理记录在来源工具里的父会话 id（非子代理时为空串）
+    parent_source_id: str = ""
+    #: 父会话标题（供界面展示「属于 X」；取不到时为空串）
+    parent_title: str = ""
 
 
 # --------------------------------------------------------------------------- #
@@ -972,15 +1077,35 @@ class SessionParser:
     # ---- ZCode ----
     @staticmethod
     def parse_zcode(db_path: str, session_id: str) -> Session:
-        """解析 ZCode ``cli/db/db.sqlite`` 中的单个会话（只读打开，不写入）。"""
+        """解析 ZCode ``cli/db/db.sqlite`` 中的单个会话（只读打开，不写入）。
+
+        ``session`` 表的 ``task_type`` / ``parent_id`` 用来判定这条记录是不是
+        **子代理会话**（``task_type = 'subagent_child'``、``parent_id`` 指向父会话）：
+        这类记录的用户消息是父代理写的任务提示词，正文只有 AI 干活过程，
+        迁移到 DSH 时要按原生子代理结构写出（见
+        :meth:`SessionWriter.write_dsh`），不能当成用户会话。
+        """
         con = _open_sqlite_ro(db_path)
         try:
-            row = con.execute(
-                "select id, title, directory, time_created from session where id = ?",
-                (session_id,),
-            ).fetchone()
+            cols = {r[1] for r in con.execute('pragma table_info("session")')}
+            extra = [c for c in ("parent_id", "task_type") if c in cols]
+            sel = "select id, title, directory, time_created%s from session where id = ?" % (
+                (", " + ", ".join(extra)) if extra else "")
+            row = con.execute(sel, (session_id,)).fetchone()
             title = (row[1] if row else "") or ""
             scope = (row[2] if row else "") or ""
+            parent_id = task_type = ""
+            if row and extra:
+                values = dict(zip(extra, row[4:]))
+                parent_id = (values.get("parent_id") or "").strip()
+                task_type = (values.get("task_type") or "").strip()
+            is_subagent = bool(parent_id) or task_type == "subagent_child" \
+                or str(session_id).startswith("sess_subagent_agent_")
+            parent_title = ""
+            if is_subagent and parent_id:
+                prow = con.execute("select title from session where id = ?",
+                                   (parent_id,)).fetchone()
+                parent_title = ((prow[0] if prow else "") or "").strip()
             msgs: list = []
             for mid, seq, mdata in con.execute(
                 "select id, sequence, data from message where session_id = ? "
@@ -1031,7 +1156,9 @@ class SessionParser:
                     created_at=_ms_to_iso((mobj or {}).get("time", {}).get("created")
                                           if isinstance((mobj or {}).get("time"), dict) else None),
                 ))
-            return Session(source_tool="zcode", title=title, scope=scope, messages=msgs)
+            return Session(source_tool="zcode", title=title, scope=scope, messages=msgs,
+                           is_subagent=is_subagent, parent_source_id=parent_id,
+                           parent_title=parent_title)
         finally:
             con.close()
 
@@ -1054,6 +1181,8 @@ class SessionParser:
         title = ""
         scope = ""
         msgs: list = []
+        is_subagent = False
+        parent_session_id = ""
         for line in text.split("\n"):
             line = line.strip()
             if not line:
@@ -1066,6 +1195,11 @@ class SessionParser:
             data = obj.get("data") or {}
             if etype == "session":
                 scope = obj.get("cwd") or ""
+                # 子代理会话的判定只看 header（``origin: "subagent"`` + ``parentSession``）；
+                # 目录名（裸 uuid）只是旁证，日志被单独拷出来时它不一定还在。
+                is_subagent = obj.get("origin") == "subagent" \
+                    or bool(obj.get("parentSession"))
+                parent_session_id = obj.get("parentSession") or ""
             elif etype == "session/title":
                 title = title or (data.get("title") or "")
             elif etype == "user/message":
@@ -1100,7 +1234,9 @@ class SessionParser:
                     msgs[-1].tool_calls.extend(tool_calls)
                 else:
                     msgs.append(m)
-        return Session(source_tool="dsh", title=title, scope=scope, messages=msgs)
+        return Session(source_tool="dsh", title=title, scope=scope, messages=msgs,
+                       is_subagent=is_subagent,
+                       parent_source_id=parent_session_id)
 
 
 
@@ -1291,29 +1427,61 @@ class SessionWriter:
     # ---- 写为 DeepSeek Harness 原生会话 ----
     @staticmethod
     def write_dsh(session: Session, dsh_home: str, cwd: str = "",
-                  warn: "Callable[[str], None] | None" = None) -> str:
-        """写出为 DSH 原生会话，返回新会话 id（``session-<uuid>``）。
+                  warn: "Callable[[str], None] | None" = None,
+                  session_id: str = "", parent_session_id: str = "",
+                  subagent_catalog: "Sequence[dict]" = (),
+                  created_ms: int = 0) -> str:
+        """写出为 DSH 原生会话，返回新会话 id。
 
-        需要**同时**落：
+        顶层会话（默认）：
 
-        1. ``sessions/<workspace_dir>/<sid>/session.v3.jsonl.zstd``（内容）；
-        2. ``storages/workspace.json`` 的工作区登记（会话列表按此索引）；
+        1. ``sessions/<workspace_dir>/session-<uuid>/session.v3.jsonl.zstd``（内容）；
+        2. ``storages/workspace.json`` 的工作区登记（侧边栏列表按此索引）；
         3. ``storages/session_projcache/sessions/<sid>.json`` 的投影缓存
            （冷会话的 ``blank`` 与标题都只来自这里，缺了就是「工作区有会话却看不到」）。
 
-        依赖可用 zstd 后端；缺失时抛 :class:`RuntimeError`。
+        **子代理会话**（``parent_session_id`` 非空）按 DSH 原生结构写出，与顶层会话有三点不同
+        （契约见 :func:`_dsh_v3_text` 与 README「子代理会话」一节的实测记录）：
+
+        1. 会话 id / 目录名是**裸 uuid**（``<uuid>``，无 ``session-`` 前缀）；
+        2. 日志 header 带 ``parentSession`` / ``origin: "subagent"`` / ``delegationDepth: 1``，
+           且 seq 0 是 ``subagent/descriptor``；
+        3. **不登记** ``workspace.json``（当前代 DSH 的子代理会话不进侧边栏列表，而是挂在
+           父会话的 ``subagent/catalog`` 下），也**不预写**投影缓存——该缓存由 DSH 按需自算，
+           缺它只是「多一次尾部重放」，不会给出错误值。
+
+        :param session_id: 复用调用方**预先分配**的会话 id（父会话的 ``subagent/catalog``
+            必须在写父会话时就已知子会话 id，故批量导入时先分配、再写父、最后写子；
+            见 :func:`plan_dsh_import`）。
+        :param created_ms: 复用调用方**预先分配**的创建时间（毫秒），使父会话
+            ``subagent/catalog`` 里的 ``childCreatedAt`` 与子会话 header 的
+            ``createdAt`` 严格相等。
+        :param subagent_catalog: 本会话名下的子代理目录条目（``childId`` /
+            ``childCreatedAt`` / ``mode`` / ``label``），写进本会话日志。
         """
         def _warn(msg: str) -> None:
             if warn:
                 warn(msg)
 
-        sid = _new_dsh_id()
+        is_subagent = bool(parent_session_id)
+        if session_id:
+            sid = session_id
+        else:
+            sid = _new_dsh_subagent_id() if is_subagent else _new_dsh_id()
         cwd_val = cwd or session.scope or ""
         workspace_dir = _dsh_workspace_dirname(cwd_val or "imported-workspace")
         session_dir = os.path.join(dsh_home, "sessions", workspace_dir, sid)
 
-        text, first_ms, title = _dsh_v3_text(sid, session, cwd_val)
+        text, first_ms, title = _dsh_v3_text(
+            sid, session, cwd_val,
+            parent_session_id=parent_session_id,
+            subagent_catalog=subagent_catalog,
+            created_ms=created_ms,
+        )
         _dsh_write_text(os.path.join(session_dir, "session.v3.jsonl.zstd"), text)
+
+        if is_subagent:
+            return sid
 
         _register_dsh_session(dsh_home, sid, workspace_dir, cwd_val,
                               title, first_ms, _warn)
@@ -1337,8 +1505,13 @@ def _new_reasonix_id() -> str:
 
 
 def _new_dsh_id() -> str:
-    """DSH 会话 id / 目录名：``session-<uuid>``。"""
+    """DSH 顶层会话 id / 目录名：``session-<uuid>``。"""
     return "session-%s" % uuid.uuid4()
+
+
+def _new_dsh_subagent_id() -> str:
+    """DSH 子代理会话 id / 目录名：**裸 uuid**（无 ``session-`` 前缀，与产品实测一致）。"""
+    return str(uuid.uuid4())
 
 
 def _sanitize_scope(scope: str) -> str:
@@ -1352,6 +1525,9 @@ def migrate_session(source_tool: str, source_path: str,
                      target_tool: str, target_root: str,
                      scope: str = "", workspace_id: str = "",
                      source_session_id: str = "",
+                     parent_session_id: str = "", session_id: str = "",
+                     subagent_catalog: "Sequence[dict]" = (),
+                     created_ms: int = 0,
                      warn: "Callable[[str], None] | None" = None) -> str:
     """统一入口：从 source 解析并以 target 原生格式写出，返回新会话 id。
 
@@ -1372,6 +1548,15 @@ def migrate_session(source_tool: str, source_path: str,
     :param scope: reasonix 目标作用域 / workbuddy 工作区编码
     :param workspace_id: codebuddy 目标 workspaceId / workbuddy 与 dsh 的目标工作区路径（cwd）
     :param source_session_id: zcode 源会话 id
+    :param parent_session_id: 目标 DSH 侧的**父会话 id**；非空时本会话按 DSH 原生
+        **子代理会话**写出（裸 uuid 目录、header 带 ``parentSession`` /
+        ``origin: "subagent"`` / ``delegationDepth: 1``、seq 0 为
+        ``subagent/descriptor``），且不登记 workspace.json。仅 ``target_tool="dsh"`` 有意义。
+    :param session_id: 复用调用方预先分配的会话 id（父会话的 ``subagent/catalog``
+        需要在写父会话时就已知子会话 id）。
+    :param subagent_catalog: 写进本会话日志的 ``subagent/catalog`` 条目（父会话用）。
+    :param created_ms: 复用调用方预先分配的创建时间（毫秒），使父会话
+        ``subagent/catalog`` 的 ``childCreatedAt`` 与子会话 header 的 ``createdAt`` 相等。
     :param warn: 可选警告回调（落点异常时调用，仅提示不阻断）。
     """
     def _warn(msg: str) -> None:
@@ -1461,11 +1646,119 @@ def migrate_session(source_tool: str, source_path: str,
             session, target_root, workspace_slug=scope, cwd=workspace_id, warn=_warn
         )
     elif target_tool == "dsh":
+        if parent_session_id and not session.is_subagent:
+            # 源会话本身不是子代理记录，却要求挂到某个父会话下：多半是调用方把
+            # 条目搞错了。宁可不挂，也不要伪造一条「来源没有的」子代理关系。
+            _warn("该会话在来源工具里不是子代理会话，已按普通会话写出，未挂到父会话下。")
+            parent_session_id = ""
         return SessionWriter.write_dsh(
-            session, target_root, cwd=workspace_id, warn=_warn
+            session, target_root, cwd=workspace_id, warn=_warn,
+            session_id=session_id, parent_session_id=parent_session_id,
+            subagent_catalog=subagent_catalog, created_ms=created_ms,
         )
     else:
         raise ValueError(f"不支持的目标工具: {target_tool}")
+
+
+# --------------------------------------------------------------------------- #
+# 导入编排（供「导入」对话框把子代理挂到父会话下）
+# --------------------------------------------------------------------------- #
+def plan_dsh_import(items: Sequence[dict],
+                    available: "Sequence[dict] | None" = None) -> dict:
+    """规划一批条目导入 DSH 时的会话 id 与**子代理挂接**（纯计算，不写盘、不碰界面）。
+
+    为什么需要它：DSH 的父子关系写**两份**——子会话 header 里的 ``parentSession``，
+    以及父会话日志里的 ``subagent/catalog``（内容含子会话 id 与创建时间）。因此
+    「会话 id / 创建时间」必须在**写父会话之前**就定下来，不能等写出时再随机生成。
+
+    :param items: 本次选中的条目（``list_source_sessions`` 的返回值）
+    :param available: 本次扫描到的**全部**条目；用于把「选中了子代理但没选父会话」
+        的父会话补进本批（返回在 ``extra_parents`` 里，由调用方先行确认）
+
+    :return: ``{"jobs", "ordered", "extra_parents", "missing_parents"}``：
+
+        - ``jobs``：按**写入顺序**排好的列表（父会话一定先于其子代理），每项
+          ``{"item","session_id","created_ms","parent_session_id","subagent_catalog"}``
+        - ``ordered``：与 ``jobs`` 同序的条目列表（便于调用方按序取落点计划）
+        - ``extra_parents``：为挂接子代理而**额外补进来**的父会话条目（需用户确认）
+        - ``missing_parents``：父会话线索缺失（来源没记 ``parent_id``，例如从 DSH
+          自身导入的子代理条目）而**无法挂接**的子代理条目——调用方应如实告知用户
+          这些条目未导入，而不是把它们偷偷降级成顶层会话。
+    """
+    selected = list(items)
+    pool = list(available or [])
+    selected_obj = {id(it) for it in selected}
+
+    by_source_id: dict = {}
+    for it in pool + selected:
+        sid = it.get("id")
+        if sid and sid not in by_source_id:
+            by_source_id[sid] = it
+
+    # 1) 补父会话：选中的子代理，其父会话不在本批但能在「本次扫描到的全部条目」里找到
+    extra_parents: list = []
+    taken = set(selected_obj)
+    for it in selected:
+        if not it.get("subagent"):
+            continue
+        pid = (it.get("parent_id") or "").strip()
+        if not pid:
+            continue
+        parent = by_source_id.get(pid)
+        if parent is None or id(parent) in taken:
+            continue
+        taken.add(id(parent))
+        extra_parents.append(parent)
+
+    batch = selected + extra_parents
+
+    # 2) 分配新会话 id / 创建时间（顶层 session-<uuid>，子代理裸 uuid）
+    now = _now_ms()
+    info: dict = {}
+    for offset, it in enumerate(batch):
+        is_sub = bool(it.get("subagent"))
+        info[id(it)] = {
+            "item": it,
+            "session_id": _new_dsh_subagent_id() if is_sub else _new_dsh_id(),
+            "created_ms": now + offset,
+            "parent_session_id": "",
+            "subagent_catalog": [],
+        }
+
+    # 3) 子代理 → 父会话挂接；父会话收集自己名下的 catalog 条目
+    source_index: dict = {}
+    for it in batch:
+        sid = it.get("id")
+        if sid and sid not in source_index:
+            source_index[sid] = it
+    missing_parents: list = []
+    for it in batch:
+        rec = info[id(it)]
+        if not it.get("subagent"):
+            continue
+        pid = (it.get("parent_id") or "").strip()
+        parent = source_index.get(pid) if pid else None
+        if parent is None:
+            missing_parents.append(it)
+            continue
+        rec["parent_session_id"] = info[id(parent)]["session_id"]
+        info[id(parent)]["subagent_catalog"].append({
+            "childId": rec["session_id"],
+            "childCreatedAt": rec["created_ms"],
+            "mode": "one-shot",
+            "label": _subagent_label("", it.get("title") or ""),
+        })
+
+    # 4) 顺序：父会话（非子代理）保持原相对顺序在前，其余子代理随后；
+    #    这样父会话日志先落盘，其 subagent/catalog 指向的子会话随后写出。
+    #    父会话线索缺失的子代理**不进 jobs**（调用方应告知用户它们被跳过）。
+    skipped = {id(it) for it in missing_parents}
+    visible = [it for it in batch if id(it) not in skipped]
+    ordered = [it for it in visible if not it.get("subagent")] + \
+              [it for it in visible if it.get("subagent")]
+    jobs = [info[id(it)] for it in ordered]
+    return {"jobs": jobs, "ordered": ordered, "extra_parents": extra_parents,
+            "missing_parents": missing_parents}
 
 
 # --------------------------------------------------------------------------- #
@@ -1522,10 +1815,20 @@ def list_target_workspaces(tool: str, root: str) -> list:
         return []
 
 
-def list_source_sessions(tool: str, root: str) -> list:
+def list_source_sessions(tool: str, root: str, include_subagents: bool = False) -> list:
     """列出来源工具 ``root`` 下可导入的会话。
 
-    :return: 列表，每项 ``{"id","title","path","detail","cwd","workspace_id","scope"}``：
+    :param include_subagents: 是否把**子代理会话**也列出来，**默认 False**。
+        子代理会话是 AI 内部拉起的子会话记录（ZCode：``task_type =
+        'subagent_child'`` / ``parent_id`` 非空；DSH：裸 uuid 目录），它们的
+        「用户消息」是父代理写下的任务提示词，正文只有 AI 干活过程——列进
+        「可导入会话」会被误读成用户自己的会话（2026-10-05 实测反馈）。
+        置 True 时这些条目带 ``subagent=True`` 与 ``parent_id`` / ``parent_title``，
+        导入 DSH 时按原生子代理结构挂到父会话下（见
+        :meth:`SessionWriter.write_dsh`）。
+
+    :return: 列表，每项 ``{"id","title","path","detail","cwd","workspace_id","scope",
+        "subagent","parent_id","parent_title"}``：
 
         - ``id``    ：migrate_session 所需的源标识（zcode 为会话 id，其余为路径）
         - ``title`` ：会话标题（尽力而为，取不到为空串）
@@ -1536,6 +1839,8 @@ def list_source_sessions(tool: str, root: str) -> list:
                       记录反查（反查不到则留空，退回目标工具的默认落点）
         - ``workspace_id``：CodeBuddy 的 workspaceId（仅 codebuddy 有值）
         - ``scope`` ：Reasonix 的项目名（仅 reasonix 有值）
+        - ``subagent``：是否子代理会话（其它工具暂一律 False）
+        - ``parent_id`` / ``parent_title``：子代理会话的父会话线索（取不到为空串）
 
     以上三项「工作区线索」由 ``workspace_plan`` 消费，用于**自动**确定导入落点
     （见 ``ai_env_clone/workspace_plan.py``）。
@@ -1543,16 +1848,22 @@ def list_source_sessions(tool: str, root: str) -> list:
     if not root or not os.path.isdir(root):
         return []
     if tool == "reasonix":
-        return _scan_reasonix(root)
-    if tool == "codebuddy":
-        return _scan_codebuddy(root)
-    if tool == "workbuddy":
-        return _scan_workbuddy(root)
-    if tool == "zcode":
-        return _scan_zcode(root)
-    if tool == "dsh":
-        return _scan_dsh(root)
-    return []
+        items = _scan_reasonix(root)
+    elif tool == "codebuddy":
+        items = _scan_codebuddy(root)
+    elif tool == "workbuddy":
+        items = _scan_workbuddy(root)
+    elif tool == "zcode":
+        items = _scan_zcode(root, include_subagents=include_subagents)
+    elif tool == "dsh":
+        items = _scan_dsh(root, include_subagents=include_subagents)
+    else:
+        return []
+    for it in items:
+        it.setdefault("subagent", False)
+        it.setdefault("parent_id", "")
+        it.setdefault("parent_title", "")
+    return items
 
 
 def _scan_reasonix(root: str) -> list:
@@ -1752,31 +2063,79 @@ def _scan_workbuddy(root: str) -> list:
     return out
 
 
-def _scan_zcode(root: str) -> list:
-    """扫描 ZCode ``<root>/cli/db/db.sqlite`` 的 ``session`` 表。"""
+def _scan_zcode(root: str, include_subagents: bool = False) -> list:
+    """扫描 ZCode ``<root>/cli/db/db.sqlite`` 的 ``session`` 表。
+
+    ``session`` 表区分两类记录（实测 ZCode 备份库）：
+    ``task_type = 'interactive'`` 的用户会话，与 ``task_type = 'subagent_child'``
+    的**子代理会话**（``parent_id`` 指向父会话、id 前缀 ``sess_subagent_agent_``）。
+
+    子代理会话默认**不列出**：它的「用户消息」是父代理写下的任务提示词，正文只有
+    AI 干活过程（推理 + 工具），列进「可导入会话」会被读成用户自己的会话。
+    ``include_subagents=True`` 时放行，条目额外带 ``subagent`` / ``parent_id`` /
+    ``parent_title``，并紧跟在各自父会话之后排列，供导入时按 DSH 原生子代理结构挂接。
+    """
     db = os.path.join(root, "cli", "db", "db.sqlite")
     if not os.path.isfile(db):
         # 允许直接传 db 路径
         db = root if root.endswith(".sqlite") or root.endswith(".db") else db
     if not os.path.isfile(db):
         return []
-    out = []
+    rows: list = []
+    sel: list = []
     try:
         con = _open_sqlite_ro(db)
         try:
             cols = [r[1] for r in con.execute('pragma table_info("session")')]
-            has_dir = "directory" in cols
-            sql = "select id, title%s from session" % (", directory" if has_dir else "")
-            rows = list(con.execute(sql))
+            sel = ["id", "title"]
+            if "directory" in cols:
+                sel.append("directory")
+            if "parent_id" in cols:
+                sel.append("parent_id")
+            if "task_type" in cols:
+                sel.append("task_type")
+            rows = list(con.execute("select %s from session" % ", ".join(sel)))
         finally:
             con.close()
     except sqlite3.Error:
         return []
+
+    titles = {rec.get("id"): (rec.get("title") or "") for rec in
+              (dict(zip(sel, row)) for row in rows)}
+    parents: list = []
+    children: dict = {}
     for row in rows:
-        sid, title = row[0], row[1]
-        detail = row[2] if len(row) > 2 and row[2] else ""
-        out.append({"id": sid, "title": title or "", "path": db, "detail": detail,
-                    "cwd": detail, "workspace_id": ""})
+        rec = dict(zip(sel, row))
+        sid = rec.get("id")
+        parent_id = (rec.get("parent_id") or "").strip()
+        task_type = (rec.get("task_type") or "").strip()
+        is_sub = bool(parent_id) or task_type == "subagent_child" \
+            or str(sid).startswith("sess_subagent_agent_")
+        if is_sub and not include_subagents:
+            continue
+        directory = rec.get("directory") or ""
+        parent_title = titles.get(parent_id, "") if parent_id else ""
+        if is_sub:
+            detail = "子代理会话（属于：%s）" % (parent_title or parent_id or "未知父会话")
+        else:
+            detail = directory
+        item = {"id": sid, "title": rec.get("title") or "", "path": db, "detail": detail,
+                "cwd": directory, "workspace_id": "",
+                "subagent": is_sub, "parent_id": parent_id, "parent_title": parent_title}
+        if is_sub:
+            children.setdefault(parent_id, []).append(item)
+        else:
+            parents.append(item)
+
+    out = list(parents)
+    if include_subagents:
+        # 父会话之后紧跟其子代理（父会话本身被过滤/缺失时，子代理排在最后并保持原顺序）
+        out = []
+        for item in parents:
+            out.append(item)
+            out.extend(children.pop(item["id"], []))
+        for orphans in children.values():
+            out.extend(orphans)
     return out
 
 
@@ -1828,11 +2187,16 @@ def _dsh_projcache_titles(root: str) -> dict:
     return titles
 
 
-def _scan_dsh(root: str) -> list:
+def _scan_dsh(root: str, include_subagents: bool = False) -> list:
     """扫描 DSH ``<root>/sessions/<workspace_dir>/<session-…>/``。
 
     标题取会话投影缓存（``storages/session_projcache*``，两种布局都读；
     见 :func:`_dsh_projcache_titles`），避免解压大文件。
+
+    **子代理会话**由目录名区分：顶层会话是 ``session-<uuid>``，子代理会话是**裸 uuid**
+    （见 :meth:`SessionWriter.write_dsh`）。裸 uuid 目录默认不列出——它们是 AI 的子代理
+    记录，不是用户会话；``include_subagents=True`` 时列出并标记 ``subagent``。
+    父会话 id 要解压日志才拿得到，故此处不填 ``parent_title``。
     """
     out = []
     titles = _dsh_projcache_titles(root)
@@ -1859,9 +2223,14 @@ def _scan_dsh(root: str) -> list:
                 continue
             if not _dsh_latest_session_file(sd):
                 continue
+            is_sub = not sess.startswith("session-")
+            if is_sub and not include_subagents:
+                continue
             out.append({"id": sd, "title": titles.get(sess, ""), "path": sd,
-                        "detail": "工作区 %s" % wsdir,
-                        "cwd": ws_paths.get(wsdir, ""), "workspace_id": ""})
+                        "detail": ("子代理会话 · 工作区 %s" % wsdir) if is_sub
+                                  else ("工作区 %s" % wsdir),
+                        "cwd": ws_paths.get(wsdir, ""), "workspace_id": "",
+                        "subagent": is_sub, "parent_id": "", "parent_title": ""})
     return out
 
 

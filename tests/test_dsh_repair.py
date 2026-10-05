@@ -413,6 +413,123 @@ class TestFixRecordRequiredFields(unittest.TestCase):
         self.assertTrue(plan2.empty)
 
 
+class TestWorkspacePathMissingRepair(unittest.TestCase):
+    """工作区记录的 ``path`` 缺失/为空：能从名下会话的 header cwd 推断出来就补上。
+
+    回归：旧实现把缺失的 path 一律补成**空串占位**，等于没修——DSH 里那个工作区仍然
+    没有路径。现在改为：名下会话的 cwd 一致时用它作为路径；推不出来才退空串并写明原因。
+    """
+
+    def setUp(self) -> None:
+        _enable_fake_zstd()
+        self.addCleanup(_disable_fake_zstd)
+        self.fx = _FakeDshHome()
+        self.addCleanup(self.fx.cleanup)
+
+    def _session(self, project: str, sid: str, cwd: str) -> None:
+        header = json.dumps({"type": "session", "version": 0, "id": sid, "createdAt": 1,
+                             "cwd": cwd, "delegationDepth": 0})
+        self.fx.session(project, sid, ("\n".join([header]) + "\n").encode("utf-8"))
+
+    def test_missing_path_is_inferred_from_session_cwd(self) -> None:
+        self._session("--D-project-Demo--", "session-a", "D:\\project\\Demo")
+        self._session("--D-project-Demo--", "session-b", "D:\\project\\Demo")
+        self.fx.write_index(_make_ws_index({
+            "ws-nopath": {"title": "", "sessionIds": ["session-a", "session-b"],
+                          "createdAt": "t1", "updatedAt": "t1"}}))
+        plan, idx = dr.plan_workspace_index_repair(self.fx.dsh)
+        fixes = [m for m in plan.mutations if m.action == "fix-record"]
+        self.assertEqual(len(fixes), 1)
+        self.assertEqual(fixes[0].path, "D:\\project\\Demo")
+        self.assertTrue(any("推断" in line for line in plan.describe()))
+        self.assertFalse([s for s in plan.skipped if s[0] == "ws-nopath"])
+
+        res = dr.apply_workspace_index_repair(self.fx.dsh, plan, dry_run=False,
+                                             backup=True, idx=idx)
+        self.assertTrue(res.ok)
+        with open(os.path.join(self.fx.dsh, "storages", "workspace.json"),
+                  encoding="utf-8") as fh:
+            after = json.load(fh)
+        rec = after["tables"]["workspaces"]["ws-nopath"]
+        self.assertEqual(rec["path"], "D:\\project\\Demo")
+        self.assertEqual(rec["title"], "Demo")          # 标题按推断出的路径补
+
+    def test_uninferrable_path_falls_back_to_placeholder_and_is_reported(self) -> None:
+        """名下没有会话（或 cwd 不一致）时只能补空串，但必须在计划里写明原因。"""
+        self.fx.write_index(_make_ws_index({
+            "ws-nopath": {"title": "", "sessionIds": ["session-missing"],
+                          "createdAt": "t1", "updatedAt": "t1"}}))
+        plan, _idx = dr.plan_workspace_index_repair(self.fx.dsh)
+        fixes = [m for m in plan.mutations if m.action == "fix-record"]
+        self.assertEqual(fixes[0].path, "")
+        self.assertTrue(any(sid == "ws-nopath" and "推断不出" in reason
+                            for sid, reason in plan.skipped))
+
+    def test_existing_path_is_never_overwritten(self) -> None:
+        """已经合法的 path 只增不改（目录不在本机也不属索引损坏）。"""
+        self._session("--D-project-Demo--", "session-a", "D:\\project\\Demo")
+        self.fx.write_index(_make_ws_index({
+            "ws-ok": {"path": "D:\\project\\Gone", "title": "Gone",
+                      "sessionIds": ["session-a"], "createdAt": "t1", "updatedAt": "t1"}}))
+        plan, _idx = dr.plan_workspace_index_repair(self.fx.dsh)
+        self.assertEqual([m for m in plan.mutations if m.action == "fix-record"], [])
+
+    def test_health_reports_workspace_paths_missing(self) -> None:
+        """本机不存在的工作区目录：报数量，并且算作可修项（修复＝补建空目录）。"""
+        self._session("--D-project-Demo--", "session-a", "D:\\project\\Demo")
+        self.fx.write_index(_make_ws_index({
+            "ws-gone": {"path": "D:\\project\\__definitely_absent__", "title": "gone",
+                        "sessionIds": ["session-a"], "createdAt": "t1", "updatedAt": "t1"}}))
+        result = dr.detect_ungrouped(self.fx.dsh, decompress=lambda b: b)
+        self.assertEqual(result.workspace_paths_missing, ["ws-gone"])
+        text = "\n".join(result.summary_lines())
+        self.assertIn("工作区 path 在本机不存在的工作区：1 个", text)
+        self.assertIn("补建空目录", text)
+        self.assertEqual(result.attention_total, 1)
+
+    def test_missing_directory_is_planned_and_created(self) -> None:
+        target = os.path.join(self.fx.tmp, "gone-project")
+        self.fx.write_index(_make_ws_index({
+            "ws-gone": {"path": target, "title": "gone", "sessionIds": [],
+                        "createdAt": "t1", "updatedAt": "t1"}}))
+        self.assertFalse(os.path.isdir(target))
+        plan, idx = dr.plan_workspace_index_repair(self.fx.dsh)
+        mkdirs = [m for m in plan.mutations if m.action == "mkdir"]
+        self.assertEqual([(m.workspace_id, m.path) for m in mkdirs], [("ws-gone", target)])
+        self.assertTrue(any("补建工作区 ws-gone 缺失的目录" in line
+                            for line in plan.describe()))
+        res = dr.apply_workspace_index_repair(self.fx.dsh, plan, dry_run=False,
+                                              backup=True, idx=idx)
+        self.assertTrue(res.ok)
+        self.assertTrue(os.path.isdir(target))
+        self.assertEqual([(c["path"], c["ok"]) for c in res.created], [(target, True)])
+        # 目录建好后不再出现在计划里（幂等）
+        plan2, _ = dr.plan_workspace_index_repair(self.fx.dsh)
+        self.assertEqual([m for m in plan2.mutations if m.action == "mkdir"], [])
+
+    def test_relative_path_is_left_alone(self) -> None:
+        """相对路径含义不确定，不猜也不建。"""
+        self.fx.write_index(_make_ws_index({
+            "ws-rel": {"path": "relative\\dir", "title": "rel", "sessionIds": [],
+                       "createdAt": "t1", "updatedAt": "t1"}}))
+        plan, _idx = dr.plan_workspace_index_repair(self.fx.dsh)
+        self.assertEqual([m for m in plan.mutations if m.action == "mkdir"], [])
+
+    def test_mkdir_failure_is_reported_not_fatal(self) -> None:
+        """补建失败（例如盘符不存在）只逐条上报，不影响索引写盘。"""
+        bad = "Q:\\__relink_definitely_absent__\\x"
+        self.fx.write_index(_make_ws_index({
+            "ws-bad-drive": {"path": bad, "title": "bad", "sessionIds": [],
+                             "createdAt": "t1", "updatedAt": "t1"}}))
+        plan, idx = dr.plan_workspace_index_repair(self.fx.dsh)
+        res = dr.apply_workspace_index_repair(self.fx.dsh, plan, dry_run=False,
+                                              backup=True, idx=idx)
+        self.assertTrue(res.ok)                     # 索引照写
+        self.assertEqual(len(res.created), 1)
+        self.assertFalse(res.created[0]["ok"])
+        self.assertTrue(res.created[0]["error"])
+
+
 class TestLegacyReplayDetection(unittest.TestCase):
     def setUp(self):
         _enable_fake_zstd()
@@ -566,7 +683,7 @@ class TestIncompatibleDescriptorDetection(unittest.TestCase):
         self.assertEqual(result.descriptor_bad_sessions, ["session-desc2"])
         self.assertEqual(result.ungrouped, [])          # 已登记，不算未分组
         self.assertFalse(result.healthy)
-        self.assertTrue(any("子代理描述符不兼容" in line for line in result.summary_lines()))
+        self.assertTrue(any("子代理描述符版本不合规" in line for line in result.summary_lines()))
 
 
 @unittest.skipUnless(_real_backend(), "需要真实 zstd 后端")

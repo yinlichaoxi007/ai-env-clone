@@ -24,10 +24,14 @@ DSH 旧会话数据「未分组 / 无法加载」检测与修复（纯标准库�
    迁移器会自动把它复制进合成 stream 的 finish 块）。max-tokens 剪枝场景
    （需要两侧取不同值）本工具跳过并上报，绝不猜测改写。
 
-3. **子代理描述符不兼容（只检测不修复）**：旧构建写下的
-   ``subagent/descriptor`` 事件 ``version`` 不是 3 时，官方 v0→v1 迁移直接
-   拒绝（``SessionFormatUnsupportedMigrationError``），会话无法加载；修复
-   需要理解子代理描述符 v2→v3 的官方契约，本工具仅检测并如实标记。
+3. **子代理描述符版本不合规（可修）**：旧构建写下的 ``subagent/descriptor`` 事件
+   ``version`` 不是 3 时，官方 v0→v1 迁移直接拒绝
+   （``SessionFormatUnsupportedMigrationError``，实测报错文案
+   ``subagent/descriptor 0 uses unsupported descriptor version 2``），会话无法加载。
+   修复 = 在**载荷满足 v3 语义**时只把 ``version`` 改成 3（规则三，见
+   :func:`_fix_descriptor_version`）；载荷本身不满足 v3 语义（provider 为空、
+   continuable 缺 label、agentProvider/agentModel 未成对等）时**跳过并上报**，
+   绝不拼凑一个语义不同的描述符。
 
 4. **投影缓存陈旧（会导致侧边栏看不到 / 标题错）**：DSH 侧边栏对**冷会话**只读
    ``storages/session_projcache/sessions/<sid>.json`` 的投影；该记录的
@@ -44,7 +48,23 @@ zstd 说明：会话日志是 Zstandard 压缩的 JSONL，Python 标准库**没�
 本模块按需探测可用后端（``zstandard`` / ``pyzstd`` / 系统 ``zstd`` 命令），
 没有则自动降级为「仅目录级检测」（不读文件内容）；修复仍可完成
 「按目录名匹配已有工作区」的部分。所有写入前自动备份原文件，默认 dry-run，
-**绝不删除任何条目**。
+**绝不删除任何条目**（唯一会「摘除」的动作是子代理关系修复把子会话 id 从
+``workspace.json`` 的 ``sessionIds`` 里去掉，见下条，且旧目录/旧缓存都只改名移走）。
+
+5. **子代理关系修复（来源自动查找，无需指定）**：导入器早期版本把来源工具的子代理会话
+   当成普通会话写进了 DSH（``delegationDepth = 0`` 的顶层会话、登记在工作区里，
+   在侧边栏与用户会话平级出现，正文却只是 AI 的干活过程）。本模块按来源侧的
+   ``parent_id``（ZCode 的 ``task_type = 'subagent_child'`` / DSH 的
+   ``origin: "subagent"``）+ 「标题 + 首条用户正文」指纹把它们**就地改造成 DSH 原生
+   子代理会话**（裸 uuid 目录、header 带 ``parentSession`` / ``origin`` /
+   ``delegationDepth``、seq 0 为 ``subagent/descriptor``；正文一字不改），旧顶层会话
+   目录整体移到 ``sessions/.removed/``、id 从工作区列表摘除、旧投影缓存改名移走。
+   父会话日志**不用改**：DSH 加载 v3 父会话时按「子会话证据完整 ⇒ 追加目录事实」自动补
+   ``subagent/catalog``（实测：父会话 50 条事件 + 2 条子会话证据 → 迁移结果 52 条、
+   目录项 2）；只有父会话**已发布 v4** 时才把它那份 v4 改名移走，让它回落到 v3 重新迁移。
+   来源按「本机 ZCode 数据 → 本工具备份目录 / 上次用过的包目录里的 ``zcode_backup_*.zip``
+   与 ``dsh_backup_*.zip``」自动查找，``--relink-source`` 仅作显式覆盖。
+   实现见 :mod:`ai_env_clone.subagent_relink`。
 
 用法（CLI 自动化脚本）：
 
@@ -724,10 +744,19 @@ class DetectResult:
     projcache_stale: list = field(default_factory=list)  # 投影缓存结论与日志矛盾的记录（StaleProjcache）
     zstd_name: str = ""
     zstd_missing: bool = False
+    #: 子代理关系修复的检出情况（见 :mod:`ai_env_clone.subagent_relink`）：
+    #: 可改造的旧顶层子代理会话数、判定不出来被跳过的条数、以及**判定所用的来源**说明。
+    relink_targets: list = field(default_factory=list)
+    relink_skipped: list = field(default_factory=list)
+    relink_source_note: str = ""
+    #: 索引里 path 合法、但该目录在本机不存在的**工作区 id**（信息项：记录本身没坏，
+    #: 会话仍按该路径归属；不属于「未分组」，也无法从数据推断出正确路径）。
+    workspace_paths_missing: list = field(default_factory=list)
 
     @property
     def healthy(self) -> bool:
-        """无未分组、索引无问题、无旧格式 / 重复调用 id / 描述符不兼容 / 投影缓存陈旧。"""
+        """无未分组、索引无问题、无旧格式 / 重复调用 id / 描述符不兼容 / 投影缓存陈旧 /
+        无待改造的旧顶层子代理会话。"""
         return (
             not self.ungrouped
             and not self.index_problems
@@ -735,10 +764,16 @@ class DetectResult:
             and not self.dup_id_sessions
             and not self.descriptor_bad_sessions
             and not self.projcache_stale
+            and not self.relink_targets
         )
 
     def summary_lines(self) -> list[str]:
-        """面向用户的摘要文本行。"""
+        """面向用户的摘要文本行：**每类可修复问题都给出数量**（为 0 也列出来）。
+
+        为什么每类都列：只列非零项时，用户看到「未分组 0 个」以外一片空白，会以为
+        别的检查没跑；列全了才能一眼看清「哪一类有问题、各有多少条」。按用户要求，
+        这里**只给数量**，不展开具体是哪几条会话（要细节看修复计划的 dry-run 清单）。
+        """
         lines = []
         if not self.index_exists:
             lines.append("⚠ 未找到 storages/workspace.json（索引缺失，会话可能全部显示为未分组）")
@@ -750,42 +785,77 @@ class DetectResult:
             )
         else:
             lines.append("未分组会话：0 个")
-        for p in self.index_problems:
-            lines.append("索引问题：%s" % p)
-        if self.legacy_replay_sessions:
-            lines.append(
-                "旧格式会话（官方未打补丁的构建无法加载）：%d 个，需把扁平 replayState 升级为信封后方可加载"
-                % len(self.legacy_replay_sessions)
-            )
-        if self.dup_id_sessions:
-            lines.append(
-                "重复调用 id 会话（v0→v1 迁移会拒绝）：%d 个，需在「修复重复调用 ID」勾选时一并处理"
-                % len(self.dup_id_sessions)
-            )
+        if self.index_problems:
+            lines.append("索引问题：%d 处" % len(self.index_problems))
+            lines.extend("　- %s" % p for p in self.index_problems)
+        else:
+            lines.append("索引问题：0 处")
+        lines.append("旧格式会话（官方未打补丁的构建无法加载）：%d 个（修复＝把扁平 replayState 升级为信封）"
+                     % len(self.legacy_replay_sessions))
+        lines.append("重复调用 id 会话（v0→v1 迁移会拒绝）：%d 个（勾选「同时修复重复调用 ID」才处理）"
+                     % len(self.dup_id_sessions))
         if self.descriptor_bad_sessions:
             # 与未分组会话取交集：描述符不兼容的会话很可能就是未分组的那批，
             # 标注重叠避免用户误以为「可修复 6 + 不兼容 6 = 12 个」而数量对不上。
             db_ids = set(self.descriptor_bad_sessions)
             overlap = len({s.session_id for s in self.ungrouped} & db_ids)
-            same = "" if overlap == 0 else "（其中 %d 个与上方未分组会话为同一批）" % overlap
-            lines.append(
-                "子代理描述符不兼容会话（subagent/descriptor 版本不受官方迁移支持，无法加载）：%d 个%s，"
-                "本工具暂不自动修复，已原样保留"
-                % (len(self.descriptor_bad_sessions), same)
-            )
-        if self.projcache_stale:
-            hidden = sum(1 for s in self.projcache_stale if s.hidden)
-            lines.append(
-                "投影缓存陈旧会话：%d 个（其中 %d 个会被侧边栏隐藏；修复＝移走陈旧缓存，"
-                "由 DSH 冷读时按最新日志重算）"
-                % (len(self.projcache_stale), hidden)
-            )
+            same = "" if overlap == 0 else "（其中 %d 个与未分组会话为同一批）" % overlap
+            lines.append("子代理描述符版本不合规会话（v0→v1 迁移会拒绝，会话加载报错）："
+                         "%d 个%s（修复＝把 version 升到官方要求的 3；载荷不满足 v3 语义的"
+                         "会跳过并上报）" % (len(self.descriptor_bad_sessions), same))
+        else:
+            lines.append("子代理描述符版本不合规会话（会话加载报错）：0 个")
+        hidden = sum(1 for s in self.projcache_stale if s.hidden)
+        lines.append("投影缓存陈旧会话（缓存映射与日志不符，侧边栏可能看不到 / 标题错）：%d 个"
+                     "（其中 %d 个会被侧边栏隐藏；修复＝移走陈旧缓存，由 DSH 冷读时按最新日志重算）"
+                     % (len(self.projcache_stale), hidden))
+        if self.relink_targets:
+            lines.append("旧版导入的子代理会话（当前是顶层会话、会被误当用户会话）：%d 个可自动改造为"
+                         "原生子代理会话" % len(self.relink_targets))
+        else:
+            lines.append("旧版导入的子代理会话：0 个可自动改造%s" % self._relink_skip_tail())
+        if self.relink_source_note:
+            lines.append("外部导入会话的来源（用于判定子代理父子关系）：%s"
+                         % self.relink_source_note)
+        if self.workspace_paths_missing:
+            lines.append("工作区 path 在本机不存在的工作区：%d 个（记录本身完好、会话仍按该"
+                         "路径归属；修复＝补建空目录）" % len(self.workspace_paths_missing))
+        lines.append("需注意项合计：%d 处（点「修复会话数据」可自动修复其中的可自动项）"
+                     % self.attention_total)
         if self.zstd_missing:
             lines.append(
                 "注：未安装 zstd 解压支持（zstandard/pyzstd/zstd 命令），"
                 "仅做目录级检测；旧格式与精确工作区路径判定受限。"
             )
         return lines
+
+    def _relink_skip_tail(self) -> str:
+        """「0 个可自动改造」后面的补充说明。
+
+        跳过分两种，措辞要分清，别让用户以为自己的会话出了问题：
+        - **来源里本来就是用户会话**（不是子代理记录）→ 无需改造，属正常；
+        - **真的判不出来**（来源里找不到同指纹、父会话不在本机等）→ 保持原样，需要人工看看。
+        """
+        if not self.relink_skipped:
+            return ""
+        nothing_to_do = sum(1 for _sid, reason in self.relink_skipped
+                            if "无需改造" in reason)
+        rest = len(self.relink_skipped) - nothing_to_do
+        parts = []
+        if nothing_to_do:
+            parts.append("其余 %d 条是用户会话，无需改造" % nothing_to_do)
+        if rest:
+            parts.append("%d 条无法判定父子关系，保持原样" % rest)
+        return "（%s）" % "；".join(parts)
+
+    @property
+    def attention_total(self) -> int:
+        """需要用户注意的问题条目合计（未分组 + 索引问题 + 旧格式 + 重复 id +
+        描述符不兼容 + 投影缓存陈旧 + 旧导入子代理 + 工作区目录缺失）。"""
+        return (len(self.ungrouped) + len(self.index_problems)
+                + len(self.legacy_replay_sessions) + len(self.dup_id_sessions)
+                + len(self.descriptor_bad_sessions) + len(self.projcache_stale)
+                + len(self.relink_targets) + len(self.workspace_paths_missing))
 
 
 def _find_workspace_for_session(
@@ -830,11 +900,15 @@ def detect_ungrouped(
     dsh_home: str,
     decompress: "Callable[[bytes], bytes] | None" = None,
     with_content_check: bool = True,
+    relink_source: str = "",
 ) -> DetectResult:
     """检测未分组会话与索引健康。
 
     :param with_content_check: 是否顺带做旧格式 replayState 内容扫描
         （需要 zstd；目录级检测始终执行）。
+    :param relink_source: 子代理关系修复的来源（留空 = 自动查找，见
+        :func:`ai_env_clone.subagent_relink.discover_sources`）；检测结果里会给出
+        「可改造几条 + 判定所用的来源」，便于用户在点修复前就知道会改什么。
     """
     home = resolve_dsh_home(dsh_home)
     result = DetectResult()
@@ -851,6 +925,14 @@ def detect_ungrouped(
     if decompress and with_content_check:
         result.projcache_stale = detect_stale_projcache(home, decompress=decompress, sessions=sessions)
 
+    # 子代理关系检出与索引也无关：放在早退分支之前，索引缺失时同样给出。
+    from . import subagent_relink
+
+    relink = subagent_relink.plan_subagent_relink(home, relink_source)
+    result.relink_targets = relink.targets
+    result.relink_skipped = relink.skipped
+    result.relink_source_note = relink.source_note or relink.zstd_note
+
     idx = load_workspace_index(home)
     if idx is None:
         result.index_exists = False
@@ -858,6 +940,13 @@ def detect_ungrouped(
         result.ungrouped_unattachable = len(sessions)
         return result
     result.index_problems = validate_workspace_index(idx)
+
+    # 信息项：path 合法但目录在本机不存在的工作区（记录没坏、无法从数据推断正确路径）
+    result.workspace_paths_missing = [
+        wid for wid, rec in (idx.get("tables", {}).get("workspaces") or {}).items()
+        if isinstance(rec, dict) and isinstance(rec.get("path"), str) and rec["path"].strip()
+        and not os.path.isdir(rec["path"])
+    ]
 
     workspaces = idx.get("tables", {}).get("workspaces", {})
     known = _collect_index_sessions(idx)
@@ -924,8 +1013,10 @@ def detect_duplicate_call_ids(dsh_home: str) -> list[str]:
 def detect_incompatible_descriptors(dsh_home: str) -> list[str]:
     """仅做子代理描述符兼容性检测（需要 zstd），返回无法加载的会话 id 列表。
 
-    官方 v0→v1 迁移要求 ``subagent/descriptor.version === 3``，旧版本描述符
-    会被 ``SessionFormatUnsupportedMigrationError`` 拒绝；本工具只检测不修复。
+    官方 v0→v1 迁移要求 ``subagent/descriptor.version === 3``，旧版本描述符会被
+    ``SessionFormatUnsupportedMigrationError`` 拒绝。会话文件修复现在会**顺带把它修好**
+    （载荷满足 v3 语义时只改 version；见 :func:`_fix_descriptor_version`），故这里
+    在修复后应回到空列表。
     """
     decompress, _compress, _name = zstd_backend()
     if not decompress:
@@ -1095,13 +1186,74 @@ class RepairPlan:
         for m in self.mutations:
             if m.action == "create-workspace":
                 lines.append("补建工作区 %s（path=%s）并登记会话 %s" % (m.workspace_id, m.path, m.session_id))
+            elif m.action == "mkdir":
+                lines.append("补建工作区 %s 缺失的目录（记录里 path 指向、本机不存在）：%s"
+                             % (m.workspace_id, m.path))
             elif m.action == "fix-record":
-                lines.append("补齐工作区记录 %s 的必填字段：%s" % (m.workspace_id, m.detail))
+                if m.path:
+                    lines.append("补齐工作区记录 %s 缺失的 path（从该工作区会话的 cwd 推断）：%s"
+                                 % (m.workspace_id, m.path))
+                else:
+                    lines.append("补齐工作区记录 %s 的必填字段：%s" % (m.workspace_id, m.detail))
             else:
                 lines.append("把会话 %s 加入工作区 %s 的 sessionIds" % (m.session_id, m.workspace_id))
         for sid, reason in self.skipped:
             lines.append("跳过 %s：%s" % (sid, reason))
         return lines
+
+
+def _cwd_for_workspace(record: dict, sessions_by_id: dict,
+                       decompress) -> "tuple[str, str]":
+    """从某工作区名下会话的 header ``cwd`` 推断工作区路径。
+
+    :return: ``(推断出的路径, 说明)``；推断不出时路径为空串、说明给出原因。
+    """
+    ids = record.get("sessionIds") if isinstance(record, dict) else None
+    if not isinstance(ids, list) or not ids:
+        return "", "该工作区名下没有会话，无从推断"
+    found: dict = {}
+    for sid in ids:
+        session = sessions_by_id.get(sid)
+        if session is None or not session.log_file or decompress is None:
+            continue
+        header, _err = (session.header, "") if session.header else \
+            _read_session_header(session.log_file, decompress)
+        if not isinstance(header, dict):
+            continue
+        cwd = header.get("cwd")
+        if isinstance(cwd, str) and cwd.strip():
+            found[cwd] = found.get(cwd, 0) + 1
+    if not found:
+        return "", "名下会话都没有可读的 header cwd"
+    best = sorted(found.items(), key=lambda kv: (-kv[1], kv[0]))
+    if len(found) > 1:
+        return "", ("名下会话的 cwd 不一致（%s），不猜"
+                    % "、".join("%s×%d" % (p, n) for p, n in best[:3]))
+    path, count = best[0]
+    return path, "名下 %d 个会话的 cwd 一致：%s" % (count, path)
+
+
+def _missing_workspace_paths(workspaces: dict) -> list:
+    """找「记录里 path 合法、但目录在本机不存在」的工作区，返回 ``[(wid, path)]``。
+
+    为什么可以补建：这类记录本身完好（会话也按该路径归属），只是目录不在了；DSH 在
+    侧边栏里对这类工作区会提示路径不可用。补建空目录是**纯增量**动作，不碰任何会话
+    数据，也不要权限就能回退（把空目录删掉即可）。只处理**绝对路径**：记录里若出现
+    相对路径，含义不确定，宁可不动。
+    """
+    out = []
+    for wid, record in (workspaces or {}).items():
+        if not isinstance(record, dict):
+            continue
+        path = record.get("path")
+        if not isinstance(path, str) or not path.strip():
+            continue
+        if not os.path.isabs(path):
+            continue
+        if os.path.isdir(path):
+            continue
+        out.append((wid, path))
+    return out
 
 
 def plan_workspace_index_repair(
@@ -1122,6 +1274,19 @@ def plan_workspace_index_repair(
         plan.skipped.append(("（全部）", "tables.workspaces 缺失，无法修复索引"))
         return plan, idx
     known = _collect_index_sessions(idx)
+    if decompress is None:
+        decompress, _compress, _name = zstd_backend()
+    # 会话清单要在「记录字段完整性」之前就备好：工作区 path 缺失时要从名下会话的
+    # header cwd 推断（见 _cwd_for_workspace）。
+    sessions = scan_sessions(home)
+    sessions_by_id = {s.session_id: s for s in sessions}
+
+    # 「记录里的 path 指向的目录不存在」→ 计划里补建该目录（纯增量，不碰会话数据）
+    for wid, path in _missing_workspace_paths(workspaces):
+        plan.mutations.append(
+            RepairMutation(action="mkdir", session_id="", workspace_id=wid, path=path,
+                           detail="记录里 path 指向的目录在本机不存在，补建空目录")
+        )
 
     # 记录字段完整性：path/title/sessionIds/createdAt/updatedAt 是 DSH 存储边界的
     # zod 必填字段（均无默认值），缺任一字段会让整个 workspace 域解析失败、桌面端
@@ -1139,7 +1304,8 @@ def plan_workspace_index_repair(
             )
             continue
         missing = []
-        if not isinstance(record.get("path"), str):
+        path_bad = not isinstance(record.get("path"), str)
+        if path_bad:
             missing.append("path")
         if not isinstance(record.get("title"), str):
             missing.append("title")
@@ -1152,16 +1318,25 @@ def plan_workspace_index_repair(
         if wid not in order_set:
             missing.append("global.workspaceIds 登记")
         if missing:
+            # path 缺失/为空是「工作区路径缺失」里唯一能**推断**出来的情形：记录里
+            # sessionIds 指的会话 header 都带 cwd，一致即可作为该工作区的路径。
+            # （path 已有合法值但目录不在本机，不属于索引损坏，不去改它。）
+            inferred, reason = ("", "")
+            if path_bad:
+                inferred, reason = _cwd_for_workspace(record, sessions_by_id, decompress)
+                if not inferred:
+                    plan.skipped.append(
+                        (wid, "工作区 path 缺失且推断不出（%s），只补空串占位" % reason))
             plan.mutations.append(
                 RepairMutation(
                     action="fix-record", session_id="", workspace_id=wid,
-                    detail="补齐 " + "、".join(missing),
+                    detail=("补齐 " + "、".join(missing)) if not inferred else
+                           ("补齐 path：" + reason),
+                    path=inferred,
                 )
             )
 
-    decompress, _compress, _name = zstd_backend() if decompress is None else (decompress, None, "")
-
-    for session in scan_sessions(home):
+    for session in sessions:
         if session.session_id in known:
             continue
         if session.project_dir == NO_CWD_PROJECT:
@@ -1253,15 +1428,27 @@ def apply_workspace_index_repair(
 
     now = _now_iso()
     applied = 0
+    created: list = []
     for m in plan.mutations:
+        if m.action == "mkdir":
+            # 补建工作区目录：与索引内容无关的纯增量动作；失败只记录、不中断
+            try:
+                os.makedirs(_longpath(m.path), exist_ok=True)
+                created.append({"workspace_id": m.workspace_id, "path": m.path,
+                                "ok": True, "error": ""})
+            except OSError as exc:
+                created.append({"workspace_id": m.workspace_id, "path": m.path,
+                                "ok": False, "error": str(exc)})
+            continue
         if m.action == "fix-record":
             # 补齐记录必填字段（只增不改：已有合法值一律保留）
             record = workspaces.get(m.workspace_id)
             if not isinstance(record, dict):
                 record = workspaces[m.workspace_id] = {}
             if not isinstance(record.get("path"), str):
-                record["path"] = ""
-            if not isinstance(record.get("title"), str):
+                # 计划里推断出了真实路径就用它，否则只能补空串占位（见计划里的跳过说明）
+                record["path"] = m.path or ""
+            if not isinstance(record.get("title"), str) or not record.get("title"):
                 record["title"] = os.path.basename(record["path"].rstrip("\\/")) or "workspace"
             if not isinstance(record.get("sessionIds"), list):
                 record["sessionIds"] = []
@@ -1322,7 +1509,8 @@ def apply_workspace_index_repair(
     except OSError as exc:
         return ApplyResult(file=file, backup_path=backup_path, applied=0, dry_run=False, ok=False, error="写盘失败: %s" % exc)
 
-    return ApplyResult(file=file, backup_path=backup_path, applied=applied, dry_run=False, ok=True)
+    return ApplyResult(file=file, backup_path=backup_path, applied=applied, dry_run=False, ok=True,
+                       created=created)
 
 
 @dataclass
@@ -1335,6 +1523,8 @@ class ApplyResult:
     dry_run: bool
     ok: bool
     error: str = ""
+    #: ``mkdir`` 动作逐条结果：``[{"workspace_id","path","ok","error"}]``
+    created: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -1462,6 +1652,78 @@ def _wrap_stream_record(record, hits: list[dict], skipped: list[dict], rewrite: 
     return record, False
 
 
+#: 子代理描述符版本规则的命中标记：汇总时据此与 replayState 命中区分开。
+DESCRIPTOR_RULE = "subagent-descriptor"
+
+
+def _descriptor_v3_problem(data: dict) -> str:
+    """按官方 v3 语义检查子代理描述符载荷；可安全升级时返回空串。
+
+    与 DSH 安装包内的 ``subagentDescriptorValue`` 同规则：``version`` 必须为 **3**；
+    ``provider`` 必须非空字符串；``mode`` 为 ``one-shot`` 时 ``label`` 可选，为
+    ``continuable`` 时要求非空 ``label``、且 ``agentProvider`` 与 ``agentModel``
+    必须成对出现；``toolFilter`` 只能含 ``allow`` / ``deny``（各自为非空字符串数组）。
+    """
+    provider = data.get("provider")
+    if not isinstance(provider, str) or not provider:
+        return "provider 不是非空字符串"
+    mode = data.get("mode")
+    if mode == "one-shot":
+        label = data.get("label")
+        return "" if label is None or isinstance(label, str) else "label 类型不是字符串"
+    if mode != "continuable":
+        return "mode=%r 既不是 one-shot 也不是 continuable" % (mode,)
+    label = data.get("label")
+    if not isinstance(label, str) or not label:
+        return "continuable 模式要求非空 label"
+    for key in ("agentProvider", "agentModel", "agentReasoningEffort", "persona"):
+        if key in data and (not isinstance(data[key], str) or not data[key]):
+            return "%s 不是非空字符串" % key
+    if ("agentProvider" in data) != ("agentModel" in data):
+        return "agentProvider 与 agentModel 必须成对出现"
+    tool_filter = data.get("toolFilter")
+    if tool_filter is not None:
+        if not isinstance(tool_filter, dict) or not tool_filter \
+                or set(tool_filter) - {"allow", "deny"}:
+            return "toolFilter 形态不符合官方要求（只能含 allow / deny）"
+        for key, value in tool_filter.items():
+            if not isinstance(value, list) or not value \
+                    or any(not isinstance(x, str) or not x for x in value):
+                return "toolFilter.%s 必须是非空字符串数组" % key
+    return ""
+
+
+def _fix_descriptor_version(event, data: dict, rewrite: bool,
+                            hits: list, skipped: list) -> "dict | None":
+    """规则三：把 ``subagent/descriptor`` 的 ``version`` 升级为 3（官方硬要求）。
+
+    旧构建写过 ``version: 2``（实测 TeaVision 的 6 个 v0 子代理会话）：released v0→v1
+    迁移对描述符版本是**硬校验**——不等于 3 就直接拒绝整份日志，界面表现就是「会话
+    加载错误」。载荷本身与 v3 语义一致时，只改这一个字段即可让会话恢复加载；载荷
+    不满足 v3 语义时**跳过并上报**，绝不拼凑一个语义不同的描述符。
+    """
+    if not isinstance(event, dict) or event.get("type") != "subagent/descriptor":
+        return None
+    version = data.get("version")
+    if isinstance(version, bool) or not isinstance(version, (int, float)) or version == 3:
+        return None                      # 已是 3（或类型非法，交给官方校验报错，不猜）
+    problem = _descriptor_v3_problem(data)
+    if problem:
+        skipped.append({
+            "rule": DESCRIPTOR_RULE, "path": "subagent/descriptor.data",
+            "reason": "描述符载荷不满足 version 3 的官方语义（%s），未改动" % problem,
+            "fields": sorted(data.keys()),
+        })
+        return None
+    hits.append({
+        "rule": DESCRIPTOR_RULE, "path": "subagent/descriptor.data.version",
+        "from": version, "to": 3, "fields": sorted(data.keys()),
+    })
+    if not rewrite:
+        return None
+    return {**data, "version": 3}
+
+
 def wrap_line_event(event, rewrite: bool, finish_kind: "str | None" = None) -> "tuple[object, bool, list[dict], list[dict]]":
     """处理单个事件行的 replayState 升级（无跨行状态）。
 
@@ -1480,6 +1742,12 @@ def wrap_line_event(event, rewrite: bool, finish_kind: "str | None" = None) -> "
         return event, False, hits, skipped
     data = event["data"]
     changed = False
+
+    # ⓪ 子代理描述符版本升级（与 replayState 无关，独立判定）
+    new_descriptor = _fix_descriptor_version(event, data, rewrite, hits, skipped)
+    if new_descriptor is not None:
+        data = new_descriptor
+        changed = True
 
     # ① 内嵌 stream 的 finish 块（v2 形态；assistant/message 与 assistant/attempt 通用）
     stream = data.get("stream")
@@ -1794,6 +2062,8 @@ def _new_session_report() -> dict:
         "session_id": None,        # header 的 id
         "hits": [],                # replayState 升级命中 [{seq, path, fields}]
         "skipped": [],             # 主动跳过未升级的命中 [{seq, path, reason, fields}]
+        "descriptor_hits": [],     # 子代理描述符版本升级命中 [{seq, path, from, to}]
+        "descriptor_skipped": [],  # 描述符载荷不满足 v3 语义、跳过未改的命中
         "actions": [],             # 已识别的修复动作 [{rule, count, detail}]
         "problems": [],            # 其他问题（仅报告）
         "dup_fixes": [],           # 重复调用 id 去重命中 [{seq, callId, new_id}]
@@ -1845,8 +2115,15 @@ def _process_lines(lines: list[str], rewrite: bool, report: dict, all_events: li
         ):
             fk = finish_kinds.get((event_data.get("turn"), event_data.get("step")))
         new_event, row_changed, line_hits, line_skipped = wrap_line_event(event, rewrite, finish_kind=fk)
-        report["hits"].extend(line_hits)
-        skipped.extend(line_skipped)
+        # 按规则分流命中：描述符版本升级与 replayState 升级是两件事，汇总时要分开说
+        for hit in line_hits:
+            target = report["descriptor_hits"] if hit.get("rule") == DESCRIPTOR_RULE \
+                else report["hits"]
+            target.append(hit)
+        for item in line_skipped:
+            target = report["descriptor_skipped"] if item.get("rule") == DESCRIPTOR_RULE \
+                else skipped
+            target.append(item)
         if rewrite and row_changed:
             changed_rows[i] = new_event
     if skipped:
@@ -1920,6 +2197,28 @@ def _summarize(report: dict, all_events: list, rewrite: bool, changed: bool) -> 
                 "rule": "max-tokens剪枝场景跳过",
                 "count": len(report["skipped"]),
                 "detail": "该场景需要 stream 侧保留全量、source 侧随内容剪枝，本工具暂不自动升级，已原样保留",
+            }
+        )
+    if report["descriptor_hits"]:
+        pairs = ", ".join("%s→%s" % (h.get("from"), h.get("to"))
+                          for h in report["descriptor_hits"][:6])
+        report["actions"].append(
+            {
+                "rule": "子代理描述符版本升级",
+                "count": len(report["descriptor_hits"]),
+                "detail": (
+                    "把 subagent/descriptor 的 version 升到官方要求的 3"
+                    "（v0→v1 迁移对版本是硬校验，旧版本会让会话加载报错）：%s%s"
+                    % (pairs, " …" if len(report["descriptor_hits"]) > 6 else "")
+                ),
+            }
+        )
+    if report["descriptor_skipped"]:
+        report["actions"].append(
+            {
+                "rule": "子代理描述符未升级（已保留原样）",
+                "count": len(report["descriptor_skipped"]),
+                "detail": "；".join(sorted({s.get("reason", "") for s in report["descriptor_skipped"]})),
             }
         )
     dup_fixed = bool(report["dup_fixes"])
@@ -2189,13 +2488,19 @@ class DshRepairPlan:
     data_reports: list[dict] = field(default_factory=list)       # 需修的会话文件报告
     projcache_stale: list[StaleProjcache] = field(default_factory=list)  # 需移走的陈旧投影缓存
     zstd_note: str = ""                                           # zstd 不可用时的说明
+    #: 子代理关系修复计划（``None`` = 本次没有要求处理，例如调用方没给来源）
+    relink: "object | None" = None
 
     @property
     def empty(self) -> bool:
+        relink_empty = True
+        if self.relink is not None:
+            relink_empty = bool(getattr(self.relink, "empty", True))
         return (
             not self.index_plan.mutations
             and not self.data_reports
             and not self.projcache_stale
+            and relink_empty
         )
 
     def describe(self) -> list[str]:
@@ -2205,15 +2510,26 @@ class DshRepairPlan:
             lines.append("修复会话文件 %s：%s" % (report["file"], rules))
         for stale in self.projcache_stale:
             lines.append("移走陈旧投影缓存 %s：%s" % (stale.session_id, stale.reason))
+        if self.relink is not None:
+            lines.extend(getattr(self.relink, "describe", lambda: [])())
         return lines
 
 
-def plan_dsh_repair(dsh_home: str, fix_dup_ids: bool = False) -> DshRepairPlan:
+def plan_dsh_repair(dsh_home: str, fix_dup_ids: bool = False,
+                    relink_source: str = "") -> DshRepairPlan:
     """生成联合修复计划（不写盘）。
 
-    范围：① workspace.json 索引归属修复；② 会话文件内容（默认只把扁平
-    ``replayState`` 升级为信封；``fix_dup_ids=True`` 才连重复 tool-call id 一起修）；
-    ③ 移走结论与日志矛盾的陈旧投影缓存记录。
+    范围：① workspace.json 索引归属修复（含 path 字段缺失时按会话 cwd 推断补齐、
+    path 指向的目录不在本机时补建空目录）；② 会话文件内容（默认把扁平
+    ``replayState`` 升级为信封、把 ``subagent/descriptor`` 的版本升到 3；
+    ``fix_dup_ids=True`` 才连重复 tool-call id 一起修）；
+    ③ 移走结论与日志矛盾的陈旧投影缓存记录；④ **子代理关系修复**（把早期版本导入
+    留下的顶层子代理会话改成原生子代理会话，见 :mod:`ai_env_clone.subagent_relink`）。
+
+    ④ 的来源**自动查找**（本机 ZCode / DSH 会话数据，以及本工具备份目录与上次用过的
+    目录里的 ``zcode_backup_*.zip`` / ``dsh_backup_*.zip``）；``relink_source`` 只是
+    可选的显式覆盖。检测不到「旧版导入的子代理会话」时这一步几乎不花时间（先扫 DSH
+    会话，没有候选就直接返回，不去解包）。
     """
     home = resolve_dsh_home(dsh_home)
     index_plan, index_idx = plan_workspace_index_repair(home)
@@ -2226,6 +2542,9 @@ def plan_dsh_repair(dsh_home: str, fix_dup_ids: bool = False) -> DshRepairPlan:
         r for r in summary["results"] if r["status"] in ("需要修复", "已修复")
     ]
     plan.projcache_stale = detect_stale_projcache(home, decompress=decompress)
+    from . import subagent_relink
+
+    plan.relink = subagent_relink.plan_subagent_relink(home, relink_source)
     if not decompress:
         plan.zstd_note = (
             "缺少 zstd 解压支持（%s）：zstd 会话文件内容无法检测/修复，仅处理了明文 JSONL"
@@ -2257,10 +2576,10 @@ def apply_dsh_repair(
     fix_dup_ids: bool = False,
     backup: bool = True,
 ) -> dict:
-    """执行联合修复：先修会话文件内容，再移走陈旧投影缓存，最后修 workspace 索引。
+    """执行联合修复：会话文件内容 → 陈旧投影缓存 → workspace 索引 → 子代理关系。
 
-    :return: ``{"files": [每个文件的修复报告], "projcache": [每条缓存的移走结果],
-        "index": ApplyResult}``。
+    ⚠️ 子代理关系修复**放在最后**：它会把旧顶层子代理会话的 id 从 ``sessionIds`` 里摘掉，
+    而索引修复按计划期的快照写盘（快照里那些 id 还在），先做索引才不会把它加回来。
     """
     home = resolve_dsh_home(dsh_home)
     results: list[dict] = []
@@ -2272,7 +2591,14 @@ def apply_dsh_repair(
     index_result = apply_workspace_index_repair(
         home, plan.index_plan, dry_run=False, backup=backup, idx=plan.index_idx
     )
-    return {"files": results, "projcache": projcache, "index": index_result}
+    relink_result: dict = {}
+    if plan.relink is not None and getattr(plan.relink, "targets", None):
+        from . import subagent_relink
+
+        relink_result = subagent_relink.apply_subagent_relink(home, plan.relink,
+                                                              backup=backup)
+    return {"files": results, "projcache": projcache, "index": index_result,
+            "relink": relink_result}
 
 
 # --------------------------------------------------------------------------- #
@@ -2333,6 +2659,13 @@ def main(argv: "list[str] | None" = None) -> int:
         dest="fix_dup_call_ids",
         action="store_true",
         help="同时修复同 step 内重复的 tool-call id（有语义改动，默认关闭）",
+    )
+    parser.add_argument(
+        "--relink-source",
+        dest="relink_source",
+        default="",
+        help="子代理关系修复的来源（数据根目录 / db.sqlite / 备份包 zip）；"
+             "默认自动查找本机数据与本工具备份目录里的 zcode/dsh 备份包，本项仅作覆盖",
     )
     args = parser.parse_args(argv)
 
@@ -2416,6 +2749,17 @@ def main(argv: "list[str] | None" = None) -> int:
                             }
                             for s in result.projcache_stale
                         ],
+                        "relink_targets": [
+                            {"child_id": t.child_id, "parent_id": t.parent_id,
+                             "source_session_id": t.source_session_id}
+                            for t in result.relink_targets
+                        ],
+                        "relink_skipped": [
+                            {"session_id": sid, "reason": reason}
+                            for sid, reason in result.relink_skipped
+                        ],
+                        "relink_source_note": result.relink_source_note,
+                        "workspace_paths_missing": result.workspace_paths_missing,
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -2428,11 +2772,14 @@ def main(argv: "list[str] | None" = None) -> int:
         return 0
 
     if args.command == "plan":
-        _print_plan(plan_dsh_repair(home, fix_dup_ids=args.fix_dup_call_ids))
+        _print_plan(plan_dsh_repair(home, fix_dup_ids=args.fix_dup_call_ids,
+                                    relink_source=args.relink_source))
         return 0
 
     # fix：workspace.json 索引归属 + 会话文件内容（默认只修扁平 replayState）
-    combined = plan_dsh_repair(home, fix_dup_ids=args.fix_dup_call_ids)
+    #      + 可选子代理关系修复（--relink-source 给出 ZCode 来源时才做）
+    combined = plan_dsh_repair(home, fix_dup_ids=args.fix_dup_call_ids,
+                               relink_source=args.relink_source)
     if combined.empty:
         _print_plan(combined)
         return 0
@@ -2452,6 +2799,11 @@ def main(argv: "list[str] | None" = None) -> int:
             "索引修复 %d 处；备份：%s"
             % (index_result.applied, index_result.backup_path or "（未生成）")
         )
+    for item in getattr(index_result, "created", None) or []:
+        if item["ok"]:
+            print("补建工作区目录 %s" % item["path"])
+        else:
+            print("补建工作区目录 %s 失败：%s" % (item["path"], item["error"]))
     for item in outcome["projcache"]:
         if item["ok"]:
             print("移走陈旧投影缓存 %s；备份：%s" % (item["session_id"], item["backup"]))
@@ -2468,9 +2820,20 @@ def main(argv: "list[str] | None" = None) -> int:
             print("      %s（%d 处）：%s" % (action["rule"], action["count"], action["detail"]))
         for problem in report["problems"]:
             print("      问题：%s" % problem["detail"])
+    relink_res = outcome.get("relink") or {}
+    relink_targets = relink_res.get("targets") or []
+    if relink_targets:
+        good = [r for r in relink_targets if r["ok"]]
+        print("子代理关系修复 %d 条（旧目录已移到 sessions/.removed/，可回退）" % len(good))
+        for r in relink_targets:
+            if not r["ok"]:
+                print("      %s 失败：%s" % (r["child_id"], r["error"]))
+        for p in relink_res.get("parents") or []:
+            print("      父会话 %s 已发布的 v4 已改名移走（DSH 会重新迁移并补 catalog）"
+                  % p["parent_id"])
     if any(r["status"] == "拒绝" for r in outcome["files"]) or any(
         not item["ok"] for item in outcome["projcache"]
-    ):
+    ) or any(not r["ok"] for r in relink_targets):
         return 1
     return 0
 
