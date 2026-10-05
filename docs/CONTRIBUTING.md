@@ -176,7 +176,18 @@ python -m unittest tests.test_import_matrix tests.test_session_migration_formats
 
 ---
 
-## 8. 发布流程（维护者参考，普通贡献者无需关心）
+## 8. 许可与贡献授权
+
+本项目以 **MIT** 许可发布，全文见仓库根目录 `LICENSE`。
+
+**提交贡献即表示你同意**：你提交的代码 / 文档按本仓库的 MIT 许可授权
+（inbound = outbound），且你有权提交该内容（原创，或已获得必要授权）。
+
+版权署名统一为 `Copyright (c) 2026 yinlichaoxi007 and contributors`。
+
+---
+
+## 9. 发布流程（维护者参考，普通贡献者无需关心）
 
 版本发布由 GitHub Actions 自动完成，**无需手动在网页上传编译产物**。规则如下：
 
@@ -426,7 +437,19 @@ python -m unittest tests.test_import_matrix tests.test_session_migration_formats
 
 ---
 
-## 8. Release Process (Maintainer Reference — not needed by regular contributors)
+## 8. License & Contribution Licensing
+
+This project is released under the **MIT** license (see `LICENSE` at the repo root).
+
+**By submitting a contribution you agree** that your code/docs are licensed under this
+repository's MIT license (inbound = outbound), and that you have the right to submit
+them (your original work, or you are otherwise authorized).
+
+The copyright notice is `Copyright (c) 2026 yinlichaoxi007 and contributors`.
+
+---
+
+## 9. Release Process (Maintainer Reference — not needed by regular contributors)
 
 Releases are automated by GitHub Actions — **no manual upload of build artifacts on the web**. Rules:
 

@@ -66,8 +66,10 @@ PROJECT_OWNER = "yinlichaoxi007"
 PROJECT_REPO = "ai-env-clone"
 
 #: 版权串。**「关于」对话框与 exe 版本资源共用这一个常量**，
-#: 避免两处写法漂移（改年份只改这里）。
-LEGAL_COPYRIGHT = "Copyright (c) 2026 %s" % AUTHOR
+#: 避免两处写法漂移（改年份只改这里）。署名为「原始作者 + 贡献者」：
+#: 原始作者保留署名，后续贡献者也共同享有其贡献部分的版权（口径见
+#: LICENSE 与 docs/CONTRIBUTING.md §8）。
+LEGAL_COPYRIGHT = "Copyright (c) 2026 %s and contributors" % AUTHOR
 
 #: 可识别的预发布标识，顺序即**优先级**：同一版本号下 ``dev`` < ``alpha`` <
 #: ``beta`` < ``rc`` < 正式版。未列出的标识按 :func:`_tag_rank` 排在
