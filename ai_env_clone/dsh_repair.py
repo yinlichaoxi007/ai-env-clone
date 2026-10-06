@@ -81,6 +81,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -742,6 +743,7 @@ class DetectResult:
     dup_id_sessions: list[str] = field(default_factory=list)  # 含同 step 重复 tool-call id 的会话
     descriptor_bad_sessions: list[str] = field(default_factory=list)  # 子代理描述符版本不受官方迁移支持、无法加载的会话
     projcache_stale: list = field(default_factory=list)  # 投影缓存结论与日志矛盾的记录（StaleProjcache）
+    shadowed_shells: list = field(default_factory=list)  # 空壳高代际遮挡正文的会话（ShadowedShell）
     zstd_name: str = ""
     zstd_missing: bool = False
     #: 子代理关系修复的检出情况（见 :mod:`ai_env_clone.subagent_relink`）：
@@ -764,6 +766,7 @@ class DetectResult:
             and not self.dup_id_sessions
             and not self.descriptor_bad_sessions
             and not self.projcache_stale
+            and not self.shadowed_shells
             and not self.relink_targets
         )
 
@@ -809,6 +812,11 @@ class DetectResult:
         lines.append("投影缓存陈旧会话（缓存映射与日志不符，侧边栏可能看不到 / 标题错）：%d 个"
                      "（其中 %d 个会被侧边栏隐藏；修复＝移走陈旧缓存，由 DSH 冷读时按最新日志重算）"
                      % (len(self.projcache_stale), hidden))
+        if self.shadowed_shells:
+            lines.append("被空壳遮挡的会话（导入时格式不合规被 DSH 静默重写为空壳，正文仍在低代际日志里）：%d 个"
+                         "（修复＝按低代际正文重生成合法日志并移走空壳）" % len(self.shadowed_shells))
+        else:
+            lines.append("被空壳遮挡的会话：0 个")
         if self.relink_targets:
             lines.append("旧版导入的子代理会话（当前是顶层会话、会被误当用户会话）：%d 个可自动改造为"
                          "原生子代理会话" % len(self.relink_targets))
@@ -851,11 +859,12 @@ class DetectResult:
     @property
     def attention_total(self) -> int:
         """需要用户注意的问题条目合计（未分组 + 索引问题 + 旧格式 + 重复 id +
-        描述符不兼容 + 投影缓存陈旧 + 旧导入子代理 + 工作区目录缺失）。"""
+        描述符不兼容 + 投影缓存陈旧 + 空壳遮挡 + 旧导入子代理 + 工作区目录缺失）。"""
         return (len(self.ungrouped) + len(self.index_problems)
                 + len(self.legacy_replay_sessions) + len(self.dup_id_sessions)
                 + len(self.descriptor_bad_sessions) + len(self.projcache_stale)
-                + len(self.relink_targets) + len(self.workspace_paths_missing))
+                + len(self.shadowed_shells) + len(self.relink_targets)
+                + len(self.workspace_paths_missing))
 
 
 def _find_workspace_for_session(
@@ -921,9 +930,10 @@ def detect_ungrouped(
 
     sessions = scan_sessions(home)
     result.sessions_total = len(sessions)
-    # 投影缓存陈旧与索引无关：索引缺失（早退分支）时同样要报出来
+    # 投影缓存陈旧 / 空壳遮挡都与索引无关：索引缺失（早退分支）时同样要报出来
     if decompress and with_content_check:
         result.projcache_stale = detect_stale_projcache(home, decompress=decompress, sessions=sessions)
+        result.shadowed_shells = detect_shadowed_shells(home, decompress=decompress)
 
     # 子代理关系检出与索引也无关：放在早退分支之前，索引缺失时同样给出。
     from . import subagent_relink
@@ -1047,6 +1057,165 @@ class StaleProjcache:
     path: str          # 陈旧的缓存记录文件 <sid>.json
     reason: str
     hidden: bool = False  # True：会使侧边栏隐藏该会话（blank 判据）
+
+
+@dataclass
+class ShadowedShell:
+    """一个「空壳高代际遮挡正文」的会话（关系校验类受损，方案见从备份包导入方案 ④）。
+
+    DSH 对**不满足关系校验**（seq 不连续 / 缺系统头 / turn-step 不配对）的日志会
+    **静默丢弃**并改写成一个只有几行 seed 的空壳 v4；原低代际日志的正文还在磁盘上，
+    但加载器按**最高代际**取用 ⇒ 界面看到的就是空会话。修复 = 把低代际正文经
+    ``session_migration._dsh_v3_text`` 重生成合法 v3，并把空壳高代际文件移走。
+    """
+
+    session_id: str
+    session_dir: str
+    shadow_file: str        # 空壳高代际日志（最高代际，无 turn/start）
+    shadow_version: int
+    body_file: str          # 被遮挡的含正文低代际日志
+    body_version: int
+
+
+def _iter_generation_logs(session_dir: str) -> "list[tuple[str, int]]":
+    """目录内全部 canonical 代际日志，按代际**降序**（与 ``find_generation_log``
+    同一套文件名判定，临时/备份文件天然不匹配）。"""
+    try:
+        entries = os.listdir(_longpath(session_dir))
+    except OSError:
+        return []
+    out = []
+    for name in entries:
+        version = parse_generation_log_filename(name)
+        if version is None:
+            continue
+        out.append((os.path.join(session_dir, name), version))
+    out.sort(key=lambda kv: -kv[1])
+    return out
+
+
+def _log_has_turn_start(log_file: str, decompress) -> bool:
+    """日志里是否含 ``turn/start`` 事件（空壳 seed 没有；正文一定有）。"""
+    try:
+        text = _read_log_text(log_file, decompress)
+    except Exception:  # noqa: BLE001 - 读不了按「没有正文」处理，宁可漏报不误伤
+        return False
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(entry, dict) and entry.get("type") == "turn/start":
+            return True
+    return False
+
+
+def detect_shadowed_shells(
+    dsh_home: str, decompress: "Callable[[bytes], bytes] | None" = None
+) -> "list[ShadowedShell]":
+    """找「最高代际是空壳 seed、低代际里还压着正文」的会话。
+
+    只认**可证明的遮挡**：最高代际日志无 ``turn/start``（空壳），且**低代际**某份
+    日志含 ``turn/start``（正文确在）。只有一份日志、或低代际也没有正文的
+    「真空会话」**不算**——前者无需修复，后者没有可恢复的内容，标出来只会吓人。
+    """
+    home = resolve_dsh_home(dsh_home)
+    if decompress is None:
+        decompress, _compress, _name = zstd_backend()
+    if decompress is None:
+        return []               # 无 zstd 读不了日志内容，目录级检测不判这一类
+    out: list = []
+    for s in scan_sessions(home):
+        if not s.log_file:
+            continue
+        logs = _iter_generation_logs(s.path)
+        if len(logs) < 2:
+            continue
+        # scan_sessions 已把 log_file 指到最高代际；这里再对一遍防漂移
+        if logs[0][0] != s.log_file:
+            continue
+        if _log_has_turn_start(s.log_file, decompress):
+            continue            # 最高代际有正文：没有遮挡
+        for body_file, body_version in logs[1:]:
+            if _log_has_turn_start(body_file, decompress):
+                out.append(ShadowedShell(
+                    session_id=s.session_id, session_dir=s.path,
+                    shadow_file=s.log_file, shadow_version=s.log_version,
+                    body_file=body_file, body_version=body_version,
+                ))
+                break           # 取「代际最高的含正文低代际」即可（逐会话一份）
+    return out
+
+
+def _apply_shell_fix(fix: ShadowedShell, decompress, home: str,
+                     backup: bool = True) -> dict:
+    """执行一份空壳遮挡修复：重生成正文 → 移走空壳 → 移走其投影缓存。
+
+    全程可回退：写盘前把**两份**日志都备份成 ``<文件>.bak.<UTC>``（与
+    ``repair_session_file`` 同风格）；重生成直接复用导入写出器
+    ``session_migration._dsh_v3_text``（同 sid、保留原 ``createdAt``），它的产物
+    已用官方迁移+校验链验证过。缓存记录**移走不代写**（与陈旧投影缓存同一修法）。
+    """
+    from .session_migration import _dsh_v3_text, _dsh_write_text, _parse_dsh_text
+
+    report = {"session_id": fix.session_id, "ok": False, "backups": [], "error": ""}
+    try:
+        header, _err = _read_session_header(fix.body_file, decompress)
+        created_ms = 0
+        cwd_val = ""
+        if isinstance(header, dict):
+            created_ms = int(header.get("createdAt") or 0)
+            cwd_val = header.get("cwd") if isinstance(header.get("cwd"), str) else ""
+        # ★ 用本模块的 _read_log_text（跟随调用方注入的解压后端）拿明文，再交给
+        # _parse_dsh_text 解析；不走 SessionParser.parse_dsh（它固定走 session_migration
+        # 的压缩层，明文日志 / 测试打桩都过不去）。
+        session = _parse_dsh_text(_read_log_text(fix.body_file, decompress))
+        text, _first_ms, _title = _dsh_v3_text(
+            fix.session_id, session, cwd_val,
+            parent_session_id=session.parent_source_id,
+            created_ms=created_ms,
+        )
+    except Exception as exc:  # noqa: BLE001 - 单个会话失败不挡其余修复
+        report["error"] = "重生成失败：%r" % (exc,)
+        return report
+
+    if backup:
+        for path in (fix.body_file, fix.shadow_file):
+            backup_path = _backup_path(path)
+            try:
+                shutil.copy2(_longpath(path), _longpath(backup_path))
+                report["backups"].append(backup_path)
+            except OSError as exc:
+                report["error"] = "备份失败（%s），不写盘：%s" % (path, exc)
+                return report
+
+    try:
+        _dsh_write_text(fix.body_file, text)
+    except Exception as exc:  # noqa: BLE001
+        report["error"] = "写回正文失败：%r" % (exc,)
+        return report
+    stamp = _now_iso().replace(":", "").replace(".", "-")
+    try:
+        os.replace(_longpath(fix.shadow_file),
+                   _longpath("%s.bak-%s" % (fix.shadow_file, stamp)))
+    except OSError as exc:
+        report["error"] = ("正文已重生成，但空壳移走失败（%s）；请手动把 %s 移出会话目录"
+                           % (exc, fix.shadow_file))
+        return report
+    # 该会话若有投影缓存记录，一并移走：重生成后缓存里的 title/blank 都可能过期，
+    # 让 DSH 冷读按新日志重算（与陈旧投影缓存同一修法，绝不代写缓存值）。
+    cache_record = os.path.join(_projcache_dir(home), fix.session_id + ".json")
+    if os.path.isfile(cache_record):
+        try:
+            os.replace(_longpath(cache_record),
+                       _longpath("%s.bak-%s" % (cache_record, stamp)))
+        except OSError:
+            pass                # 移不走只影响侧边栏首次显示，不算修复失败
+    report["ok"] = True
+    return report
 
 
 def _projcache_dir(dsh_home: str) -> str:
@@ -2487,6 +2656,7 @@ class DshRepairPlan:
     index_idx: "dict | None" = None                              # 读入的索引
     data_reports: list[dict] = field(default_factory=list)       # 需修的会话文件报告
     projcache_stale: list[StaleProjcache] = field(default_factory=list)  # 需移走的陈旧投影缓存
+    shell_fixes: list[ShadowedShell] = field(default_factory=list)  # 空壳遮挡待修复会话
     zstd_note: str = ""                                           # zstd 不可用时的说明
     #: 子代理关系修复计划（``None`` = 本次没有要求处理，例如调用方没给来源）
     relink: "object | None" = None
@@ -2500,6 +2670,7 @@ class DshRepairPlan:
             not self.index_plan.mutations
             and not self.data_reports
             and not self.projcache_stale
+            and not self.shell_fixes
             and relink_empty
         )
 
@@ -2510,6 +2681,11 @@ class DshRepairPlan:
             lines.append("修复会话文件 %s：%s" % (report["file"], rules))
         for stale in self.projcache_stale:
             lines.append("移走陈旧投影缓存 %s：%s" % (stale.session_id, stale.reason))
+        for fix in self.shell_fixes:
+            lines.append(
+                "重生成会话 %s 的正文（正文在低代际 v%d 日志里，被 DSH 拒后写的空壳 v%d 遮挡），"
+                "并把空壳日志与投影缓存移走"
+                % (fix.session_id, fix.body_version, fix.shadow_version))
         if self.relink is not None:
             lines.extend(getattr(self.relink, "describe", lambda: [])())
         return lines
@@ -2542,6 +2718,7 @@ def plan_dsh_repair(dsh_home: str, fix_dup_ids: bool = False,
         r for r in summary["results"] if r["status"] in ("需要修复", "已修复")
     ]
     plan.projcache_stale = detect_stale_projcache(home, decompress=decompress)
+    plan.shell_fixes = detect_shadowed_shells(home, decompress=decompress)
     from . import subagent_relink
 
     plan.relink = subagent_relink.plan_subagent_relink(home, relink_source)
@@ -2576,17 +2753,21 @@ def apply_dsh_repair(
     fix_dup_ids: bool = False,
     backup: bool = True,
 ) -> dict:
-    """执行联合修复：会话文件内容 → 陈旧投影缓存 → workspace 索引 → 子代理关系。
+    """执行联合修复：会话文件内容 → 空壳遮挡 → 陈旧投影缓存 → workspace 索引 → 子代理关系。
 
     ⚠️ 子代理关系修复**放在最后**：它会把旧顶层子代理会话的 id 从 ``sessionIds`` 里摘掉，
     而索引修复按计划期的快照写盘（快照里那些 id 还在），先做索引才不会把它加回来。
+    空壳遮挡修复放在投影缓存之前：它自己会顺带移走该会话的缓存记录。
     """
     home = resolve_dsh_home(dsh_home)
+    decompress, _compress, _name = zstd_backend()
     results: list[dict] = []
     for report in plan.data_reports:
         file = report.get("file")
         if file:
             results.append(repair_session_file(file, apply=True, fix_dup_ids=fix_dup_ids))
+    shells = [_apply_shell_fix(fix, decompress, home, backup=backup)
+              for fix in plan.shell_fixes]
     projcache = [_move_stale_projcache(stale) for stale in plan.projcache_stale]
     index_result = apply_workspace_index_repair(
         home, plan.index_plan, dry_run=False, backup=backup, idx=plan.index_idx
@@ -2597,8 +2778,8 @@ def apply_dsh_repair(
 
         relink_result = subagent_relink.apply_subagent_relink(home, plan.relink,
                                                               backup=backup)
-    return {"files": results, "projcache": projcache, "index": index_result,
-            "relink": relink_result}
+    return {"files": results, "shells": shells, "projcache": projcache,
+            "index": index_result, "relink": relink_result}
 
 
 # --------------------------------------------------------------------------- #
@@ -2748,6 +2929,16 @@ def main(argv: "list[str] | None" = None) -> int:
                                 "hidden": s.hidden,
                             }
                             for s in result.projcache_stale
+                        ],
+                        "shadowed_shells": [
+                            {
+                                "session_id": f.session_id,
+                                "shadow_file": f.shadow_file,
+                                "shadow_version": f.shadow_version,
+                                "body_file": f.body_file,
+                                "body_version": f.body_version,
+                            }
+                            for f in result.shadowed_shells
                         ],
                         "relink_targets": [
                             {"child_id": t.child_id, "parent_id": t.parent_id,
