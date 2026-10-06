@@ -40,9 +40,12 @@ from ai_env_clone.updater import (
     check_update,
     describe_result,
     handle_check_update_flag,
+    handle_update_flags,
     platform_asset_name,
 )
 from ai_env_clone import prefs as _prefs
+from ai_env_clone import elevate
+from ai_env_clone import updater
 
 # 版本查询必须先于 import tkinter 生效：版本号不该依赖 GUI 库——CI、最小化容器、
 # 只做版本核对的脚本可能没装 tkinter（本项目的受管 Python 就没有）。命中即退出，
@@ -57,6 +60,12 @@ if handle_docs_flag(sys.argv[1:]):
 
 # 「检查更新」同理不依赖 GUI 库；退出码 0=有新版本 / 1=已是最新 / 2=检查失败。
 _rc = handle_check_update_flag(sys.argv[1:])
+if _rc is not None:
+    raise SystemExit(_rc)
+
+# 「--update / --resume-update」同样不依赖 GUI 库：下载、校验、替换自成一条链，
+# 提权后的新进程只做替换不启动 GUI（见 updater/elevate 模块 docstring）。
+_rc = handle_update_flags(sys.argv[1:])
 if _rc is not None:
     raise SystemExit(_rc)
 
@@ -1242,6 +1251,14 @@ class QoderBackupApp:
             self.root, text="就绪", relief=tk.SUNKEN, anchor=tk.W, padding=4
         )
         self.status.grid(row=2, column=0, sticky="ew")
+        # 更新徽标：状态栏**右侧**的可点状态文字（界面方案第八部分——刻意不再往
+        # 主操作区加按钮）。默认隐藏，启动自动检查真发现可装更新时才出现。
+        self.update_badge = tk.Label(
+            self.root, text="", fg="#1a5fb4", cursor="hand2", padx=4
+        )
+        self.update_badge.grid(row=2, column=1, sticky="e")
+        self.update_badge.grid_remove()
+        self.update_badge.bind("<Button-1>", lambda _e: self._show_about())
 
         # 构建完成后按实际内容自适应窗口高度（保证状态栏等完整区域默认可见）
         self._refresh_import_matrix()
@@ -1255,6 +1272,9 @@ class QoderBackupApp:
         # 窗口尺寸变化（用户拖动 / 最大化 / 不同分辨率屏幕）时重排内容区：
         # 富余则按比例放大各弹性区域，不足则按比例压缩，压缩到底再出现竖向滚动条。
         self.root.bind("<Configure>", self._on_root_configure)
+
+        # 启动自动检查更新：开关 + 频率判定通过才查（默认关），首屏稳定后再发请求
+        self._maybe_auto_check_update()
 
     # ------------------------------------------------------------- helpers --
     def _avail_body_height(self) -> int:
@@ -2337,6 +2357,66 @@ class QoderBackupApp:
             messagebox.showinfo("更新设置", "（单元测试下不弹窗）")
             return
         UpdateSettingsDialog(self)
+
+    # -- 启动自动检查更新 ------------------------------------------------- #
+    def _maybe_auto_check_update(self) -> None:
+        """启动自动检查（判定见 ``prefs.should_check_now``：开关 + 频率 + 上次时间）。
+
+        - **默认关**：本机可能要代理才连得上 GitHub，静默检查会让启动白等；
+        - ``HEADLESS`` 下整条关闭——测试构造 app **绝不**发起网络；
+        - 结果只在「真有可安装的更新」时打扰用户（状态栏徽标）：
+          「已是最新 / 有新版但通道不含 / 检查失败」一律静默——
+          失败的详情留给用户手动「检查更新」时看，自动路径不该弹错误框。
+        """
+        if HEADLESS:
+            return
+        try:
+            cfg = _prefs.update_settings()
+            due = _prefs.should_check_now(cfg)
+        except Exception:  # noqa: BLE001 - 偏好读不出来就不检查
+            return
+        if not due:
+            return
+        # 首屏渲染完再查：晚于 _fit_layout 与工具检测，不和启动抢注意力
+        self.root.after(2500, self._auto_check_update)
+
+    def _auto_check_update(self) -> None:
+        cfg = _prefs.update_settings()
+
+        def _work() -> None:
+            result = None
+            try:
+                result = check_update(
+                    current=_version.__version__,
+                    include_prerelease=bool(cfg.get("include_prerelease")),
+                    proxy=str(cfg.get("proxy") or ""),
+                    skipped_version=str(cfg.get("skipped_version") or ""),
+                )
+            except Exception:  # noqa: BLE001 - 自动检查失败完全静默
+                result = None
+            try:
+                self.root.after(0, lambda: self._apply_auto_check(result))
+            except tk.TclError:       # 窗口已关闭
+                pass
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _apply_auto_check(self, result) -> None:
+        """自动检查的收尾（主线程）：记检查时间；有可装更新才亮徽标。"""
+        try:
+            _prefs.record_check()
+        except Exception:  # noqa: BLE001 - 记不上时间只影响下次频率判定
+            pass
+        if result is None or result.error or result.up_to_date or result.asset_missing:
+            return
+        info = getattr(result, "info", None)
+        if info is None:
+            return
+        self._show_update_badge(info.version)
+
+    def _show_update_badge(self, version: str) -> None:
+        self.update_badge.configure(text="有新版本 v%s（点击查看）" % version)
+        self.update_badge.grid()
 
     def on_migrate(self) -> None:
         """打开「导入会话」对话框（仅当前工具支持导入时可用）。"""
@@ -4025,6 +4105,13 @@ def _enable_dpi_awareness() -> None:
 
 def main() -> None:
     _enable_dpi_awareness()
+    # 上一次更新留下的 .old 只能由「成功启动起来的新版本」清掉——本函数能执行到
+    # 这里就说明新版本已经跑起来了（方案 6.1 ⑧）；尽力而为，清不掉静默留待下次。
+    if getattr(sys, "frozen", False):
+        try:
+            updater.cleanup_pending_old()
+        except Exception:  # noqa: BLE001 - 清理绝不挡启动
+            pass
     root = tk.Tk()
     try:
         ttk.Style().theme_use("vista")
@@ -6228,6 +6315,23 @@ class AboutDialog:
                              relief=tk.FLAT, state="disabled")
         self._notes_packed = False
 
+        # 下载 / 安装行：只在「检查发现了可安装的更新」后出现（平时不占高度）。
+        # 打包版 Windows 可自动替换重启；其余平台只下载 + 校验 + 指路手动替换。
+        self._info = None                      # 最近一次检查发现的 UpdateInfo
+        self._downloaded_path = None           # 已下载并通过校验的文件
+        self._dl_cancel = None                 # threading.Event
+        self._dl_running = False
+        self.dl_row = ttk.Frame(right)
+        self.dl_status_var = tk.StringVar(value="")
+        self.dl_label = ttk.Label(self.dl_row, textvariable=self.dl_status_var)
+        self.dl_pbar = ttk.Progressbar(self.dl_row, length=160,
+                                       mode="determinate", maximum=100)
+        self.dl_btn = ttk.Button(self.dl_row, width=14,
+                                 command=self._start_download)
+        self.skip_btn = ttk.Button(self.dl_row, text="跳过此版本", width=12,
+                                   command=self._skip_version)
+        self._dl_row_packed = False
+
         btns = ttk.Frame(top)
         btns.pack(fill=tk.X, pady=(4, 12))
         ttk.Button(btns, text="关闭", width=12, command=top.destroy).pack(
@@ -6405,10 +6509,14 @@ class AboutDialog:
             return
         if info is not None:
             self.latest_var.set("最新版本：v%s" % info.version)
+            self._info = info
+            self._show_action_row()
             # 更新说明 = 结论（含「未做哈希校验 / 这是预发布」这类提醒）+ 发布说明
             notes = text + (("\n\n" + notes) if notes else "")
         else:
             self.latest_var.set(text)
+            self._info = None
+            self._hide_action_row()
         if notes:
             self.notes.configure(state="normal")
             self.notes.delete("1.0", tk.END)
@@ -6419,6 +6527,175 @@ class AboutDialog:
                 self._notes_packed = True
         if not failed:
             _prefs.record_check()
+
+    # -- 下载 / 安装 / 跳过（方案第五、六部分） ---------------------------- #
+    def _can_install(self) -> bool:
+        """能否原地替换重启：**仅打包版 Windows**（源码模式的程序是代码本身，
+        ``sys.executable`` 是 python.exe，替换它毫无意义；macOS/Linux 本轮只做下载）。"""
+        return sys.platform.startswith("win") and updater.is_frozen()
+
+    def _show_action_row(self) -> None:
+        info = self._info
+        if info is None:
+            return
+        if self._downloaded_path and os.path.isfile(self._downloaded_path):
+            self.dl_btn.configure(text="立即安装")
+        elif self._can_install():
+            self.dl_btn.configure(text="下载并更新…")
+        else:
+            self.dl_btn.configure(text="下载…")
+        if not self._dl_row_packed:
+            self.dl_label.pack(side=tk.LEFT)
+            self.dl_btn.pack(side=tk.RIGHT, padx=(6, 0))
+            self.skip_btn.pack(side=tk.RIGHT)
+            self.dl_row.pack(fill=tk.X, pady=(8, 0))
+            self._dl_row_packed = True
+        self.dl_status_var.set("")
+        self.dl_btn.configure(state="normal")
+
+    def _hide_action_row(self) -> None:
+        if self._dl_row_packed:
+            self.dl_row.pack_forget()
+            self._dl_row_packed = False
+        self._dl_running = False
+        self._dl_cancel = None
+        self.dl_pbar.pack_forget()
+
+    def _skip_version(self) -> None:
+        """跳过当前发现的版本（写进 prefs，检查侧按 tag 相等过滤）。"""
+        info = self._info
+        if info is None or self._dl_running:
+            return
+        if not messagebox.askyesno(
+                "跳过此版本",
+                "跳过 v%s？此后检查更新不再提示该版本；\n"
+                "可在「设置 → 更新设置」里重新启用。" % info.version,
+                parent=self.top):
+            return
+        _prefs.save_update_settings(skipped_version=info.tag)
+        self._info = None
+        self._hide_action_row()
+        self.latest_var.set("已跳过 v%s（可在更新设置里重新启用）" % info.version)
+
+    def _start_download(self) -> None:
+        """点「下载」：后台线程流式下载 + 三道校验（进度经 ``after`` 回主线程）。"""
+        info = self._info
+        if info is None or self._dl_running:
+            return
+        if self._downloaded_path and os.path.isfile(self._downloaded_path):
+            self._install(self._downloaded_path)     # 已下载过：直接进安装
+            return
+        cfg = _prefs.update_settings()
+        cancel = threading.Event()
+        self._dl_cancel = cancel
+        self._dl_running = True
+        self.dl_btn.configure(state="disabled")
+        self.skip_btn.configure(state="disabled")
+        self.dl_pbar.configure(value=0)
+        if not self.dl_pbar.winfo_manager():
+            self.dl_pbar.pack(side=tk.LEFT, padx=(8, 0))
+        self.dl_status_var.set("下载中…")
+
+        def _progress(pct: int) -> None:
+            def _apply() -> None:
+                try:
+                    self.dl_pbar.configure(value=max(0, pct))
+                    self.dl_status_var.set(
+                        "下载中…%s" % ("…" if pct < 0 else "%d%%" % pct))
+                except tk.TclError:
+                    pass
+            try:
+                self.top.after(0, _apply)
+            except tk.TclError:
+                pass
+
+        def _work() -> None:
+            try:
+                path = updater.download_update(
+                    info, proxy=str(cfg.get("proxy") or ""),
+                    progress=_progress, cancel=cancel.is_set)
+            except updater.UpdateCancelled:
+                self.top.after(0, lambda: self._dl_finished("已取消。"))
+            except Exception as exc:  # noqa: BLE001 - 失败原因原样展示，不吞
+                self.top.after(0, lambda: self._dl_finished("下载失败：%s" % exc))
+            else:
+                self.top.after(0, lambda: self._dl_downloaded(path))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _dl_finished(self, message: str) -> None:
+        self._dl_running = False
+        self._dl_cancel = None
+        try:
+            self.dl_btn.configure(state="normal")
+            self.skip_btn.configure(state="normal")
+            self.dl_pbar.pack_forget()
+            self.dl_status_var.set(message)
+        except tk.TclError:
+            pass
+
+    def _dl_downloaded(self, path: str) -> None:
+        self._downloaded_path = path
+        self._dl_running = False
+        self._dl_cancel = None
+        try:
+            self.skip_btn.configure(state="normal")
+            self.dl_pbar.pack_forget()
+            self.dl_status_var.set("校验通过")
+        except tk.TclError:
+            pass
+        if self._can_install():
+            self.dl_btn.configure(text="立即安装", state="normal")
+            self._install(path)
+        else:
+            self.dl_btn.configure(state="normal")
+            self.dl_status_var.set("已下载并校验：%s" % path)
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", path])   # 在访达中显示
+
+    def _install(self, path: str) -> None:
+        """替换并重启（仅打包版 Windows 会被调用）。失败按方案 6.1.1 给提权重试。"""
+        if not messagebox.askyesno(
+                "安装更新",
+                "已下载并通过校验，立即重启并安装新版本？\n"
+                "（当前程序将退出，由新版本接管。）",
+                parent=self.top):
+            self.dl_btn.configure(text="立即安装")
+            self.dl_status_var.set("已下载，可稍后点「立即安装」。")
+            return
+        try:
+            updater.stage_and_replace(path)
+        except updater.UpdaterError as exc:
+            if not self._offer_elevation(path, exc):
+                messagebox.showerror("更新失败", str(exc), parent=self.top)
+            return
+        self.dl_status_var.set("已启动新版本，当前程序即将退出…")
+        self.top.after(400, self.app.root.destroy)
+
+    def _offer_elevation(self, path: str, exc: "updater.UpdaterError") -> bool:
+        """目录不可写时的「提权重试」出路（方案 6.1.1）。返回是否已处理。"""
+        directory = os.path.dirname(os.path.abspath(sys.executable))
+        if updater.ensure_dir_writable(directory):
+            return False            # 不是权限问题（杀软锁定等），照实报错即可
+        if not (updater.is_frozen() and sys.platform.startswith("win")):
+            return False            # 源码模式不提供提权按钮（方案边界一）
+        if elevate.is_user_admin():
+            return False            # 已提权仍不可写 ⇒ 不是权限问题，只给手动路径
+        if not messagebox.askyesno(
+                "无法自动更新：程序所在目录不可写",
+                "%s\n\n要以管理员身份重新运行并自动更新吗？\n"
+                "（选「否」将打开发布页手动下载。）" % exc,
+                parent=self.top):
+            webbrowser.open("https://github.com/%s/%s/releases/latest"
+                            % (updater.OWNER, updater.REPO))
+            return True
+        if not elevate.request_elevation(path):
+            # 用户在 UAC 里点了「否」：静默回到对话框，不算失败、不弹错误框
+            self.dl_status_var.set("已下载，可稍后点「立即安装」。")
+            return True
+        self.dl_status_var.set("已请求管理员权限，当前程序即将退出…")
+        self.top.after(400, self.app.root.destroy)
+        return True
 
 
 class UpdateSettingsDialog:
