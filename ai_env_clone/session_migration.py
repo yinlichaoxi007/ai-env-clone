@@ -1181,67 +1181,74 @@ class SessionParser:
             if not resolved:
                 raise ValueError("指定的 DSH 会话目录内没有 session*.jsonl.zstd 文件")
             session_file = resolved
-        text = _dsh_read_text(session_file)
-        title = ""
-        scope = ""
-        msgs: list = []
-        is_subagent = False
-        parent_session_id = ""
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            etype = obj.get("type")
-            data = obj.get("data") or {}
-            if etype == "session":
-                scope = obj.get("cwd") or ""
-                # 子代理会话的判定只看 header（``origin: "subagent"`` + ``parentSession``）；
-                # 目录名（裸 uuid）只是旁证，日志被单独拷出来时它不一定还在。
-                is_subagent = obj.get("origin") == "subagent" \
-                    or bool(obj.get("parentSession"))
-                parent_session_id = obj.get("parentSession") or ""
-            elif etype == "session/title":
-                title = title or (data.get("title") or "")
-            elif etype == "user/message":
-                msgs.append(SessionMessage(
-                    role="user",
-                    content=_flatten_any(data.get("content")),
-                    created_at=_ms_to_iso(obj.get("time")),
-                ))
-            elif etype == "assistant/message":
-                msg = data.get("message") or {}
-                text_parts: list = []
-                tool_calls: list = []
-                for part in msg.get("content") or []:
-                    if not isinstance(part, dict):
-                        continue
-                    if part.get("type") == "text":
-                        text_parts.append(part.get("text") or "")
-                    elif part.get("type") == "tool-call":
-                        tool_calls.append({
-                            "id": part.get("id") or "",
-                            "name": part.get("name") or "",
-                            "arguments": part.get("arguments") or "",
-                        })
-                m = SessionMessage(
-                    role="assistant",
-                    content="\n".join(p for p in text_parts if p),
-                    tool_calls=tool_calls,
-                    created_at=_ms_to_iso(obj.get("time")),
-                )
-                # 相邻助手消息（同一步多次输出）合并，保持用户名下内容完整
-                if msgs and msgs[-1].role == "assistant" and tool_calls and not text_parts:
-                    msgs[-1].tool_calls.extend(tool_calls)
-                else:
-                    msgs.append(m)
-        return Session(source_tool="dsh", title=title, scope=scope, messages=msgs,
-                       is_subagent=is_subagent,
-                       parent_source_id=parent_session_id)
+        return _parse_dsh_text(_dsh_read_text(session_file))
 
+def _parse_dsh_text(text: str) -> Session:
+    """解析 DSH 会话日志**明文**（已解压的 JSONL）为 ``Session``。
+
+    与 ``SessionParser.parse_dsh`` 的唯一差别是输入形态：这里吃的是已解压
+    文本，不经过 zstd 后端——空壳遮挡修复（``dsh_repair``）拿到的是已解压
+    正文，直接复用这段解析，避免再过一遍压缩层。
+        """
+    title = ""
+    scope = ""
+    msgs: list = []
+    is_subagent = False
+    parent_session_id = ""
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        etype = obj.get("type")
+        data = obj.get("data") or {}
+        if etype == "session":
+            scope = obj.get("cwd") or ""
+            # 子代理会话的判定只看 header（``origin: "subagent"`` + ``parentSession``）；
+            # 目录名（裸 uuid）只是旁证，日志被单独拷出来时它不一定还在。
+            is_subagent = obj.get("origin") == "subagent" \
+                or bool(obj.get("parentSession"))
+            parent_session_id = obj.get("parentSession") or ""
+        elif etype == "session/title":
+            title = title or (data.get("title") or "")
+        elif etype == "user/message":
+            msgs.append(SessionMessage(
+                role="user",
+                content=_flatten_any(data.get("content")),
+                created_at=_ms_to_iso(obj.get("time")),
+            ))
+        elif etype == "assistant/message":
+            msg = data.get("message") or {}
+            text_parts: list = []
+            tool_calls: list = []
+            for part in msg.get("content") or []:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    text_parts.append(part.get("text") or "")
+                elif part.get("type") == "tool-call":
+                    tool_calls.append({
+                        "id": part.get("id") or "",
+                        "name": part.get("name") or "",
+                        "arguments": part.get("arguments") or "",
+                    })
+            m = SessionMessage(
+                role="assistant",
+                content="\n".join(p for p in text_parts if p),
+                tool_calls=tool_calls,
+                created_at=_ms_to_iso(obj.get("time")),
+            )
+            # 相邻助手消息（同一步多次输出）合并，保持用户名下内容完整
+            if msgs and msgs[-1].role == "assistant" and tool_calls and not text_parts:
+                msgs[-1].tool_calls.extend(tool_calls)
+            else:
+                msgs.append(m)
+    return Session(source_tool="dsh", title=title, scope=scope, messages=msgs,
+                   is_subagent=is_subagent,
+                   parent_source_id=parent_session_id)
 
 
 # --------------------------------------------------------------------------- #
