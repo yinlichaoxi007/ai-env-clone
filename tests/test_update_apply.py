@@ -222,6 +222,26 @@ class TestStageAndReplace(_TmpCase):
         with open(marker, "r", encoding="utf-8") as f:
             self.assertEqual(__import__("json").load(f)["old"], old)
 
+    def test_target_rename_failure_is_diagnosable(self) -> None:
+        """目标 exe 被占用（杀软锁定）⇒ 改名失败转成可诊断的 UpdaterError，原文件不动。"""
+        target = self._make_target()
+        downloaded = self._make_download()
+        real_rename = os.rename
+
+        def _busy(src, dst):
+            if str(src) == str(target):
+                raise PermissionError(32, "in use by antivirus")
+            return real_rename(src, dst)
+
+        with mock.patch.object(os, "rename", side_effect=_busy):
+            with self.assertRaises(updater.UpdaterError) as ctx:
+                updater.stage_and_replace(downloaded, target=target,
+                                          popen=lambda _argv: None)
+        self.assertIn("杀毒软件", str(ctx.exception))
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), b"MZold")            # 原文件未动
+        self.assertFalse(os.path.exists(target + ".old"))   # 尚未产生任何残留
+
     def test_unwritable_dir_aborts_without_elevation(self) -> None:
         """预检不可写 ⇒ 直接失败，**绝不静默提权**（方案 6.4 底线）。"""
         target = self._make_target()
