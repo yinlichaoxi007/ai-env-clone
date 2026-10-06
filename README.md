@@ -227,24 +227,32 @@ from ai_env_clone.core import export_backup, import_backup
 
 - 备份产物是一个标准 `.zip` 文件，文件名形如 `<工具名>_backup_<时间戳>.zip`（例如 `qoder_backup_20260805_095519.zip`）。包内含 `<工具名>_backup_manifest.json` 清单，记录 `kind`（类型）、`tool`（工具名）、`created_at`（创建时间）、`source_root`（来源目录）、`items`（包含模块）、`origin_info`（该包携带的源设备信息，见「携带源设备信息」一节）、文件数等。
 - 在「备份浏览器」（点「还原备份包」打开）中可查看明细、校验完整性、选择还原。校验结果会显示在列表「完整性」列，切换选择后仍可见。
-- 恢复时会**自动覆盖**同名文件，并在覆盖前在备份目录下的 `backup/<工具名>/` 生成 `<工具名>_rollback_<时间戳>.zip` 回滚快照，可随时还原到恢复前状态，也方便按文件时间信息对比选择。备份默认同样导出到该 `backup/<工具名>/`。
+- 恢复确认框提供**还原方式二选一**：**增量合并**（默认，仅 CodeBuddy / DSH / Reasonix / WorkBuddy 提供）或**全覆盖**。「全覆盖」在覆盖前于 `backup/<工具名>/` 生成 `<工具名>_rollback_<时间戳>.zip` 回滚快照，可随时还原到覆盖前状态；「合并」先算后写，失败同样**整体回滚**。备份默认导出到同一目录。
 - **备份目录位置**：与启动方式同级。
   - 源码模式（`python -m ai_env_clone` / `run.bat`）：`<仓库根>/backup/<工具名>/`。
   - 打包模式（单文件 exe / app / 二进制）：可执行程序是独立分发物，备份目录放在 **exe 同级**的 `backup/<工具名>/`（如 `dist/backup/qoder/`），让程序与它的备份数据在一起，便于随程序一起拷贝/迁移。重打包（`build_exe.py` / `build.bat`）只会覆盖 exe 本身，不会清空 `backup/` 子目录，备份数据安全。
 - **防误还原**：还原时以包内 manifest 的 `kind` 为准，仅改文件名无法骗过校验；若包内记录的 `source_root` 与当前还原目标不一致，会弹窗二次确认，防止覆盖错误目录的数据。备份与回滚快照均可还原。
-- **还原对「目标机器已有数据」的影响，按工具分两类（界面按当前工具说明是哪一类）**：
-  - **文件落盘型**（CodeBuddy / DSH / Reasonix）：数据按文件与目录存放，还原只**补入或更新**包内文件，目标机上包外的会话与数据不受影响；DSH 的全局索引文件还会走**并集合并**。
-  - **整库覆盖型**（Qoder 的 `local.db` / `main.sqlite` / `sessionMigration.sqlite` / `memoryMigration.sqlite`；WorkBuddy 的 `workbuddy.db`；TraeCode CN 与 TraeWork CN 的 `database.db`；ZCode 的 `db.sqlite` / `tasks-index.sqlite`）：会话记录集中在**单个库文件**里，还原 = **整库换掉** ⇒ 目标机库中**原有的会话会被备份内容取代**（备份包里没有的本机记录不会保留）。这类工具还原前请先确认「这台电脑上有没有要留下的数据」：有就先在本机导出一份备份（或依赖还原时自动生成的回滚快照）再还原。
-  - 每个适配器通过 `BaseAdapter.RESTORE_LIBRARY_FILES` **声明**自己属于哪一类，界面据此取措辞；「声明」与「磁盘上默认勾选的库文件」是否一致由 `tests/test_item_contract.py` 锁死（两个方向都查）。
+- **还原对「目标机器已有数据」的影响，取决于还原方式与工具**：
+  - **增量合并（默认，仅 CodeBuddy / DSH / Reasonix / WorkBuddy 提供）**：尽量不动本机已有数据，把备份包里有、本机没有的内容**并入**（先算后写、失败整体回滚）：
+    - **CodeBuddy**：`index.json` 会话清单**并集**（本机条目优先）；`settings.json` / `mcp.json` / `argv.json` 以包为准；其余文件保留本机。
+    - **DSH**：`workspace.json` **并集**（保留本机原有工作区）；`cordis.patch.yml` 以包为准；会话文件保留本机。
+    - **WorkBuddy**：`workbuddy.db` 库内**逐表并入**（会话 / 工作区 / 用量表；白名单外的应用状态绝不触碰，本机已有行不动）；`settings.json` 以包为准。
+    - **Reasonix**：会话为独立文件 ⇒ 本机保留；`config.toml` / `settings.json` 以包为准。
+  - **全覆盖（所有工具都有，语义与旧版一致）**：同名文件整体替换，覆盖前自动生成回滚快照。影响按工具分两类（界面按当前工具说明是哪一类）：
+    - **文件落盘型**（CodeBuddy / DSH / Reasonix）：数据按文件与目录存放，还原只**补入或更新**包内文件，目标机上包外的会话与数据不受影响。
+    - **整库覆盖型**（Qoder 的 `local.db` / `main.sqlite` / `sessionMigration.sqlite` / `memoryMigration.sqlite`；WorkBuddy 的 `workbuddy.db`；TraeCode CN 与 TraeWork CN 的 `database.db`；ZCode 的 `db.sqlite` / `tasks-index.sqlite`）：会话记录集中在**单个库文件**里，还原 = **整库换掉** ⇒ 目标机库中**原有的会话会被备份内容取代**（备份包里没有的本机记录不会保留）。这类工具还原前请先确认「这台电脑上有没有要留下的数据」：有就先在本机导出一份备份（或依赖还原时自动生成的回滚快照）再还原。
+  - 每个适配器通过 `BaseAdapter.RESTORE_POLICY` / `RESTORE_LIBRARY_FILES` **声明**自己的合并策略与所属类别，界面据此决定「合并」选项是否出现、确认框取什么措辞；声明与实现的一致性由 `tests/test_restore_merge.py` / `tests/test_item_contract.py` 锁死。
 - **「完整备份」的口径 = 默认勾选项**：默认勾选的即**无法从零重建**的核心内容（会话、记忆、规则），所以按默认导出就是一个可以直接换机的完整包。备份完成时会明确告知本次**是否**为完整备份；若你取消了默认项，会列出被跳过的项并提示重新导出。未勾选项只有两类：可重建的（插件 / 技能 / 索引）与出于安全不随包携带的凭证。
-- **关于「覆盖 vs 融合」**：恢复时同名文件是**整体覆盖**（覆盖前自动生成回滚快照，可随时还原到覆盖前状态），而不是按内容结构做「追加不同、覆盖相同」的融合。这是**各 AI 工具数据格式的限制**：会话日志是压缩/加密/二进制格式（如 DSH 的 `session.jsonl.zstd`、Qoder 旧版 `local.db` 的会话正文列），本工具无法读取其内部结构去逐条合并；对明文 JSON/JSONL 虽可解析，但半吊子的「部分融合」可能造成同一会话在不同机器上内容不一致、甚至让工具无法正常打开数据，比整体覆盖更危险。因此**多台电脑使用时应「串行」而非「交叉并行」**——精确的粒度是**同一工作区的同一会话**：
-  - **例外（安全的索引合并）**：面向「全局索引文件」这类**纯 JSON、结构可完整解析且合并语义明确**的文件，本工具会做**合并而非整体覆盖**，以保住目标机器原有的同名条目。典型即 DSH 的 `storages/workspace.json`（见下节）。
+- **关于「合并 vs 全覆盖」（2026-10-05 起两者并存，默认合并）**：
+  - **合并的粒度是「清单 / 库表的并集」，不是逐条内容的三路融合**：把备份包里有、本机没有的会话**并进来**；两边都有的条目**以本机为准**（本机强相关的字段）或**以包为准**（唯一配置文件，见上表）。会话日志是压缩 / 加密 / 二进制格式（如 DSH 的 `session.jsonl.zstd`、Qoder 旧版 `local.db` 的会话正文列），**同一条会话在两台机器上的增量**本工具无法逐条拼合；半吊子的「内容级部分融合」可能造成同一会话在不同机器上内容不一致、甚至让工具无法正常打开数据，比整体覆盖更危险——因此这类内容仍走「并集 + 本机优先」，不搞逐条合并。
+  - **「全覆盖」保留为退路**：语义与旧版完全一致（整库 / 整文件替换 + 回滚快照），想完全复刻备份包当时的状态时选它；Qoder / Trae / ZCode 因会话库无法逐表解析，**只有全覆盖**。
+  - 因此**多台电脑使用仍应「串行」而非「交叉并行」**——精确的粒度是**同一工作区的同一会话**：
   1. **同一工作区的同一会话**，同一时间只在一台电脑上使用（不同工作区、不同会话互不影响，可并行）；
   2. 换电脑前，先在当前电脑**导出备份**；
   3. 到新电脑后，先**还原该备份**再开始使用；
-  4. 切勿在两台电脑上交叉使用同一个工作区/会话后互相还原——覆盖会丢失其中一侧的增量，融合则可能产生冲突数据。
-  - harness 自身的设置（含自定义模型配置，如 DSH 的 `profiles/<profile>/cordis.patch.yml`）理论上可按 key 融合，但**没必要**：设置本就应随会话一起串行修改、随备份整体迁移，恢复时同样整体覆盖同名文件即可，避免跨机器设置漂移。
-  - 若某台电脑上已经产生了新数据（还原目标里已有备份之外的会话/记忆），还原前请先手动导出该电脑的备份（或直接使用自动生成的回滚快照），确保新旧数据各有一份可回退的副本，再决定保留哪一侧。
+  4. 切勿在两台电脑上交叉使用同一个工作区/会话后互相还原——合并只并「有 / 无」，**同一条会话两边的增量**无法拼合；全覆盖则会丢失其中一侧的增量。
+  - harness 自身的设置（含自定义模型配置，如 DSH 的 `profiles/<profile>/cordis.patch.yml`）理论上可按 key 融合，但**没必要**：设置本就应随会话一起串行修改、随备份整体迁移，合并模式下声明为「以包为准」，避免跨机器设置漂移。
+  - 若某台电脑上已经产生了新数据（还原目标里已有备份之外的会话/记忆），**默认的合并方式本身就是为这种场景准备的**（新数据不动、旧包内容并入）；需要完全回到备份包状态时改选「全覆盖」，覆盖前请先手动导出该电脑的备份（或直接使用自动生成的回滚快照），确保新旧数据各有一份可回退的副本。
 
 ### 跨软件会话导入
 
@@ -732,21 +740,29 @@ from ai_env_clone.core import export_backup, import_backup
 
 - A standard `.zip` named `<tool>_backup_<timestamp>.zip`, with a `<tool>_backup_manifest.json` (kind, tool, creation time, source dir, modules, `origin_info` — the source-device info this archive carries, see "Carried Source-Device Info", file count, …).
 - Viewable via the "备份浏览器" (open from "还原备份包"): inspect details, verify integrity, and choose what to restore.
-- Restore **overwrites** existing files and auto-creates a `<tool>_rollback_<timestamp>.zip` snapshot beforehand in the same `backup/<tool>/` directory, so you can revert anytime. Type is verified against the manifest to prevent accidental restore of a misnamed file.
+- The restore confirmation offers a **choice of restore mode**: **incremental merge** (default; only CodeBuddy / DSH / Reasonix / WorkBuddy offer it) or **full overwrite**. "Full overwrite" auto-creates a `<tool>_rollback_<timestamp>.zip` snapshot beforehand in the same `backup/<tool>/` directory so you can revert anytime; "merge" computes first and writes later, rolling back **as a whole** on failure. Type is verified against the manifest to prevent accidental restore of a misnamed file. Backups are exported to the same directory by default.
 - **Backup directory location**: next to the launch method. Source mode (`python -m ai_env_clone` / `run.bat`) → `<repo root>/backup/<tool>/`. Packaged mode (single-file exe / app / binary) → the executable is a standalone distributable, so backups go to `backup/<tool>/` **next to the exe** (e.g. `dist/backup/qoder/`), keeping the program and its data together. Re-packaging (`build_exe.py` / `build.bat`) only overwrites the exe itself and never clears the `backup/` subfolder, so backups are safe.
-- **How a restore affects the target machine's existing data falls into two categories (the UI states which one applies to the selected tool)**:
-  - **File-based tools** (CodeBuddy / DSH / Reasonix): data lives as files and directories, so a restore only **adds or updates** files from the package; sessions and data on the target machine that are not in the package are untouched. DSH's global index file is additionally **unioned** (merged, not overwritten).
-  - **Whole-library-overwrite tools** (Qoder's `local.db` / `main.sqlite` / `sessionMigration.sqlite` / `memoryMigration.sqlite`; WorkBuddy's `workbuddy.db`; TraeCode CN and TraeWork CN's `database.db`; ZCode's `db.sqlite` / `tasks-index.sqlite`): sessions live in a **single library file**, so a restore **replaces the whole library** — the target machine's **existing sessions in that library are replaced** by the package contents (local records absent from the package are not kept). Before restoring one of these, check whether this machine holds data you want to keep; if so, export a backup here first (or rely on the rollback snapshot created automatically during restore).
-  - Each adapter **declares** its category via `BaseAdapter.RESTORE_LIBRARY_FILES`, and the UI derives its wording from that declaration. The declaration is kept in sync with the actual default-checked library files by `tests/test_item_contract.py` (checked in both directions).
+- **How a restore affects the target machine's existing data depends on the restore mode and the tool**:
+  - **Incremental merge (default; only CodeBuddy / DSH / Reasonix / WorkBuddy offer it)**: leaves the machine's existing data alone as much as possible and **merges in** what the package has and the machine lacks (compute first, write later, whole-rollback on failure):
+    - **CodeBuddy**: the `index.json` session list is **unioned** (local entries win); `settings.json` / `mcp.json` / `argv.json` follow the package; everything else stays local.
+    - **DSH**: `workspace.json` is **unioned** (local workspaces preserved); `cordis.patch.yml` follows the package; session files stay local.
+    - **WorkBuddy**: `workbuddy.db` is merged **table by table** (sessions / workspaces / usage tables; anything outside the whitelist is never touched, existing local rows stay put); `settings.json` follows the package.
+    - **Reasonix**: sessions are standalone files ⇒ kept local; `config.toml` / `settings.json` follow the package.
+  - **Full overwrite (every tool, semantics unchanged from before)**: same-named files are replaced as a whole, with a rollback snapshot created first. Its effect still falls into two categories (the UI states which one applies):
+    - **File-based tools** (CodeBuddy / DSH / Reasonix): data lives as files and directories, so a restore only **adds or updates** files from the package; sessions and data on the target machine that are not in the package are untouched.
+    - **Whole-library-overwrite tools** (Qoder's `local.db` / `main.sqlite` / `sessionMigration.sqlite` / `memoryMigration.sqlite`; WorkBuddy's `workbuddy.db`; TraeCode CN and TraeWork CN's `database.db`; ZCode's `db.sqlite` / `tasks-index.sqlite`): sessions live in a **single library file**, so a restore **replaces the whole library** — the target machine's **existing sessions in that library are replaced** by the package contents (local records absent from the package are not kept). Before restoring one of these, check whether this machine holds data you want to keep; if so, export a backup here first (or rely on the rollback snapshot created automatically during restore).
+  - Each adapter **declares** its merge policy via `BaseAdapter.RESTORE_POLICY` and its category via `RESTORE_LIBRARY_FILES`; the UI uses the declarations both to show/hide the "merge" option and to word the confirmations. Declaration-vs-implementation consistency is locked by `tests/test_restore_merge.py` / `tests/test_item_contract.py`.
 - **The definition of a "complete backup" = the default-checked items**: the defaults are exactly the **core content that cannot be rebuilt from scratch** (sessions, memories, rules), so exporting with defaults yields a package that is ready for machine migration. The completion dialog explicitly states whether this backup **is** complete; if you unchecked any defaults, it lists the skipped items and asks you to export again. Unchecked items are only ever of two kinds: rebuildable ones (plugins / skills / indexes) and credentials deliberately not carried in the package for security.
-- **About "overwrite vs merge"**: restoring **overwrites same-named files as a whole** (a rollback snapshot is auto-created first so you can always revert to the pre-restore state) rather than merging "append different content, overwrite same content" at the structural level. This is a **limitation of each AI tool's data format**: session logs are compressed/encrypted/binary (e.g. DSH's `session.jsonl.zstd`, Qoder's legacy `local.db` session content columns), which this tool cannot read internally to merge line by line; and even for plain JSON/JSONL, a partial merge could leave the same conversation inconsistent across machines or even make the tool unable to open its data — worse than a whole-file overwrite. Therefore, when using multiple computers, use the tool **serially, not concurrently** — the precise granularity is **the same session in the same workspace**:
+- **About "merge vs overwrite" (both coexist since 2026-10-05, merge is the default)**:
+  - **Merge granularity is "list / library-table union", not line-by-line three-way content fusion**: sessions that exist in the package but not on the machine are **merged in**; entries that exist on both sides take the **local** value (for machine-strongly-related fields) or the **package** value (for the single config files listed above). Session logs are compressed/encrypted/binary (e.g. DSH's `session.jsonl.zstd`, Qoder's legacy `local.db` session content columns) — the tool **cannot splice the per-machine increments of the same conversation**; a half-baked content-level merge could leave the same conversation inconsistent across machines or even make the tool unable to open its data — worse than a whole overwrite. So such content stays on "union + local wins", with no per-conversation merging.
+  - **"Full overwrite" is kept as the fallback**: its semantics are exactly what they always were (whole-library / whole-file replacement + rollback snapshot) — pick it when you want the machine to mirror the package's state; Qoder / Trae / ZCode, whose session libraries cannot be parsed table by table, **offer only full overwrite**.
+  - Therefore, when using multiple computers, still use the tool **serially, not concurrently** — the precise granularity is **the same session in the same workspace**:
   1. Use **one session of one workspace on only one computer** at a time (different workspaces/sessions are unaffected and can be used in parallel);
   2. Before switching machines, **export a backup** on the current computer;
   3. On the new computer, **restore that backup first**, then start using the tool;
-  4. Never use the same workspace/session concurrently on two computers and then restore back and forth — overwriting loses one side's increments, while merging can produce conflicting data.
-  - **Exception (safe index merge)**: for "global index files" that are **plain JSON with a fully parseable structure and unambiguous merge semantics**, the tool **merges instead of overwriting** so the target machine's existing same-named entries are preserved. The typical case is DSH's `storages/workspace.json` (see next section).
-  - Harness settings themselves (including custom model configs, e.g. DSH's `profiles/<profile>/cordis.patch.yml`) could theoretically be merged by key, but there is **no need**: settings should travel with the sessions — modify them serially on one machine, let them migrate with the backup, and restore them by whole-file overwrite like everything else, avoiding cross-machine settings drift.
-  - If the restore target already has new data (sessions/memories beyond the backup), first export that computer's own backup manually (or keep the auto-generated rollback snapshot) so both old and new data each have a revertible copy, then decide which side to keep.
+  4. Never use the same workspace/session concurrently on two computers and then restore back and forth — merging only unions "present / absent" and **cannot splice both sides' increments of the same conversation**, while overwriting loses one side's increments outright.
+  - Harness settings themselves (including custom model configs, e.g. DSH's `profiles/<profile>/cordis.patch.yml`) could theoretically be merged by key, but there is **no need**: settings should travel with the sessions — modify them serially on one machine, let them migrate with the backup; under merge mode they are declared to "follow the package", avoiding cross-machine settings drift.
+  - If the restore target already has new data (sessions/memories beyond the backup), the **default merge mode exists exactly for that scenario** (new data untouched, package content merged in); to fully mirror the package instead, switch to "full overwrite" — and first export that computer's own backup manually (or keep the auto-generated rollback snapshot) so both old and new data each have a revertible copy.
 
 ### Cross-tool session import
 
