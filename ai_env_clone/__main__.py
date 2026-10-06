@@ -525,10 +525,11 @@ class QoderBackupApp:
         self._worker: threading.Thread | None = None
 
         self._after_id = None
-        # DSH 修复完成后自动复检的那一次 after：**必须单独记住句柄**，否则窗口
+        # DSH / WorkBuddy 修复完成后自动复检的那一次 after：**必须单独记住句柄**，否则窗口
         # 在它触发前被关闭 ⇒ Tk 报 "invalid command name ..._dsh_check"（实测残留
         # 噪音就是这么来的）。_after_id 被 _drain_queue 自己占用，不能复用。
         self._dsh_check_job = None
+        self._wb_check_job = None
         self._build_ui()
         self._refresh_items()
         self._refresh_uid_combo()
@@ -941,6 +942,37 @@ class QoderBackupApp:
         # True/False=已检测结论，供修复按钮置灰判断（无任何可修项时禁用）。
         self._dsh_has_fixable = None
         self.dsh_health_frame.pack_forget()
+
+        # WorkBuddy 会话健康（仅 WorkBuddy 适配器显示；与 DSH 那套同构：检测 → dry-run
+        # 计划 → 确认 → 备份写盘 → 复检）。存在的意义是「导入后工作区看得见、会话列表全空」
+        # 这一类失配：会话正文（projects/*.jsonl）与索引行（workbuddy.db 的 sessions）
+        # 必须同时到位，且索引行的 user_id 归属得对当前登录账号可见（见 workbuddy_repair）。
+        self.wb_health_frame = ttk.Frame(self.dir_frame)
+        self.wb_health_label = ttk.Label(
+            self.wb_health_frame, text="", foreground="#333",
+            anchor="w", justify="left", wraplength=760,
+        )
+        self.wb_health_label.pack(fill=tk.X)
+        wb_health_row = ttk.Frame(self.wb_health_frame)
+        wb_health_row.pack(fill=tk.X, pady=(2, 0))
+        self.wb_check_btn = ttk.Button(
+            wb_health_row, text="检测会话健康", command=self._wb_check, width=14
+        )
+        self.wb_check_btn.pack(side=tk.LEFT)
+        self.wb_fix_btn = ttk.Button(
+            wb_health_row, text="修复会话数据", command=self._wb_fix, width=16
+        )
+        self.wb_fix_btn.pack(side=tk.LEFT, padx=(6, 0))
+        wb_hint = ttk.Label(
+            self.wb_health_frame,
+            text="检测 WorkBuddy 的会话索引库与磁盘事件流是否配套：导入行的归属写错"
+            "（会话列表空但工作区照常显示）、正文在但库里没登记、工作区缺行、侧栏秒开快照"
+            "陈旧；「修复会话数据」写盘前先备份 workbuddy.db，请先完全退出 WorkBuddy",
+            foreground="#666", anchor="w", justify="left", wraplength=760,
+        )
+        wb_hint.pack(fill=tk.X, pady=(4, 0))
+        self._hint_labels.append(wb_hint)
+        self.wb_health_frame.pack_forget()
 
         # Qoder 历史诊断行：仅选中 qoder 时显示。新版 Qoder CN 已改为独立桌面端
         # （Electron，数据根 %APPDATA%/com.qodercn.app.stable，会话主库 main.sqlite），
@@ -2530,13 +2562,15 @@ class QoderBackupApp:
             frame.pack_forget()
 
     def _update_tool_rows_visibility(self) -> None:
-        """统一刷新「仅特定工具显示」的行（当前：DSH 会话健康行、Qoder 历史诊断行）。
+        """统一刷新「仅特定工具显示」的行（DSH 会话健康行、WorkBuddy 会话健康行、
+        Qoder 历史诊断行）。
 
         工具切换 / 重新探测数据目录后调用，保证行可见性与当前适配器一致。
         行的进出会改变内容总高，故作废布局基准（重排任务已由调用方的
         ``_refresh_items`` 排好，这里不重复排）。
         """
         self._update_dsh_health_visibility()
+        self._update_wb_health_visibility()
         self._update_qoder_diag_visibility()
         self._invalidate_fixed()
 
@@ -2553,6 +2587,149 @@ class QoderBackupApp:
             frame.pack(fill=tk.X, padx=10, pady=(0, 8))
         else:
             frame.pack_forget()
+
+    def _update_wb_health_visibility(self) -> None:
+        """workbuddy 适配器选中时显示「会话健康」行，其他工具隐藏（不破坏布局）。
+
+        与 ``_update_dsh_health_visibility`` 同理，用幂等 ``pack`` / ``pack_forget``。
+        """
+        frame = getattr(self, "wb_health_frame", None)
+        if frame is None:
+            return
+        if self.adapter.name == "workbuddy":
+            frame.pack(fill=tk.X, padx=10, pady=(0, 8))
+            self._set_wb_buttons_state()
+        else:
+            frame.pack_forget()
+
+    def _wb_home_for_check(self) -> str:
+        """当前 WorkBuddy 数据根（与备份条目同口径：适配器探测 ``~/.workbuddy``）。"""
+        from ai_env_clone.adapters import workbuddy as wb_adapter
+
+        return wb_adapter._workbuddy_home()
+
+    def _set_wb_buttons_state(self) -> None:
+        """数据根存在才允许点检测/修复（没装过 WorkBuddy 时点了也只是空跑）。"""
+        ok = os.path.isdir(self._wb_home_for_check())
+        for name in ("wb_check_btn", "wb_fix_btn"):
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            try:
+                widget.configure(state="normal" if ok else "disabled")
+            except tk.TclError:
+                pass
+
+    def _wb_check(self) -> None:
+        """检测 WorkBuddy 会话索引与磁盘事件流的失配（归属 / 未登记 / 工作区缺行 / 快照）。"""
+        if self.busy:
+            messagebox.showwarning("请稍候", "当前有任务正在执行。")
+            return
+        from ai_env_clone.workbuddy_repair import detect_wb_sessions
+
+        wb_home = self._wb_home_for_check()
+        self._set_status("正在检测 WorkBuddy 会话健康…")
+
+        def work():
+            try:
+                result = detect_wb_sessions(wb_home)
+            except Exception as exc:  # noqa: BLE001
+                self.msg_queue.put(("error", "%s: %s" % (type(exc).__name__, exc)))
+                return
+            self.msg_queue.put(("wb_report", result))
+
+        self._run_bg(work)
+
+    def _render_wb_report(self, result) -> None:
+        """主线程渲染检测结果：更新健康标签 + 弹窗摘要。"""
+        text = "\n".join(result.summary_lines())
+        self.wb_health_label.configure(
+            text=text,
+            foreground="#0a6" if result.healthy else "#c60",
+        )
+        self._fit_layout()
+        self._set_status("WorkBuddy 会话健康检测完成")
+        title = ("WorkBuddy 会话健康：正常" if result.healthy
+                 else "WorkBuddy 会话健康：发现 %d 项需注意" % result.attention_total)
+        self._show_plain_report_dialog(title, text)
+
+    def _wb_fix(self) -> None:
+        """修复会话数据：生成 dry-run 计划（后台）→ 主线程确认 → 备份并写盘 → 复检。"""
+        if self.busy:
+            messagebox.showwarning("请稍候", "当前有任务正在执行。")
+            return
+        from ai_env_clone.workbuddy_repair import plan_wb_repair
+
+        wb_home = self._wb_home_for_check()
+        self._set_status("正在生成 WorkBuddy 修复计划（dry-run）…")
+
+        def work():
+            try:
+                plan = plan_wb_repair(wb_home)
+            except Exception as exc:  # noqa: BLE001
+                self.msg_queue.put(("error", "%s: %s" % (type(exc).__name__, exc)))
+                return
+            self.msg_queue.put(("wb_fix_plan", plan))
+
+        self._run_bg(work)
+
+    def _confirm_wb_fix(self, plan) -> None:
+        """主线程确认修复计划，确认后后台备份 + 写库 + 移走陈旧快照。"""
+        from ai_env_clone.workbuddy_repair import apply_wb_repair
+
+        if plan.empty:
+            lines = ["会话索引库与磁盘事件流已配套，无需修复。"]
+            lines.extend("- %s" % note for note in plan.notes)
+            self._set_status("无需修复")
+            self._show_plain_report_dialog(
+                "修复 WorkBuddy 会话数据", "\n".join(lines))
+            return
+
+        text = ("将执行以下修复（写盘前先备份 workbuddy.db 及 -wal/-shm）：\n\n"
+                + "\n\n".join(plan.describe())
+                + "\n\n共 %d 项。是否继续？\n\n"
+                "注意：请先完全退出 WorkBuddy（含系统托盘图标），否则改动可能被其"
+                "内存中的旧列表覆盖。" % plan.total())
+        if not self._show_plain_report_dialog("确认修复 WorkBuddy 会话数据", text, ask=True):
+            self._set_status("已取消修复")
+            return
+
+        wb_home = plan.home or self._wb_home_for_check()
+        self._set_status("正在修复 WorkBuddy 会话数据…")
+
+        def work():
+            try:
+                outcome = apply_wb_repair(wb_home, plan, backup=True)
+            except Exception as exc:  # noqa: BLE001
+                self.msg_queue.put(("wb_fix_done", ("修复失败",
+                                                    "%s: %s" % (type(exc).__name__, exc), False)))
+                return
+            if not outcome["ok"]:
+                self.msg_queue.put(("wb_fix_done", ("修复失败", outcome["error"], False)))
+                return
+            lines = []
+            if outcome["backups"]:
+                lines.append("已备份：%s" % "、".join(
+                    os.path.basename(b) for b in outcome["backups"]))
+            if outcome["ownership"]:
+                lines.append("会话归属改正（user_id 置空串）：%d 条。" % outcome["ownership"])
+            if outcome["registered"]:
+                lines.append("补登记会话：%d 个（%s）。" % (
+                    len(outcome["registered"]),
+                    "、".join(s[:8] for s in outcome["registered"][:6])))
+            if outcome["workspaces"]:
+                lines.append("补登记工作区：%d 个。" % len(outcome["workspaces"]))
+            if outcome["snapshots_moved"]:
+                lines.append("移走陈旧侧栏快照：%d 个（已备份为 .bak.<时间戳>）。"
+                             % len(outcome["snapshots_moved"]))
+            for err in outcome.get("snapshot_errors") or []:
+                lines.append("· %s" % err)
+            if not lines:
+                lines.append("无改动。")
+            lines.append("现在重新打开 WorkBuddy 查看会话列表；仍看不到请再点一次「检测会话健康」。")
+            self.msg_queue.put(("wb_fix_done", ("修复完成", "\n".join(lines), True)))
+
+        self._run_bg(work)
 
     def _qoder_diag(self) -> None:
         """检测 Qoder 新旧两处数据根，诊断「导入后仍看不到历史会话」的成因。"""
@@ -3174,6 +3351,24 @@ class QoderBackupApp:
                         else:
                             messagebox.showerror("修复失败", text)
                         self._dsh_check_job = self.root.after(50, self._dsh_check)
+                    elif kind == "wb_report":
+                        # WorkBuddy 会话健康检测结果（后台线程产出，主线程渲染）
+                        self.pbar["value"] = 0
+                        self._render_wb_report(payload)
+                    elif kind == "wb_fix_plan":
+                        # WorkBuddy 修复计划已生成：主线程确认后执行
+                        self.pbar["value"] = 0
+                        self._confirm_wb_fix(payload)
+                    elif kind == "wb_fix_done":
+                        # WorkBuddy 修复写盘完成：提示并自动复检
+                        self.pbar["value"] = 0
+                        title, text, ok = payload
+                        self._set_status(title)
+                        if ok:
+                            messagebox.showinfo(title, text)
+                        else:
+                            messagebox.showerror("修复失败", text)
+                        self._wb_check_job = self.root.after(50, self._wb_check)
             except queue.Empty:
                 pass
             if not self._closing:
@@ -3268,14 +3463,15 @@ class QoderBackupApp:
             except tk.TclError:
                 pass
             self._relayout_job = None
-        # DSH 修复后的「延迟自动复检」（同样是窗口销毁后会报 invalid command 的回调）
-        job = getattr(self, "_dsh_check_job", None)
-        if job:
-            try:
-                self.root.after_cancel(job)
-            except tk.TclError:
-                pass
-            self._dsh_check_job = None
+        # DSH / WorkBuddy 修复后的「延迟自动复检」（同样是窗口销毁后会报 invalid command 的回调）
+        for attr in ("_dsh_check_job", "_wb_check_job"):
+            job = getattr(self, attr, None)
+            if job:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+                setattr(self, attr, None)
 
     def _on_close(self) -> None:
         """关闭窗口：若有任务在跑先确认，避免线程访问已销毁的 Tk。"""

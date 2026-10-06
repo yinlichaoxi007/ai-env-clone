@@ -15,6 +15,14 @@ WorkBuddy 适配器（自包含，不依赖任何遗留兼容层）。
     created_at/updated_at/model/mode/…）、``workspaces``（工作区路径 → 最近打开时间）、
     ``session_usage``（用量）、``automations`` / ``automation_runs``（自动化）、
     ``buddy_snapshots``。**核心数据**（不含它，界面里看不到会话列表），默认勾选。
+    ⚠️ ``sessions.user_id`` 决定会话对谁可见：侧栏本地列表的谓词是
+    ``transport='local' and deleted_at is null and (user_id = <当前登录 uid> or user_id = '')``，
+    且 ``workspaces`` 表**没有** user 维度 ⇒ 给导入行写一个凭空发明的 uid（如
+    ``imported``）会得到「工作区列表看得到、会话列表全空」。写 ``''`` 是产品自身
+    「从 projects/ 重建索引」时对导入行的做法（谁登录都可见），本工具的
+    ``write_workbuddy`` / ``workbuddy_repair`` 一律遵循它。
+    另：``<配置根>/<uid>/sidebar-list-snapshot.json`` 是侧栏「秒开」的磁盘快照
+    （按 uid 分片），空快照会让冷启动先渲染空列表 ⇒ 修完库要一并移走（见 workbuddy_repair）。
   - ``projects/<工作区编码>/<会话 id>.jsonl`` + ``<会话 id>.meta.json``
     会话**完整事件流**（明文 JSONL，每行一条事件：``message`` / ``reasoning`` /
     ``function_call`` / ``function_call_result`` / ``file-history-snapshot`` /

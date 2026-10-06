@@ -585,15 +585,19 @@ def _register_workbuddy_session(wb_home: str, sid: str, cwd: str, title: str,
         warn("打开 WorkBuddy 会话索引库失败：%s（会话事件流仍已写出）" % exc)
         return
     try:
-        row = con.execute(
-            "select user_id from sessions where user_id is not null and user_id <> '' limit 1"
-        ).fetchone()
-        user_id = row[0] if row else "imported"
+        # user_id 一律写空串，**不要**「借库里已有行的 user_id」，更不要凭空造一个值。
+        # WorkBuddy 侧栏本地列表的谓词是
+        #     where transport='local' and deleted_at is null and (user_id = ? or user_id = '')
+        # （? = 当前登录 uid），且它自身「从 projects/ 重建索引」时也把 userId 置空串
+        # —— 空串是产品给「无主/导入行」的约定，对当时登录的任何账号都可见。
+        # 旧实现从既有行反查 uid、查不到就写 "imported"：目标库为空时造出一个不属于任何
+        # 账号的值 ⇒ 会话正文与 workspaces 行都在，侧栏会话列表却一条都不显示；
+        # 而且这条 "imported" 会被下一次导入当成「已有 uid」继承，自我固化。
         con.execute(
             "insert or ignore into sessions(id, cwd, user_id, title, status, created_at,"
             " updated_at, last_activity_at, is_playground, source_mode, mode)"
             " values(?,?,?,?,?,?,?,?,?,?,?)",
-            (sid, cwd, user_id, title, "completed", created_ms, updated_ms, updated_ms,
+            (sid, cwd, "", title, "completed", created_ms, updated_ms, updated_ms,
              0, "import", "craft"),
         )
         con.execute(
