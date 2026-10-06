@@ -213,7 +213,12 @@ python -m ai_env_clone --check-update
 （而不是笼统一句「检查更新失败」），便于判断该换网络还是换代理。
 代理地址可在图形界面「设置 → 更新设置」填写，`--check-update` 会自动沿用。
 
-**下载与自动替换尚未实现**：目前只做到「检测 + 展示」——命令行 `--check-update`，以及图形界面「帮助 → 关于 → 检查更新」。下载、校验与 Windows 原地替换是后续步骤。
+**下载与自动替换（打包版 Windows 支持自动安装）**：
+
+- **GUI**：「帮助 → 关于 → 检查更新」发现新版本后，对话框里出现「下载并更新…」——后台流式下载（带进度与取消），落盘前过**三道校验**（体积 = release 声明值、SHA256 = `SHA256SUMS` 清单值、结构魔数 `MZ`），任一不符立即丢弃、绝不落地。校验通过后确认即**原地替换并自动重启**：运行中的 exe 先改名 `.old` 备份 → 新文件落位 → 启动新版本 → 旧进程退出；`.old` 保留到新版本成功启动一次后自动清理（新版本若启动即崩，它就是回滚退路）。替换失败（如被杀毒软件锁定）自动把 `.old` 改回原名**整体回滚**。
+- **权限不足时**（程序装在 `C:\Program Files` 等受限目录）：给出「以管理员身份重新运行并自动更新」的提权重试——**提权只能由你显式点击**触发（UAC 弹窗由 Windows 给出），提权后的新进程**只做替换这一件事**（`--resume-update`），不启动界面、不碰其它东西；选「否」则打开发布页手动下载。源码模式不提供自动替换（程序是代码本身，请用 `git pull` 更新）。
+- **CLI**：`--update` 一条命令完成「检查 → 下载 → 校验 → 替换重启」（无控制台的窗口版退化为消息框提示）；非 Windows 平台只下载 + 校验（Linux 自动补可执行位），并给出手动替换指引。
+- **启动自动检查**默认**关**（本机可能需代理才能连上 GitHub，静默检查会白等）；在「设置 → 更新设置」开启并选择频率后，启动时后台检查、**只在真有可安装更新时**在状态栏右侧亮出「有新版本（点击查看）」——已是最新、通道不含、检查失败一律静默。
 
 > 打包版 exe 的「属性 → 详细信息」里是**同一个版本号**——它由 `ai_env_clone/version.py` 生成，与「帮助 → 关于」对话框、`--version` 同源，不会出现「关于里一个号、属性页另一个号」。
 
@@ -726,7 +731,12 @@ when both fail it reports **each side's own reason** (instead of a vague "check 
 so it is clear whether to change network or proxy. A proxy can be set in
 "设置 → 更新设置" in the GUI and is reused by `--check-update`.
 
-**Downloading and self-replacement are not implemented yet**: only "detection + display" exists today — the `--check-update` command and **Help → About → Check for updates** in the GUI.
+**Download and self-replacement (automatic install on packaged Windows builds)**:
+
+- **GUI**: once "Help → About → Check for updates" finds a new version, a "下载并更新…" (download & update) button appears — streaming download in a background thread (with progress and cancel), and **three verifications** before anything lands on disk (size = the release's declared value, SHA256 = the `SHA256SUMS` entry, structural magic `MZ`); any mismatch discards the file immediately. After verification and your confirmation, the update is applied **in place with an automatic restart**: the running exe is renamed to `.old` as a backup → the new file takes its place → the new version starts → the old process exits. The `.old` file is kept until the new version has started once (if the new version crashed at startup, it is the rollback path) and is then cleaned automatically. A failed replacement (e.g. blocked by antivirus) renames `.old` back — **full rollback**.
+- **Insufficient permissions** (program installed under `C:\Program Files` and similar): an "elevate and retry" way out is offered — elevation happens **only on your explicit click** (the UAC prompt comes from Windows), and the elevated process does **one thing only** (replacement via `--resume-update`), never opening the UI or touching anything else; choosing "No" opens the releases page for a manual download. Source mode offers no self-replacement (the program is the code itself — use `git pull` to update).
+- **CLI**: `--update` runs "check → download → verify → replace & restart" in one command (windowed builds without a console fall back to a message box); on non-Windows platforms it downloads + verifies only (Linux fixes the executable bit) and prints manual-replacement guidance.
+- **Startup auto-check is off by default** (this machine may need a proxy to reach GitHub, and a silent check would stall startup); once enabled in "设置 → 更新设置" with a frequency, startup checks run in the background and **only a genuinely installable update** surfaces as a clickable "有新版本" note on the right of the status bar — "already up to date", "a newer version exists outside your channel", and check failures all stay silent.
 
 > The packaged `.exe` shows the **same version** under Properties → Details — it is generated from `ai_env_clone/version.py`, the same source as the **Help → About** dialog and `--version`, so they cannot disagree.
 

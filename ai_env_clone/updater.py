@@ -1,9 +1,10 @@
-"""更新通道的**只读**部分：探测最新版本 + 定位本平台资产。
+"""更新通道：探测最新版本 + 定位本平台资产 + **下载 / 校验 / 落地**。
 
-本模块**不导入 tkinter**，因此 ``--check-update`` 这类 CLI 分支可以生效在
-``import tkinter`` 之前（与 ``--version`` / ``--docs`` 同样的理由）。
+本模块**不导入 tkinter**，因此 ``--check-update`` / ``--update`` /
+``--resume-update`` 这类 CLI 分支可以生效在 ``import tkinter`` 之前
+（与 ``--version`` / ``--docs`` 同样的理由）。
 
-三条必须守住的规则（都有测试钉住）：
+四条必须守住的规则（都有测试钉住）：
 
 1. **GitHub 优先，失败回落 Gitee**；每侧最多 3 次、超时 8s、退避 1s/2s。
    两侧都失败时给**可诊断**的原因（``GitHub：连接超时；Gitee：HTTP 502``），
@@ -15,13 +16,22 @@
    Gitee 的 release 列表还是**按 id 升序**（实测把旧的 ``v0.1.0rc`` 排在前面），
    所以顺序也绝不能信，一律自己排序。
 3. ``SHA256SUMS`` 兼作**资产白名单**：清单里没出现过的资产名一律不认。
+4. **校验失败绝不落地**：下载与替换之间必须过「体积 + SHA256 + 结构魔数」三道校验
+   （``SHA256SUMS`` 缺失时降级为魔数 + 结构，但要在界面上明示，不静默）；
+   替换失败必须把 ``.old`` 改回原名整体回滚（见 :func:`stage_and_replace`）。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import shutil
 import ssl
+import subprocess
+import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -34,15 +44,25 @@ __all__ = [
     "UpdateResult",
     "ASSET_NAMES",
     "AUTO",
+    "UpdaterError",
     "platform_asset_name",
     "check_update",
     "handle_check_update_flag",
+    "handle_update_flags",
     "describe_result",
     "fetch_releases",
     "pick_release",
     "highest_version",
     "parse_sums",
     "build_opener",
+    "download_update",
+    "verify_file",
+    "stage_and_replace",
+    "cleanup_pending_old",
+    "ensure_dir_writable",
+    "update_download_dir",
+    "is_frozen",
+    "PENDING_OLD_FILENAME",
 ]
 
 #: 仓库坐标（GitHub 与 Gitee 同名同主）。★ **定义在 ``version.py``**，
@@ -474,3 +494,450 @@ def check_update(
                 info.sha256 = expected
                 info.checksum_verified = True
     return UpdateResult(info=info, source_errors=errors)
+
+
+# --------------------------------------------------------------------------- #
+# 下载与校验（方案第五部分：体积 / SHA256 / 结构魔数三道校验，缺一不可）
+# --------------------------------------------------------------------------- #
+class UpdaterError(Exception):
+    """更新流程的**可诊断**失败；信息会原样展示给用户，不吞异常。"""
+
+
+class UpdateCancelled(UpdaterError):
+    """用户主动取消（调用方据此显示中性提示，不当成失败）。"""
+
+
+#: 各类资产的**结构魔数**（第三道校验）：Windows PE、macOS zip、Linux ELF。
+#: Windows/mac/linux 的资产分别是裸 exe / zip / 裸二进制（见 :data:`ASSET_NAMES`）。
+_MAGIC_RULES = (
+    ("AiEnvClone-windows.exe", b"MZ"),
+    ("AiEnvClone-macos", b"PK"),
+    ("AiEnvClone-linux", b"\x7fELF"),
+)
+
+#: 下载暂存目录名（位于 ``compress_estimate.cache_dir()`` 之下）。
+UPDATE_DIRNAME = "update"
+
+#: 「旧 exe 待清理」标记文件名（成功启动一次后由 :func:`cleanup_pending_old` 清掉）。
+PENDING_OLD_FILENAME = "pending_old.json"
+
+_CHUNK = 1 << 16
+
+
+def is_frozen() -> bool:
+    """是否运行在 PyInstaller 打包产物里（源码模式的 ``sys.executable`` 是 python.exe，
+    原地替换那一套对它**不适用**，调用方必须先判这个）。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+def update_download_dir() -> str:
+    """下载暂存目录：``compress_estimate.cache_dir()/update/``（方案 5.2）。"""
+    from .compress_estimate import cache_dir
+
+    return os.path.join(cache_dir(), UPDATE_DIRNAME)
+
+
+def _expected_magic(asset_name: str) -> bytes | None:
+    lowered = (asset_name or "").lower()
+    for prefix, magic in _MAGIC_RULES:
+        if lowered.startswith(prefix.lower()):
+            return magic
+    return None
+
+
+def _sha256_of_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_file(path: str, info: UpdateInfo) -> "tuple[bool, str]":
+    """对已落盘的文件跑三道校验，返回 ``(是否通过, 失败原因)``。
+
+    1. **体积**：release 资产声明了 ``size`` 就必须相等（Gitee 不返回 size 时跳过）；
+    2. **SHA256**：拿到期望哈希就必须一致——不一致**立即判失败**；
+    3. **结构魔数**：Windows ``MZ`` / macOS ``PK`` / Linux ``\\x7fELF``，
+       识别不了的资产名跳过这条（不误伤未来新增的产物形态）。
+    """
+    try:
+        actual_size = os.path.getsize(path)
+    except OSError as exc:
+        return False, "读取下载文件失败：%s" % exc
+    if info.size and actual_size != info.size:
+        return False, "体积不符：预期 %d 字节，实际 %d 字节" % (info.size, actual_size)
+    if info.sha256:
+        actual = _sha256_of_file(path)
+        if actual != info.sha256.lower():
+            return False, "SHA256 不符：预期 %s…，实际 %s…" % (
+                info.sha256[:12], actual[:12])
+    magic = _expected_magic(info.asset_name)
+    if magic is not None:
+        try:
+            with open(path, "rb") as f:
+                head = f.read(len(magic))
+        except OSError as exc:
+            return False, "读取下载文件失败：%s" % exc
+        if head[:len(magic)] != magic:
+            return False, "文件结构不对（缺少 %r 魔数），可能不是本平台产物" % magic
+    return True, ""
+
+
+def _download_one(opener, url: str, dest_path: str, info: UpdateInfo,
+                  progress, cancel, deadline_head: bytes) -> None:
+    """单次流式下载（边写边算 SHA256）。任何失败抛异常；取消抛 :class:`UpdaterError`。"""
+    req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    digest = hashlib.sha256()
+    count = 0
+    tmp_path = dest_path + ".part"
+    with opener.open(req, timeout=_TIMEOUT * 4) as resp, \
+            open(tmp_path, "wb") as out:
+        while True:
+            if cancel is not None and cancel():
+                raise UpdateCancelled("已取消下载")
+            chunk = resp.read(_CHUNK)
+            if not chunk:
+                break
+            out.write(chunk)
+            digest.update(chunk)
+            count += len(chunk)
+            if info.size and count > info.size:
+                raise UpdaterError("下载体积超过声明值（%d 字节），已中止" % info.size)
+            if progress is not None:
+                if info.size:
+                    progress(min(99, count * 100 // info.size))
+                else:
+                    progress(-1)          # 无 size 时只表意「在进行」
+    if info.size and count != info.size:
+        raise UpdaterError("下载不完整：预期 %d 字节，实际 %d 字节" % (info.size, count))
+    with open(tmp_path, "rb") as f:
+        head = f.read(len(deadline_head)) if deadline_head else b""
+    if deadline_head and head != deadline_head:
+        raise UpdaterError("下载内容不是本平台产物（魔数不符）")
+    os.replace(tmp_path, dest_path)
+
+
+def download_update(
+    info: UpdateInfo,
+    proxy: str = "",
+    progress=None,
+    cancel=None,
+    opener=None,
+    sleep=time.sleep,
+    dest_dir: str | None = None,
+) -> str:
+    """下载 :class:`UpdateInfo` 指向的资产并过三道校验，返回落盘路径。
+
+    - 流式写盘、边写边算哈希（方案 5.2，不整块读内存）；
+    - ``progress(0~100)``（拿不到总大小时传 ``-1``）与 ``cancel()`` 由**调用方线程**
+      提供，本函数可能在后台线程里跑（GUI 侧自行用 ``after()`` 回主线程）；
+    - 同一 URL 最多重试 3 次、退避 1s/2s；仍失败则**换另一侧发布源**重下同一资产
+      （方案 3.3 ④：下载降级与版本列表同一条链路）；
+    - 下载期间写 ``<名>.part``，完整通过校验后才原子改名——**校验失败绝不落地**
+      （半截文件 / 被替换的内容都不会以正式名存在）。
+    """
+    if not info.url:
+        raise UpdaterError("该版本没有可用的下载地址")
+    dest_dir = dest_dir or update_download_dir()
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except OSError as exc:
+        raise UpdaterError("无法创建下载目录 %s：%s" % (dest_dir, exc)) from exc
+    dest_path = os.path.join(dest_dir, info.asset_name)
+    magic = _expected_magic(info.asset_name) or b""
+
+    opener = opener or build_opener(proxy)
+    magic = _expected_magic(info.asset_name) or b""
+    last_err = ""
+    pending = [info.url]           # ★ 备用源**惰性**求值：主 URL 耗尽重试后才去取
+    while pending:
+        url = pending.pop(0)
+        for attempt in range(1, _RETRIES + 1):
+            try:
+                _download_one(opener, url, dest_path, info, progress, cancel, magic)
+            except UpdaterError:
+                raise                 # 取消 / 体积越界不做无谓重试
+            except Exception as exc:  # noqa: BLE001 - 网络/HTTP 错误逐级降级
+                last_err = _describe(exc)
+                _remove_quiet(dest_path + ".part")
+                if attempt < _RETRIES:
+                    sleep(1.0 * attempt)
+                continue
+            ok, reason = verify_file(dest_path, info)
+            if not ok:
+                _remove_quiet(dest_path)
+                raise UpdaterError("校验失败，已丢弃下载文件：%s" % reason)
+            if progress is not None:
+                progress(100)
+            return dest_path
+        if not pending:
+            pending = _fallback_urls(info, opener)   # 同一资产换另一侧重下
+    raise UpdaterError("下载失败：%s" % (last_err or "未知原因"))
+
+
+def _fallback_urls(info: UpdateInfo, opener) -> list:
+    """同一资产在**另一侧发布源**的下载地址（取不到就空着，不影响主路径）。"""
+    other = "gitee" if info.source == "github" else "github"
+    releases, err = fetch_releases(opener, other)
+    if err:
+        return []
+    for r in releases:
+        if _tag_of(r) != info.tag:
+            continue
+        asset = _asset_of(r, info.asset_name)
+        if asset is not None:
+            url = asset.get("browser_download_url") or asset.get("url") or ""
+            if url and url != info.url:
+                return [url]
+    return []
+
+
+def _remove_quiet(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# 应用更新（方案 6.1：Windows 原地替换 + 自动重启；失败整体回滚）
+# --------------------------------------------------------------------------- #
+def ensure_dir_writable(directory: str) -> bool:
+    """可写性预检：试建一个临时文件再删掉（比 ``os.access`` 可靠——后者对
+    ACL / 只读卷经常给出与实际写入相反的答案）。"""
+    try:
+        fd, probe = tempfile.mkstemp(prefix=".update_probe_", dir=directory)
+    except OSError:
+        return False
+    try:
+        os.close(fd)
+        os.remove(probe)
+    except OSError:
+        pass
+    return True
+
+
+def _pending_old_path() -> str:
+    return os.path.join(update_download_dir(), PENDING_OLD_FILENAME)
+
+
+def stage_and_replace(
+    downloaded: str,
+    target: str | None = None,
+    restart: bool = True,
+    popen=None,
+) -> str:
+    """把**已校验通过**的下载文件原地替换到 ``target``（默认当前程序自身）。
+
+    流程（方案 6.1 ③~⑧）：
+
+    1. 目标目录可写性预检——不可写就抛错，**绝不静默提权**；
+    2. 先把新文件挪到**同一卷**的目标目录（``os.replace`` 不能跨卷）；
+    3. ``target → target.old``（运行中的 exe 不能删但能改名）→ 新文件落位；
+    4. 任一步失败 ⇒ 把 ``.old`` 改回原名**整体回滚**后再报错；
+    5. 成功则记下「待清理标记」，``restart=True`` 时启动新版本并返回 ``.old`` 路径
+       （调用方随后退出当前进程；``.old`` 留到新版本成功启动一次后由
+       :func:`cleanup_pending_old` 清掉——新版本启动即崩时它就是回滚的最后退路）。
+
+    ``popen`` 仅供测试注入；默认真启动 ``target``。
+    """
+    target = target or sys.executable
+    directory = os.path.dirname(os.path.abspath(target))
+    if not os.path.isdir(directory):
+        raise UpdaterError("程序所在目录不存在：%s" % directory)
+    if not ensure_dir_writable(directory):
+        raise UpdaterError(
+            "程序所在目录不可写，无法自动替换：%s\n"
+            "请以管理员身份运行，或手动替换程序文件。" % directory)
+    if not os.path.isfile(downloaded):
+        raise UpdaterError("下载文件不存在：%s" % downloaded)
+
+    # 新文件先落到同卷同目录（沿用下载文件名加 .new 后缀，避免撞名）。
+    staged = os.path.join(
+        directory, "%s.new-%s" % (os.path.basename(target), _stamp()))
+    try:
+        shutil.move(downloaded, staged)
+    except (OSError, shutil.Error) as exc:
+        raise UpdaterError("无法把新版本移入程序目录：%s" % exc) from exc
+    # 哈希旁证（若下载侧写了）一并带走，供 --resume-update 复核。
+    sidecar = downloaded + ".sha256"
+    if os.path.isfile(sidecar):
+        try:
+            shutil.move(sidecar, staged + ".sha256")
+        except OSError:
+            pass
+
+    old = target + ".old"
+    if os.path.exists(old):
+        try:
+            os.remove(old)
+        except OSError:
+            # 上一次的 .old 还被占用（前进程未退净）：换名保存，别挡本次更新。
+            old = "%s.old-%s" % (target, _stamp())
+
+    os.rename(target, old)
+    try:
+        os.replace(staged, target)
+    except OSError as exc:
+        try:
+            os.rename(old, target)
+        except OSError as rollback_exc:
+            raise UpdaterError(
+                "替换失败（%s），且回滚也失败（%s）：\n旧版本保留在 %s，请手动恢复。"
+                % (exc, rollback_exc, old)) from exc
+        raise UpdaterError(
+            "替换新版本失败（可能被杀毒软件拦截），已回滚到原版本：%s" % exc) from exc
+
+    try:
+        os.makedirs(update_download_dir(), exist_ok=True)
+        with open(_pending_old_path(), "w", encoding="utf-8") as f:
+            json.dump({"old": old, "target": target}, f, ensure_ascii=False)
+    except OSError:
+        pass                    # 标记写不上只影响「自动清 .old」，不影响更新本身
+
+    if restart:
+        (popen or subprocess.Popen)([target])
+    return old
+
+
+def _stamp() -> str:
+    return time.strftime("%Y%m%d%H%M%S")
+
+
+def cleanup_pending_old(marker_path: str | None = None) -> bool:
+    """新版本成功启动后清掉上一次更新留下的 ``.old``（方案 6.1 ⑧）。
+
+    只做**尽力而为**：``.old`` 还被占用（前一进程未完全退出）就留着下次再试，
+    **不算错误、不弹任何提示**。返回是否清掉了标记。
+    """
+    marker_path = marker_path or _pending_old_path()
+    try:
+        with open(marker_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+    old = data.get("old") if isinstance(data, dict) else None
+    if isinstance(old, str) and old:
+        try:
+            os.remove(old)
+        except OSError:
+            return False          # 还被占用：留待下次（此时新版本已能跑，无害）
+    try:
+        os.remove(marker_path)
+    except OSError:
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# CLI：--update / --resume-update（方案第七部分；生效在 import tkinter 之前）
+# --------------------------------------------------------------------------- #
+def _run_cli_update(argv: list[str]) -> int:
+    from .prefs import update_settings
+    from .version import __version__, emit_console
+
+    state = {"last": -10}
+
+    def _progress(pct: int) -> None:
+        """CLI 进度：每 10% 打一行（无控制台时 emit_console 兜底为消息框）。"""
+        if pct >= 0 and pct - state["last"] < 10 and pct != 100:
+            return
+        state["last"] = pct
+        emit_console("下载进度：%s%%" % ("…" if pct < 0 else pct))
+
+    cfg = update_settings()
+    result = check_update(
+        current=__version__,
+        include_prerelease=bool(cfg.get("include_prerelease")),
+        proxy=str(cfg.get("proxy") or ""),
+        skipped_version=str(cfg.get("skipped_version") or ""),
+    )
+    if result.error:
+        emit_console("检查更新失败：%s" % result.error)
+        return 2
+    if result.up_to_date or result.info is None:
+        emit_console(describe_result(result, __version__, platform_asset_name()))
+        return 1 if result.up_to_date else 2
+    info = result.info
+    emit_console(describe_result(result, __version__, platform_asset_name()))
+    emit_console("开始下载 %s …" % info.asset_name)
+    try:
+        path = download_update(info, proxy=str(cfg.get("proxy") or ""),
+                               progress=_progress)
+    except UpdaterError as exc:
+        emit_console("下载失败：%s" % exc)
+        return 2
+    emit_console("已下载并通过校验：%s" % path)
+
+    if sys.platform.startswith("win") and is_frozen():
+        try:
+            stage_and_replace(path)
+        except UpdaterError as exc:
+            emit_console("更新失败：%s" % exc)
+            return 2
+        emit_console("已启动新版本，当前程序即将退出。")
+        return 0
+    if sys.platform.startswith("linux"):
+        try:
+            os.chmod(path, 0o755)     # HTTP 下载不保留可执行位（方案 L3）
+        except OSError:
+            pass
+    emit_console("本平台暂不支持自动替换，请手动用该文件替换当前程序。\n"
+                 "（源码模式请改用 git pull 更新源码。）")
+    return 0
+
+
+def _run_resume_update(staged: str) -> int:
+    """``--resume-update``：提权后的新进程**只做校验 → 替换 → 重启**（不重新下载）。"""
+    from .version import emit_console
+
+    target = sys.executable
+    if not sys.platform.startswith("win") or not is_frozen():
+        emit_console("--resume-update 仅支持打包版 Windows。")
+        return 2
+    if not os.path.isfile(staged):
+        emit_console("待安装的更新文件不存在：%s" % staged)
+        return 2
+    # 复核用：size 一律免检（staged 已在下载时查过），魔数按 Windows 资产名取。
+    info = UpdateInfo(version="", tag="", asset_name=ASSET_NAMES["windows"],
+                      url="", size=0)
+    sidecar = staged + ".sha256"
+    if os.path.isfile(sidecar):
+        try:
+            with open(sidecar, "r", encoding="utf-8") as f:
+                expected = f.read().strip().lower()
+            if re.fullmatch(r"[0-9a-f]{64}", expected):
+                actual = _sha256_of_file(staged)
+                if actual != expected:
+                    emit_console("更新文件校验不符，已放弃安装。")
+                    return 2
+        except OSError:
+            pass
+    ok, reason = verify_file(staged, info)
+    if not ok:
+        emit_console("更新文件校验失败：%s" % reason)
+        return 2
+    try:
+        stage_and_replace(staged, target=target)
+    except UpdaterError as exc:
+        emit_console("更新失败：%s" % exc)
+        return 2
+    emit_console("已启动新版本。")
+    return 0
+
+
+def handle_update_flags(argv: list[str]) -> int | None:
+    """``--update`` / ``--resume-update`` 的 CLI 分支；未命中返回 ``None``。
+
+    与 ``--check-update`` 同样处理在 ``import tkinter`` 之前；无控制台（``--windowed``
+    产物）时输出经 :func:`version.emit_console` 退化为系统消息框。
+    """
+    for i, arg in enumerate(argv):
+        if arg == "--update":
+            return _run_cli_update(argv)
+        if arg.startswith("--resume-update="):
+            return _run_resume_update(arg.split("=", 1)[1].strip().strip('"'))
+        if arg == "--resume-update" and i + 1 < len(argv):
+            return _run_resume_update(argv[i + 1].strip().strip('"'))
+    return None
