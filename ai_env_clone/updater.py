@@ -776,7 +776,13 @@ def stage_and_replace(
             # 上一次的 .old 还被占用（前进程未退净）：换名保存，别挡本次更新。
             old = "%s.old-%s" % (target, _stamp())
 
-    os.rename(target, old)
+    try:
+        os.rename(target, old)
+    except OSError as exc:
+        # 目标 exe 本身被占用（杀软扫描 / 其它进程锁住）时改名会失败——此刻还没动
+        # 任何东西，原样报错即可，但要给可诊断的话术而不是裸 PermissionError。
+        raise UpdaterError(
+            "旧版本改名失败（可能被杀毒软件或其它程序占用）：%s" % exc) from exc
     try:
         os.replace(staged, target)
     except OSError as exc:
