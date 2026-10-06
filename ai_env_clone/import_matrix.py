@@ -190,6 +190,8 @@ TARGET_GROUPING: dict[str, tuple] = {
     "workbuddy": (
         "分组按「工作区路径」重新映射：目标机已有同名工作区时，导入的会话会"
         "并入该工作区（表现为分组被合并）",
+        "登记的 sessions 行 user_id 置空串（无主）：WorkBuddy 的本地会话列表"
+        "只显示「属于当前登录账号」或「无主」的行，写其它值会话就看不到",
     ),
     "dsh": (
         "分组按「工作区路径」重新映射并登记进 storages/workspace.json："

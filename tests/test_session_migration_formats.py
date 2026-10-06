@@ -147,7 +147,7 @@ class TestWorkBuddyWrite(unittest.TestCase):
             row = con.execute("select cwd, user_id, title, status from sessions where id=?",
                               (sid,)).fetchone()
             self.assertIsNotNone(row)
-            self.assertEqual(row[1], "u-1")           # 沿用已有 user_id
+            self.assertEqual(row[1], "")              # 空串＝WorkBuddy 对导入行的约定，侧栏才可见
             self.assertEqual(row[2], "导入的会话")
             # 既有会话未被改写
             self.assertEqual(con.execute("select count(*) from sessions").fetchone()[0], 2)

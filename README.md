@@ -179,7 +179,7 @@ GUI 界面要点：
 - **未找到项标红**：当数据目录未正确识别时，备份内容中找不到的每一项会标红并注明「（未找到）」，备份内容区右上角同时显示「N 项未找到」；已勾选项保持不变，仅作提示，不会自动取消勾选。
 - **估算大小**：点击「估算大小」按钮可预估所选备份项打包后的体积。
 - **数据导入区**：位于「备份内容」与「选项」之间，随所选工具刷新。直接列出**该工具可导入的来源软件、实测版本、可导入的数据范围与状态**（`支持导入` / `仅备份/还原` / `待支持`）；支持导入时「导入会话…」按钮可用，点击即打开导入对话框；「导入说明」按钮弹出全部工具的支持矩阵。
-- **仅特定工具显示的行**：选中 **DeepSeek Harness** 时出现「会话健康」行（检测未分组会话 / 旧格式 replayState 等）；选中 **Qoder CN** 时出现「历史会话诊断」行（对比新版 `main.sqlite` 与旧版 `local.db` 两处数据根及导入账本，给出「导入后仍看不到历史会话」的成因结论）。这两行对其他工具隐藏，不影响各区域自适应布局。
+- **仅特定工具显示的行**：选中 **DeepSeek Harness** 时出现「会话健康」行（检测未分组会话 / 旧格式 replayState 等）；选中 **WorkBuddy** 时同样出现「会话健康」行（检测「导入行归属写错 ⇒ 侧栏看不到会话」「磁盘有正文、库里没登记」「工作区缺行」「侧栏秒开快照陈旧」，并可一键修复）；选中 **Qoder CN** 时出现「历史会话诊断」行（对比新版 `main.sqlite` 与旧版 `local.db` 两处数据根及导入账本，给出「导入后仍看不到历史会话」的成因结论）。这些行对其他工具隐藏，不影响各区域自适应布局。
 - **菜单（「AI 工具」行右侧）**：**设置 → 更新设置…** 配置「启动时自动检查更新 / 检查频率 / 是否包含预发布版本 / 代理」；**帮助 → 使用说明（`F1`）** 打开纯文字使用说明（与 `--docs` 同源，不显示图片；**表格按查看器当前宽度排版**——列间画 `|` 的等宽网格，放得下的表一行一行铺开、放不下的列**自己折行**（列边界仍对齐，所以把窗口拉宽、表格跟着变宽）；只有窄到每列放不下几个字才改成「条目名 + `列名：值`」的分条样式；**表格与分条之间只有一个切换阈值**，同一宽度下所有表格形态一致——把窗口缩小时变分条的宽度与放大时变回表格的宽度是同一个，不会出现「缩小时先分条、放大要更宽才回来」的错开；也不会出现被窗口裁掉或折行后列错位的表格；正文按字符折行，适配中文）；**帮助 → 关于** 显示版本号、作者与版权、项目主页，并可点「检查更新」查询最新版本（**只查询，不下载、不替换**）。**关于里的项目地址可直接点击打开浏览器**，也可以拖选后 `Ctrl+C` 复制（右键菜单另有「复制链接地址 / 全选」）。菜单与「AI 工具」下拉同处一行，**不额外占用窗口高度**。
 - **高分屏与窗口高度适配**：窗口声明 DPI 感知（Per-Monitor v2），缩放系数超过 100% 时不会被系统虚化放大。**首次打开的默认高度为屏幕高的 75%**（下限 460px），各工具完全一致、与内容多少无关——内容少的工具也不会缩成一小条；之后高度**完全由你控制**：拖高时备份内容区与数据导入说明区**按比例放大**（一屏能看到更多条目），拖矮时**按比例压缩**（为下方区域腾空间）；压到各自下限仍装不下时出现竖向滚动条，**进度条与状态栏始终固定在窗口最下方**，任何窗口高度下都不会被裁掉看不见——小尺寸屏幕上也不会因窗口超高而被遮挡。默认高度按屏幕**比例**而非固定像素计算，故在任意 DPI 缩放下占屏比例恒定。备份内容区高度只取决于窗口高度、与工具项数无关。窗口宽度不足时内容区出现横向滚动条，各区域的文字与控件不会被裁掉。
 
@@ -308,7 +308,7 @@ from ai_env_clone.core import export_backup, import_backup
 实现要点：
 
 - **不覆盖目标已有会话**：新会话一律使用全新生成的 id（WorkBuddy / CodeBuddy 为 UUID，DSH 顶层为 `session-<uuid>`、子代理为裸 uuid，Reasonix 为时间戳 id），天然避开碰撞。
-- **写「原生落点」而非只写文件**：部分工具界面按索引读取，只落文件是看不到的。因此 WorkBuddy 会同时把会话登记进 `workbuddy.db` 的 `sessions` 表（`insert or ignore`，绝不改写既有行）；DSH 会同时把会话登记进 `storages/workspace.json` 的工作区索引（**界面列表靠的就是它**），并尽力在新的 `session_projcache*` 缓存里补一条标题记录（该缓存可由 DSH 自行从日志重建，且换布局后旧单文件的写入只在目录树尚不存在时生效，故属「尽力而为」）。CodeBuddy / Reasonix 则遵循其「项目路径 / 工作区」派生规则，落点不一致会明确提示。
+- **写「原生落点」而非只写文件**：部分工具界面按索引读取，只落文件是看不到的。因此 WorkBuddy 会同时把会话登记进 `workbuddy.db` 的 `sessions` 表（`insert or ignore`，绝不改写既有行；`user_id` **写空串**——产品的本地会话列表只认「当前登录账号」或「无主（空串）」的行，写别的值会话就一条都不显示，见「WorkBuddy 会话索引」一节）；DSH 会同时把会话登记进 `storages/workspace.json` 的工作区索引（**界面列表靠的就是它**），并尽力在新的 `session_projcache*` 缓存里补一条标题记录（该缓存可由 DSH 自行从日志重建，且换布局后旧单文件的写入只在目录树尚不存在时生效，故属「尽力而为」）。CodeBuddy / Reasonix 则遵循其「项目路径 / 工作区」派生规则，落点不一致会明确提示。
 - **只读解析来源**：ZCode 的 `db.sqlite` 一律以 `mode=ro` 只读打开，绝不写入来源库。
 - **中文/长文本安全**：DSH 的会话文件是**多帧** Zstandard 流，本工具按多帧语义整体解压（早期实现只解首帧，会把 4MB 的会话误判为「无消息」，已修复）。
 - **DSH 需要 zstd 后端**：读 / 写 DSH 会话都依赖 `zstandard` / `pyzstd` 模块或系统 `zstd` 命令；缺失时导入会明确报错（而非静默产生坏数据）。
@@ -382,6 +382,22 @@ python -m ai_env_clone.dsh_repair repair-data <文件或目录> --apply --fix-du
 > - 「读取 header 精确匹配 / 补建未知工作区 / 会话文件内容检测与修复」受限——`.jsonl.zstd` 文件会被明确标记为「因缺少 zstd 后端无法处理」（区别于真正的数据损坏），明文 `.jsonl` 仍可正常处理；
 > - 需要完整能力可在本机安装任一 zstd 支持（如 `pip install zstandard`），无需改动代码。
 
+### WorkBuddy 会话索引：「有工作区、会话列表却是空的」检测与修复
+
+WorkBuddy（Electron 桌面版，数据根 `~/.workbuddy`）的会话**正文**放在 `projects/<工作区编码>/<会话 id>.jsonl` 事件流里，而侧栏**列表**读的是 `workbuddy.db` 的 `sessions` 表。它本地列表的谓词（从其 `app.asar` 的 `LocalConversationsImpl.visibleRows` 核对）是::
+
+    where transport = 'local' and deleted_at is null
+      and (user_id = <当前登录 uid> or user_id = '')
+
+而 `workspaces` 表只有 `path` + `last_opened_at`，**没有账号维度**。于是「会话行的 `user_id` 既不是当前账号也不是空串」的症状特别具有迷惑性：**工作区照常显示，会话一条都不见**。早期版本的导入正是踩了这一点（给 `user_id` 写了一个凭空发明的值，而且这个值还会被下一次导入当成「已有 uid」继承下去）；现在写出侧固定遵循产品自己的约定 —— **`user_id = ''`**（它自身「从 `projects/` 重建会话索引」时也写空串），存量数据由「修复会话数据」处理，**不用删了重导**。
+
+在主界面下拉选择 **WorkBuddy** 后，数据目录区域出现「会话健康」行（仅该工具显示，切走自动隐藏）：
+
+- **「检测会话健康」**（只读扫描，不改任何文件）：逐类给出数量（为 0 也列出来）。可自动修复的四类——**归属写错的导入会话**（`transport='local'`、未删除、`source_mode='import'`，而 `user_id` 既非当前 uid 也非空串）、**磁盘有正文而库里没登记**的会话（按事件流里的 `cwd` / `ai-title` / 时间戳补登记；产品自己也会跳过的 `.quickask` 划词临时会话不塞进列表，读不到 `cwd` 的跳过并说明）、**`workspaces` 缺行**（按产品的路径归一规则比对，避免 `D:\a` 与 `d:/a` 被当成两个工作区重复插行；playground 那种纯时间戳目录不算工作区）、**陈旧的侧栏秒开快照**（`<数据根>/<uid>/sidebar-list-snapshot.json`，产品只在列表完整时落盘，导入后留下的空快照会让冷启动首帧先渲染一份空列表）。只报告不处理的三类——**库里有行但正文缺失**的会话（内容无法凭空重建）、**属于其它账号且非本工具导入**的本地会话、**云端会话**（归属由账号与云同步对账，本工具不碰）。当前登录 uid 从产品自己按 uid 落盘的几处位置发现（快照目录 / `storage/user-<uid>` / `memory/<uid>_memory.md`，取最近活动的），**只用于报告与定位快照文件，写入值恒为空串**。
+- **「修复会话数据」**：先给出 dry-run 清单（改哪几条会话、补登记哪些、移走哪个快照）供确认，确认后**先备份 `workbuddy.db` 及 `-wal` / `-shm`**（`<文件>.bak.<UTC>`）再写库：把导入行的 `user_id` 置为空串、补插缺失的会话行与工作区行（`insert or ignore` / upsert，**绝不改写既有行**），事务提交后才把陈旧快照**改名移走**（备份没成功就不移，宁可留一个陈旧快照也不丢现场）。写库用 `begin immediate` 持写锁：**拿不到锁（WorkBuddy 正在运行）就整体不写并如实报错**，避免「修了但没生效」；中途任何失败整笔回滚，不会留下「归属改了、会话没登记」的半改状态。修复幂等，完成后自动复检一次。
+
+> 建议**先完全退出 WorkBuddy（含系统托盘图标）**再点修复：它会把会话列表缓存在内存里，可能用旧列表覆盖改动。
+
 ### 敏感凭证脱敏（自定义模型配置）
 
 部分工具的配置文件内**可能直接含明文敏感凭证**，典型即 CodeBuddy 的自定义模型配置 `~/.codebuddy/models.json`——每个自定义模型条目可能带明文 `apiKey`、令牌或其他私有凭证。把明文凭证打包进备份 zip 存在泄露风险（备份可能被同步到外部、或落到他人手中）。
@@ -417,6 +433,7 @@ ai_env_clone/                包（import 名 ai_env_clone，产品名 AiEnvClon
 ├── session_migration.py  跨软件会话迁移（各工具原生格式的解析 / 原生写出，含来源扫描）
 ├── workspace_plan.py  导入落点自动判定（工作区派生规则 / 工具默认落点 / 手动覆盖与创建确认）
 ├── dsh_repair.py      DSH 旧会话「未分组/无法加载」检测与修复（纯标准库，CLI 可用；含会话文件内容修复）
+├── workbuddy_repair.py WorkBuddy 会话索引检测与修复（纯标准库：归属 / 未登记 / 工作区缺行 / 陈旧侧栏快照；写库前备份并取写锁）
 ├── adapters/
 │   ├── base.py        BaseAdapter 抽象接口 + 适配器注册表
 │   ├── qoder.py       Qoder 适配器（参考实现，自包含；覆盖三处数据面：旧代 ~/.qoder-cn 与 CLI/Agent 新族、桌面端 main.sqlite、本地工作区；含历史不可见诊断）
@@ -664,7 +681,7 @@ GUI highlights:
 - **Missing items highlighted**: when the data directory is not correctly detected, every item that cannot be found is shown in red and labelled "(未找到 / not found)"; the top-right of the backup list also shows "N 项未找到" (N items not found). Already-checked items keep their state — only a hint, no auto-uncheck.
 - **Estimate size**: click "估算大小" (estimate size) to preview the packed size of selected items.
 - **Data-import area**: sits between "备份内容" and "选项", refreshed for the selected tool. It directly lists **the source tools that can be imported, their tested versions, the importable scope, and the status** (`支持导入` / `仅备份/还原` / `待支持`); when import is possible the "导入会话…" button is enabled and opens the import dialog, while "导入说明" shows the full capability matrix for every tool.
-- **Rows shown only for specific tools**: selecting **DeepSeek Harness** shows a "会话健康 / session health" row (detects ungrouped sessions, old-format `replayState`, etc.); selecting **Qoder CN** shows a "历史会话诊断 / session diagnostics" row (compares the new `main.sqlite` and the legacy `local.db` data roots plus the import ledger, and explains why "history sessions are still missing after import"). Both rows are hidden for other tools and do not affect the adaptive layout.
+- **Rows shown only for specific tools**: selecting **DeepSeek Harness** shows a "会话健康 / session health" row (detects ungrouped sessions, old-format `replayState`, etc.); selecting **WorkBuddy** shows the same kind of "session health" row (detects imported session rows the sidebar filters out, sessions present on disk but unregistered, missing `workspaces` rows and a stale sidebar snapshot — see "WorkBuddy session index"); selecting **Qoder CN** shows a "历史会话诊断 / session diagnostics" row (compares the new `main.sqlite` and the legacy `local.db` data roots plus the import ledger, and explains why "history sessions are still missing after import"). These rows are hidden for other tools and do not affect the adaptive layout.
 - **Menus (right side of the "AI 工具" row)**: **设置 → 更新设置…** configures "check for updates on startup / check frequency / include pre-releases / proxy"; **帮助 → 使用说明 (`F1`)** opens the plain-text manual (same source as `--docs`, no images; **tables are laid out for the viewer's current width** — they render as an aligned grid when they fit, otherwise they **wrap by column while keeping the columns aligned**, so widening the window widens the table; only when a column would be too narrow does it switch to a "record name + `column: value`" list, so nothing is ever clipped or wrapped into misaligned columns; body text wraps by character, which suits Chinese); **帮助 → 关于** shows the version, author, copyright and project home, and offers a "检查更新" button that **only queries — it never downloads or replaces** anything. **The project URLs in 关于 are clickable (they open your browser) and can be selected and copied with `Ctrl+C`** (the right-click menu also offers "copy link address / select all"). The menus share the row with the tool dropdown, so they **add no window height**.
 - **Hi-DPI & adaptive window height**: the window declares DPI awareness (Per-Monitor v2), so it is not blurry-scaled by the OS when the scaling factor exceeds 100%. **On first launch the height is 75% of the screen height** (floored at 460px) — identical for every tool and independent of how much content it has, so a tool with few items no longer opens as a thin strip; afterwards the height is **fully under your control**: drag it taller and the backup content area and the import-notes area **scale up proportionally** (more items visible at once); drag it shorter and they **shrink proportionally** (freeing room for the sections below); once both reach their floors a vertical scrollbar appears, and the **progress bar and status bar stay pinned to the bottom** of the window — they are never clipped out of view at any window height, so small screens won't hide part of the window either. The default height is a **fraction of the screen**, not a fixed pixel value, so its share of the screen stays constant at any DPI scaling. The backup content area's height depends only on the window height, never on the tool or item count. If the window is too narrow, a horizontal scrollbar appears in the content area so labels and controls are never clipped.
 
@@ -793,7 +810,7 @@ Writing a session into a target tool **requires deciding which workspace it belo
 Implementation notes:
 
 - **Never overwrites existing target sessions**: new sessions always get a freshly generated id (UUID for WorkBuddy / CodeBuddy, `session-<uuid>` for DSH top-level and a bare uuid for DSH subagents, timestamp id for Reasonix), so collisions are impossible by construction.
-- **Writes the "native landing spot", not just files**: some UIs read from an index, so dropping files alone is invisible. WorkBuddy therefore also registers the session in `workbuddy.db`'s `sessions` table (`insert or ignore`, never rewriting existing rows); DSH also registers it in `storages/workspace.json`'s workspace index (**this is what the UI list reads**) and best-effort adds a title record to the `session_projcache*` cache (DSH can rebuild that cache from the log itself, and after the layout change the legacy single-file write only takes effect when the per-record tree does not yet exist — hence "best effort"). CodeBuddy / Reasonix follow their "project path / workspace" derivation rules, and a mismatch is reported explicitly.
+- **Writes the "native landing spot", not just files**: some UIs read from an index, so dropping files alone is invisible. WorkBuddy therefore also registers the session in `workbuddy.db`'s `sessions` table (`insert or ignore`, never rewriting existing rows; `user_id` is written as **the empty string** — its local session list only accepts rows owned by the logged-in uid or ownerless ones, so any other value makes every imported session disappear, see "WorkBuddy session index"); DSH also registers it in `storages/workspace.json`'s workspace index (**this is what the UI list reads**) and best-effort adds a title record to the `session_projcache*` cache (DSH can rebuild that cache from the log itself, and after the layout change the legacy single-file write only takes effect when the per-record tree does not yet exist — hence "best effort"). CodeBuddy / Reasonix follow their "project path / workspace" derivation rules, and a mismatch is reported explicitly.
 - **Read-only source parsing**: ZCode's `db.sqlite` is always opened `mode=ro` — the source DB is never written to.
 - **CJK / long-text safe**: DSH session files are **multi-frame** Zstandard streams; this tool decompresses the whole stream with multi-frame semantics (an early implementation decoded only the first frame and misjudged a 4 MB session as "no messages" — fixed).
 - **DSH needs a zstd backend**: reading / writing DSH sessions requires the `zstandard` / `pyzstd` module or a system `zstd` binary; when missing, import fails loudly (instead of silently producing corrupt data).
@@ -867,6 +884,20 @@ Exit codes: `0` ok, `1` some file is corrupt/unprocessable, `2` bad arguments (`
 > - exact header matching, creating workspaces for unknown cwds, and session-file content detection/repair are limited — `.jsonl.zstd` files are explicitly marked as "unreadable without a zstd backend" (distinct from genuine corruption), while plaintext `.jsonl` files still work;
 > - for full capability, install any zstd support (e.g. `pip install zstandard`) — no code changes needed.
 
+### WorkBuddy session index: detect & repair "workspaces show up, the session list is empty"
+
+In WorkBuddy (the Electron desktop app, data root `~/.workbuddy`) the session **content** lives in `projects/<workspace-slug>/<session-id>.jsonl` event streams, while the sidebar **list** reads the `sessions` table of `workbuddy.db`. Its predicate for local rows (verified against `LocalConversationsImpl.visibleRows` inside the app's `app.asar`) is::
+
+    where transport = 'local' and deleted_at is null
+      and (user_id = <currently logged-in uid> or user_id = '')
+
+whereas the `workspaces` table only has `path` + `last_opened_at` — **it has no user dimension at all**. So a session row whose `user_id` is neither the current uid nor an empty string produces a very misleading symptom: **the workspaces show up as usual, and not a single session is listed**. An earlier version of the importer did exactly that (it wrote an invented value into `user_id`, and the next import even inherited it as "an existing uid"). The writer now follows the product's own convention — **`user_id = ''`** (the product's own "rebuild the session index from `projects/`" writes an empty string too) — and existing rows are repaired by "repair session data", **no need to re-import**.
+
+When **WorkBuddy** is selected in the dropdown, the data-directory area shows the "session health" row (this tool only; it hides again when you switch):
+
+- **「检测会话健康」/ "check session health"** (read-only scan, touches no file). Counts per category, zeros included. Four auto-repairable ones: **imported rows with the wrong owner** (`transport='local'`, not deleted, `source_mode='import'`, `user_id` neither the current uid nor `''`), **sessions that exist on disk but are not registered in the database** (registered from the stream's `cwd` / `ai-title` / timestamps; `.quickask` scratch sessions — which the product itself skips — are not pushed into the list, and streams without a `cwd` are skipped with a stated reason), **missing `workspaces` rows** (compared through the product's path-normalization rule so `D:\a` and `d:/a` are not counted twice; a pure-timestamp playground directory is not a workspace), and a **stale sidebar snapshot** (`<data-root>/<uid>/sidebar-list-snapshot.json`, written only for a complete list — an empty one left behind by an import makes the first cold-start frame render an empty list). Three report-only ones: **rows whose content is missing on disk** (content cannot be conjured back), **local rows that belong to another account and were not imported by this tool**, and **cloud sessions** (their ownership is reconciled by the account and cloud sync; this tool never touches them). The current uid is discovered from the places the product itself stores per-uid data (snapshot directory / `storage/user-<uid>` / `memory/<uid>_memory.md`, most recently active wins) and is used **only for reporting and to locate the snapshot file — the value written is always the empty string**.
+- **「修复会话数据」/ "repair session data"**: first shows a dry-run plan (which rows get re-owned, which sessions and workspaces get registered, which snapshot gets moved aside) for confirmation, then **backs up `workbuddy.db` including `-wal` / `-shm`** (`<file>.bak.<UTC>`) and writes: the imported rows' `user_id` becomes `''`, missing session and workspace rows are inserted (`insert or ignore` / upsert — **existing rows are never rewritten**), and only after the commit is the stale snapshot **renamed out of the way** (if the backup fails the file stays put: a stale snapshot is preferable to losing the evidence). The write takes the lock with `begin immediate`: **if the lock cannot be acquired (WorkBuddy is running) nothing is written at all and the error says so**, so there is no "repaired but silently overwritten" state; any failure mid-way rolls the transaction back, leaving no half-applied state. The repair is idempotent, and a re-check runs automatically after it.
+
 ### Sensitive credential redaction (custom model config)
 
 Some tools may store **plaintext sensitive credentials directly inside a config file** — the typical case being CodeBuddy's custom model config `~/.codebuddy/models.json`, where each custom model entry may carry a plaintext `apiKey`, token, or other private credential. Packing a plaintext credential into the backup zip is a leakage risk (backups may be synced externally or fall into other hands).
@@ -899,6 +930,7 @@ ai_env_clone/                package (import name ai_env_clone, product name AiE
 ├── core.py            generic core (scan / pack / verify / restore / SQLite snapshot / Zip Slip guard), tool-agnostic
 ├── compress_estimate.py  compressed-size estimation (empirical ratios + calibratable cache)
 ├── dsh_repair.py         DSH legacy-session "ungrouped/unloadable" detect & repair (stdlib-only, CLI-capable; includes session-file content repair)
+├── workbuddy_repair.py   WorkBuddy session-index detect & repair (stdlib-only: wrong owner / unregistered rows / missing workspaces / stale sidebar snapshot; backs up and locks the DB before writing)
 ├── adapters/
 │   ├── base.py        BaseAdapter interface + adapter registry
 │   ├── qoder.py       Qoder adapter (reference implementation, self-contained)
