@@ -84,6 +84,10 @@ class ConversionPlan:
     skipped_empty: int = 0          # 标题与正文皆空，无内容可转
     layout: str = "legacy"
     uid: str = ""
+    #:导出目标：qoder = 写回 Qoder 自身的新版记忆（默认）；
+    #: codebuddy = 写成 CodeBuddy 用户级记忆 .mdc（跨工具记忆迁移）
+    target: str = "qoder"
+    scope_prefix: str = ""          # 按 scope_id 前缀过滤工作区记忆（空=全量）
 
     @property
     def to_create(self) -> int:
@@ -190,6 +194,51 @@ def render_memory_md(mem: LegacyMemory) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_codebuddy_mdc(mem: LegacyMemory, updated_at: str = "") -> str:
+    """渲染为 CodeBuddy 用户级记忆 ``.mdc``（形态对照真实样本
+    ``.memories/20260809-cleanup-rule.mdc``：frontmatter 只有 ``enabled`` /
+    ``updatedAt``，正文 markdown；标题以一级标题带入，避免信息丢失）。"""
+    lines = ["---", "enabled: true",
+             "updatedAt: %s" % (updated_at or "2026-01-01T00:00:00.000Z"), "---", ""]
+    if mem.title:
+        lines.append("# %s" % mem.title)
+        lines.append("")
+    body = (mem.content or "").rstrip()
+    lines.append(body)
+    if mem.keywords:
+        lines.append("")
+        lines.append("> 关键词：%s" % "、".join(mem.keywords))
+    return "\n".join(lines) + "\n"
+
+
+def _mdc_slug_date(mem: LegacyMemory) -> str:
+    """文件名日期段：gmt_create 实测三种形态并存（ISO ``2025-06-01``、
+    10 位秒级时间戳、13 位毫秒时间戳），归一成 ``YYYYMMDD``；解析不出回退
+    ``19700101``。"""
+    raw = (mem.gmt_create or "").strip()
+    import datetime as _dt
+    try:
+        if re.fullmatch(r"\d{13}", raw):
+            return _dt.datetime.fromtimestamp(
+                int(raw) / 1000).strftime("%Y%m%d")
+        if re.fullmatch(r"\d{10}", raw):
+            return _dt.datetime.fromtimestamp(int(raw)).strftime("%Y%m%d")
+        if re.fullmatch(r"\d{8}", raw):
+            return raw
+        m = re.match(r"(\d{4})-(\d{2})-(\d{2})", raw)
+        if m:
+            return m.group(1) + m.group(2) + m.group(3)
+    except (OSError, OverflowError, ValueError):
+        pass
+    return "19700101"
+
+
+def _mdc_slug(mem: LegacyMemory) -> str:
+    date = _mdc_slug_date(mem)
+    slug = _BAD_FN.sub("-", (mem.title or "memory").strip())[:40].strip("-")
+    return "%s-%s.mdc" % (date, slug or "memory")
+
+
 def _safe_filename(title: str) -> str:
     name = _BAD_FN.sub("-", (title or "").strip()) or "未命名记忆"
     return name[:80].rstrip(". ")
@@ -230,10 +279,18 @@ def _uid_dir_name(qoder_home: str, uid: str) -> str:
 
 def plan_conversion(db_path: str, qoder_home: str,
                     layout: str = "legacy", uid: str = "",
-                    include_lingma: bool = True) -> ConversionPlan:
+                    include_lingma: bool = True,
+                    target: str = "qoder",
+                    codebuddy_memories_dir: str = "",
+                    scope_prefix: str = "") -> ConversionPlan:
     """生成转换计划（**不写盘**）：每条记忆一个目标文件，已存在即跳过。"""
-    plan = ConversionPlan(layout=layout, uid=uid)
+    plan = ConversionPlan(layout=layout, uid=uid, target=target,
+                          scope_prefix=scope_prefix)
     memories = read_legacy_memories(db_path, include_lingma=include_lingma)
+    if scope_prefix:
+        memories = [m for m in memories
+                    if m.scope != "workspace"
+                    or (m.scope_id or "").startswith(scope_prefix)]
     uid_dir = _uid_dir_name(qoder_home, uid)
 
     projects_dir = os.path.join(qoder_home, "projects")
@@ -248,26 +305,38 @@ def plan_conversion(db_path: str, qoder_home: str,
             plan.skipped_empty += 1
             continue
         category = mem.category or "misc"
+        if target == "codebuddy":
+            entry = ConversionEntry(
+                memory=mem,
+                target_path=os.path.join(codebuddy_memories_dir,
+                                         _mdc_slug(mem)),
+                project_key=derive_project_key(mem.scope_id)
+                if mem.scope == "workspace" else "")
+            entry.action = ("exists" if os.path.isfile(entry.target_path)
+                            else "create")
+            plan.entries.append(entry)
+            continue
         filename = _safe_filename(mem.title or "未命名记忆") + ".md"
         if mem.scope == "workspace" and mem.scope_id:
+            dest = None
             if layout == "legacy":
                 key, _hit = match_project_key(mem.scope_id, existing_keys)
-                target = os.path.join(qoder_home, "memories", uid_dir,
-                                      "projects", key, category, filename)
+                dest = os.path.join(qoder_home, "memories", uid_dir,
+                                    "projects", key, category, filename)
             else:
                 key, _hit = match_project_key(mem.scope_id, existing_keys)
-                target = os.path.join(projects_dir, key, "memory", category,
-                                      filename)
+                dest = os.path.join(projects_dir, key, "memory", category,
+                                    filename)
         else:
             if layout == "legacy":
-                target = os.path.join(qoder_home, "memories", uid_dir,
-                                      "global", category, filename)
+                dest = os.path.join(qoder_home, "memories", uid_dir,
+                                    "global", category, filename)
             else:
-                target = os.path.join(qoder_home, "memory", category, filename)
-        entry = ConversionEntry(memory=mem, target_path=target,
+                dest = os.path.join(qoder_home, "memory", category, filename)
+        entry = ConversionEntry(memory=mem, target_path=dest,
                                 project_key=derive_project_key(mem.scope_id)
                                 if mem.scope == "workspace" else "")
-        entry.action = "exists" if os.path.isfile(target) else "create"
+        entry.action = "exists" if os.path.isfile(dest) else "create"
         plan.entries.append(entry)
     return plan
 
@@ -287,9 +356,12 @@ def apply_conversion(plan: ConversionPlan) -> dict:
         try:
             os.makedirs(os.path.dirname(_longpath(entry.target_path)),
                         exist_ok=True)
+            rendered = (render_codebuddy_mdc(entry.memory)
+                        if plan.target == "codebuddy"
+                        else render_memory_md(entry.memory))
             with open(_longpath(entry.target_path), "w",
                       encoding="utf-8", newline="\n") as f:
-                f.write(render_memory_md(entry.memory))
+                f.write(rendered)
             created += 1
             created_paths.append(entry.target_path)
         except OSError as exc:
@@ -339,6 +411,15 @@ def main(argv: "list[str] | None" = None) -> int:
                         help="不并入更老一代的 lingma_memory 表")
     parser.add_argument("--apply", action="store_true",
                         help="真正写盘（合并不覆盖；默认只打印计划）")
+    parser.add_argument("--target", choices=["qoder", "codebuddy"],
+                        default="qoder",
+                        help="导出目标：qoder=写回自身新版记忆（默认）；"
+                             "codebuddy=CodeBuddy 用户级 .mdc")
+    parser.add_argument("--codebuddy-memories", default="",
+                        help="CodeBuddy 的 .memories 目录（target=codebuddy 时必填）")
+    parser.add_argument("--scope-prefix", default="",
+                        help="只转 scope_id 以该前缀开头的工作区记忆"
+                             "（global 不受影响；跨工具导出建议按在维护的项目过滤）")
     args = parser.parse_args(argv)
 
     if sys.platform == "win32":
@@ -357,8 +438,15 @@ def main(argv: "list[str] | None" = None) -> int:
         return 2
     qoder_home = args.qoder_home or infer_qoder_home(db)
 
+    if args.target == "codebuddy" and not args.codebuddy_memories:
+        print("--target codebuddy 需要 --codebuddy-memories 指定 .memories 目录。",
+              file=sys.stderr)
+        return 2
     plan = plan_conversion(db, qoder_home, layout=args.layout, uid=args.uid,
-                           include_lingma=not args.no_lingma)
+                           include_lingma=not args.no_lingma,
+                           target=args.target,
+                           codebuddy_memories_dir=args.codebuddy_memories,
+                           scope_prefix=args.scope_prefix)
     for line in plan.summary_lines():
         print(line)
     shown = 0

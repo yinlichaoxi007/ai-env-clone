@@ -231,22 +231,27 @@ def _flatten_wb_reasoning(raw_content) -> str:
     return _flatten_any(raw_content)
 
 
-#: WorkBuddy 用户记录里的真实提问包裹标签（W 文档 §4 实测：标签外是系统注入的
-#: 时间 / 上下文等，**不是用户写的话**）。
-_WORKBUDDY_USER_QUERY_RX = re.compile(r"<user_query>(.*?)</user_query>", re.S)
+#: 用户记录里的真实提问包裹标签——WorkBuddy 与 CodeBuddy 同款（两工具实测样本
+#: 一致）：标签外是系统注入（时间 / 上下文 / ``<user_info>`` / ``<rules>`` / memories），
+#: **不是用户写的话**。
+_USER_QUERY_RX = re.compile(r"<user_query>(.*?)</user_query>", re.S)
 
 
-def _extract_workbuddy_user_query(text: str) -> str:
+def _extract_user_query(text: str) -> str:
     """取用户消息里 ``<user_query>…</user_query>`` 的**第一段**内容作为用户真实提问。
 
     整条没有标签时（典型即本工具写出的导入会话，正文本来就是干净的用户话）原样
     保留；标签内容为空也回退原文——抽取是「提纯」，绝不把消息变成空串。
     """
-    m = _WORKBUDDY_USER_QUERY_RX.search(text or "")
+    m = _USER_QUERY_RX.search(text or "")
     if not m:
         return text or ""
     inner = m.group(1).strip()
     return inner if inner else (text or "")
+
+
+# 兼容别名（WorkBuddy 轮引入时的名字）
+_extract_workbuddy_user_query = _extract_user_query
 
 
 def count_workbuddy_forks(session_jsonl: str) -> int:
@@ -1025,26 +1030,41 @@ class SessionParser:
             try:
                 inner_obj = json.loads(inner) if isinstance(inner, str) else inner
                 if isinstance(inner_obj, dict):
-                    # 常见结构：{"role","content":[{"type":"text","text":...}]}
+                    # 常见结构：{"role","content":[{"type":"text"|"reasoning","text":…}]}
+                    # （2026-10-07 真实样本：assistant 的 content 是
+                    #   [{type:"reasoning",…},{type:"text",…}]，reasoning 必须
+                    #   单独进 reasoning_content，混进正文会把思考过程当回答）
                     content = inner_obj.get("content")
                     if isinstance(content, list):
                         parts = []
+                        rparts: list = []
                         for part in content:
                             if isinstance(part, dict):
-                                if part.get("type") == "text":
-                                    parts.append(part.get("text", ""))
-                                elif "text" in part:
+                                ptype = part.get("type")
+                                if ptype == "reasoning":
+                                    rparts.append(str(part.get("text", "")))
+                                elif ptype == "text" or "text" in part:
                                     parts.append(str(part.get("text", "")))
                                 else:
                                     parts.append(json.dumps(part, ensure_ascii=False))
                             else:
                                 parts.append(str(part))
                         text = "\n".join(p for p in parts if p)
+                        reasoning = "\n".join(r for r in rparts if r)
                     elif isinstance(content, str):
                         text = content
                     else:
                         text = json.dumps(inner_obj, ensure_ascii=False)
-                    reasoning = inner_obj.get("reasoning_content", "") or ""
+                    reasoning = (reasoning
+                                 or inner_obj.get("reasoning_content", "")
+                                 or (inner_obj.get("providerOptions") or {})
+                                 .get("openaiCompatible", {})
+                                 .get("reasoning_content", "")
+                                 or "")
+                    if role == "user":
+                        # CodeBuddy 与 WorkBuddy 同款：真实提问包在
+                        # ``<user_query>…</user_query>``，标签外是系统注入
+                        text = _extract_user_query(text)
             except (json.JSONDecodeError, TypeError):
                 text = inner if isinstance(inner, str) else json.dumps(inner, ensure_ascii=False)
             msgs.append(SessionMessage(
@@ -1080,7 +1100,7 @@ class SessionParser:
         没有 fork 标记的文件（含本工具写出的导入会话，事件无 parentId）走原线性
         路径，零行为变化。
 
-        用户消息经 ``_extract_workbuddy_user_query`` 提纯：只取
+        用户消息经 ``_extract_user_query`` 提纯：只取
         ``<user_query>…</user_query>`` 标签内的真实提问，标签外的系统注入不带进
         迁移结果。
         """
@@ -1138,7 +1158,7 @@ class SessionParser:
                         msgs.append(cur)
                         cur = None
                     if role == "user":
-                        text = _extract_workbuddy_user_query(text)
+                        text = _extract_user_query(text)
                     msgs.append(SessionMessage(role=role, content=text, created_at=ts))
             elif etype == "reasoning":
                 a = _ensure_assistant()
@@ -2114,7 +2134,13 @@ def _scan_codebuddy(root: str) -> list:
 
 
 def _codebuddy_title_from_first_message(session_dir: str, index_path: str) -> str:
-    """CodeBuddy 新版 index.json 无 title 字段时，用首条用户消息前 40 字兜底。"""
+    """CodeBuddy 新版 index.json 无 title 字段时，用首条用户消息前 40 字兜底。
+
+    先经 ``_extract_user_query`` 提纯：CodeBuddy 的用户消息与 WorkBuddy 同款，
+    真实提问包在 ``<user_query>…</user_query>`` 里，标签外是系统注入
+    （``<user_info>`` / ``<rules>`` / ``<memories>``，2026-10-07 实测样本）——
+    不提纯的话兜底标题会变成「OS Version: win32…」。
+    """
     try:
         idx = _read_json(index_path)
         msgs = idx.get("messages") or []
@@ -2128,7 +2154,24 @@ def _codebuddy_title_from_first_message(session_dir: str, index_path: str) -> st
         if not mid:
             return ""
         mobj = _read_json(os.path.join(session_dir, "messages", "%s.json" % mid))
-        text = _flatten_any(_loads_maybe(mobj.get("message")))
+        inner = _loads_maybe(mobj.get("message"))
+        text = ""
+        if isinstance(inner, dict):
+            content = inner.get("content")
+            if isinstance(content, list):
+                # 首个文本型 part（注入+提问同在一段里，交给提纯拆）
+                for part in content:
+                    if isinstance(part, dict) and "text" in part:
+                        text = str(part.get("text") or "")
+                        break
+            elif isinstance(content, str):
+                text = content
+            else:
+                text = json.dumps(inner, ensure_ascii=False)
+        elif inner is not None:
+            # 非 JSON 的 message 字段：旧包 / 测试夹具直接存纯文本
+            text = str(inner)
+        text = _extract_user_query(text)
         text = " ".join((text or "").split())
         return text[:40]
     except (OSError, ValueError, TypeError, AttributeError):

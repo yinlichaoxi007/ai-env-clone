@@ -176,3 +176,60 @@ class TestConvert(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCodeBuddyTarget(unittest.TestCase):
+    """``--target codebuddy``：写成 CodeBuddy 用户级 ``.mdc``（跨工具记忆迁移）。
+
+    mdc 形态对照真实样本 ``.memories/20260809-cleanup-rule.mdc``：frontmatter 只有
+    ``enabled`` / ``updatedAt``，正文 markdown；标题以一级标题带入。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="qmem_cb_")
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.db = _make_db(self.tmp)
+        self.mem_dir = os.path.join(self.tmp, "memories")
+
+    def test_plan_flat_files_and_prefix_filter(self):
+        plan = qmc.plan_conversion(
+            self.db, os.path.join(self.tmp, "qoder"), target="codebuddy",
+            codebuddy_memories_dir=self.mem_dir,
+            scope_prefix="D:\\demo")
+        names = {os.path.basename(e.target_path) for e in plan.entries}
+        self.assertTrue(all(n.endswith(".mdc") for n in names))
+        # scope_id 不带前缀的 global 记忆不受过滤影响；workspace 的全带前缀
+        titles = {e.memory.title for e in plan.entries}
+        # global 记忆不受前缀过滤影响；workspace 记忆（D:\demo\proj）命中前缀保留
+        self.assertIn("全局记忆一", titles)
+        self.assertIn("项目记忆一", titles)
+        self.assertIn("更老一代记忆", titles)      # lingma 的 scope_id 同为 D:\demo\proj
+
+    def test_render_and_apply_no_overwrite(self):
+        plan = qmc.plan_conversion(
+            self.db, os.path.join(self.tmp, "qoder"), target="codebuddy",
+            codebuddy_memories_dir=self.mem_dir)
+        result = qmc.apply_conversion(plan)
+        self.assertEqual(result["created"], plan.to_create)
+        self.assertEqual(result["created"], plan.to_create)
+        target_of = {e.memory.title: e.target_path for e in plan.entries}
+        created = target_of["项目记忆一"]
+        with open(created, encoding="utf-8") as f:
+            text = f.read()
+        self.assertTrue(text.startswith("---"
+                         + chr(10) + "enabled: true" + chr(10)
+                         + "updatedAt: "))
+        self.assertIn("# 项目记忆一", text)
+        self.assertIn("项目内容第一行", text)
+        self.assertIn("> 关键词：kw1、kw2", text)
+        # 复跑：全部 exists，已有文件一字不动
+        plan2 = qmc.plan_conversion(
+            self.db, os.path.join(self.tmp, "qoder"), target="codebuddy",
+            codebuddy_memories_dir=self.mem_dir)
+        self.assertEqual(plan2.to_create, 0)
+        before = {e.target_path: open(e.target_path, "rb").read()
+                  for e in plan2.entries}
+        qmc.apply_conversion(plan2)
+        after = {e.target_path: open(e.target_path, "rb").read()
+                 for e in plan2.entries}
+        self.assertEqual(before, after)

@@ -25,6 +25,7 @@ from unittest import mock
 
 from ai_env_clone.adapters import get_adapter, list_adapters
 from ai_env_clone.adapters import codebuddy as cb_mod
+from ai_env_clone import session_migration as sm
 from ai_env_clone.core import BackupItem
 from ai_env_clone.adapters.codebuddy import (
     CodeBuddyAdapter,
@@ -922,3 +923,59 @@ class TestLongPathSessionRoundTrip(TempEnv):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestParseForkSample(unittest.TestCase):
+    """编辑重发实测样本（2026-10-07，会话 488c133f）的解析回归。
+
+    样本形态：user 消息 = 注入（``<user_info>`` / ``<rules>`` / ``<memories>``）
+    + ``<user_query>`` 包裹的真实提问；assistant 消息 content 是
+    ``[{type:"reasoning"},{type:"text"}]``，reasoning 单列、不混进正文。
+    """
+
+    def _make_session(self, root: str) -> str:
+        sdir = os.path.join(root, "history", "059d5d31", "488c133f")
+        os.makedirs(os.path.join(sdir, "messages"))
+        inner_user = json.dumps({"role": "user", "content": [{
+            "type": "text",
+            "text": "<user_info>\nOS Version: win32\n</user_info>\n\n<rules>\n测试\n</rules>"
+                    "\n\n<user_query>\nhello，who are you2\n</user_query>",
+        }]}, ensure_ascii=False)
+        inner_ai = json.dumps({"role": "assistant", "content": [
+            {"type": "reasoning", "text": "The user is asking \"hello, who are you2\""},
+            {"type": "text", "text": "你好！我是 CodeBuddy。"},
+        ]}, ensure_ascii=False)
+        with open(os.path.join(sdir, "messages", "u1.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"role": "user", "message": inner_user}, f, ensure_ascii=False)
+        with open(os.path.join(sdir, "messages", "a1.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"role": "assistant", "message": inner_ai,
+                       "createdAt": "2026-10-07T15:02:01.129Z"}, f, ensure_ascii=False)
+        with open(os.path.join(sdir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump({"messages": [
+                {"id": "u1", "type": "text", "role": "user", "isComplete": True},
+                {"id": "a1", "type": "text", "role": "assistant", "isComplete": False},
+            ]}, f, ensure_ascii=False)
+        return sdir
+
+    def test_user_query_extracted_and_reasoning_separated(self):
+        tmp = tempfile.mkdtemp(prefix="cb_fork_")
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        sdir = self._make_session(tmp)
+        s = sm.SessionParser.parse_codebuddy(sdir)
+        self.assertEqual(
+            [m.content for m in s.messages if m.role == "user"],
+            ["hello，who are you2"])       # 注入被提纯掉
+        ai = [m for m in s.messages if m.role == "assistant"][0]
+        self.assertEqual(ai.content, "你好！我是 CodeBuddy。")   # 正文
+        self.assertIn("The user is asking", ai.reasoning_content)  # 推理单列
+
+    def test_title_fallback_uses_query_not_injection(self):
+        """index.json 无 title 时兜底标题必须取 ``<user_query>`` 内容，
+        不能是「OS Version: win32…」（不提纯就会这样）。"""
+        tmp = tempfile.mkdtemp(prefix="cb_fork2_")
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        sdir = self._make_session(tmp)
+        s = sm.SessionParser.parse_codebuddy(sdir)
+        self.assertEqual(s.title, "hello，who are you2")
