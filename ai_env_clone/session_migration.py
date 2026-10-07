@@ -1302,10 +1302,11 @@ def _parse_dsh_text(text: str) -> Session:
         data = obj.get("data") or {}
         if etype == "session":
             scope = obj.get("cwd") or ""
-            # 子代理会话的判定只看 header（``origin: "subagent"`` + ``parentSession``）；
-            # 目录名（裸 uuid）只是旁证，日志被单独拷出来时它不一定还在。
-            is_subagent = obj.get("origin") == "subagent" \
-                or bool(obj.get("parentSession"))
+            # 子代理会话的判定**只认 ``origin: "subagent"``**：DSH 的「分叉按钮」
+            # 产生的用户分支会话同样带 ``parentSession``（2026-10-07 实测样本
+            # session-18005063：parentSession + delegationDepth:0 + 无 origin），
+            # 但它是用户自己的会话，按子代理处理会把它从导入列表里吞掉。
+            is_subagent = obj.get("origin") == "subagent"
             parent_session_id = obj.get("parentSession") or ""
         elif etype == "session/title":
             title = title or (data.get("title") or "")
@@ -1322,7 +1323,10 @@ def _parse_dsh_text(text: str) -> Session:
             for part in msg.get("content") or []:
                 if not isinstance(part, dict):
                     continue
-                if part.get("type") == "text":
+                # ★ 真实日志（与本工具 write_dsh）用 ``output_text``，纯 ``text``
+                # 是文档口径——两者都收，漏了 output_text 会把助手正文丢成空串
+                # （2026-10-07 分叉样本实测踩中）。
+                if part.get("type") in ("text", "output_text"):
                     text_parts.append(part.get("text") or "")
                 elif part.get("type") == "tool-call":
                     tool_calls.append({

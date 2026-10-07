@@ -333,7 +333,9 @@ def _scan_source_dsh(root: str) -> list:
             if not isinstance(header, dict):
                 continue
             sid = str(header.get("id") or name)
-            is_sub = header.get("origin") == "subagent" or bool(header.get("parentSession"))
+            # ★ 只认 ``origin: "subagent"``：DSH 分叉按钮产生的用户分支会话也带
+            # ``parentSession``（2026-10-07 实测），但它不是子代理。
+            is_sub = header.get("origin") == "subagent"
             title, first_user = _source_titles(sd, decompress)
             out.append(SourceSession(
                 id=sid, parent_id=header.get("parentSession") or "", title=title,
@@ -498,10 +500,11 @@ def scan_dsh_sessions(dsh_home: str, decompress: Optional[Callable] = None) -> l
         header = s.header if isinstance(s.header, dict) else {}
         if isinstance(header.get("createdAt"), int):
             created = header["createdAt"]
-        # 已经是原生子代理会话的（header 声明 origin/parentSession，或是裸 uuid 目录）
+        # 已经是原生子代理会话的（header 声明 ``origin: "subagent"``，或是裸 uuid 目录）
         # 不再改造——否则「修复」跑第二遍会把自己写出的新会话再当成旧导入会话。
+        # ★ 用户分叉会话（parentSession + delegationDepth:0、无 origin）**不是**子代理，
+        # 不在此列；它也不该成为改造目标（指纹来自 ZCode 子代理记录，用户分叉撞不上）。
         already = header.get("origin") == "subagent" \
-            or bool(header.get("parentSession")) \
             or not s.session_id.startswith("session-")
         v4 = os.path.join(s.path, "session.v4.jsonl.zstd")
         facts = DshSessionFacts(
