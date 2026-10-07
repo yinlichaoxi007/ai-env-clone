@@ -231,6 +231,71 @@ def _flatten_wb_reasoning(raw_content) -> str:
     return _flatten_any(raw_content)
 
 
+#: WorkBuddy 用户记录里的真实提问包裹标签（W 文档 §4 实测：标签外是系统注入的
+#: 时间 / 上下文等，**不是用户写的话**）。
+_WORKBUDDY_USER_QUERY_RX = re.compile(r"<user_query>(.*?)</user_query>", re.S)
+
+
+def _extract_workbuddy_user_query(text: str) -> str:
+    """取用户消息里 ``<user_query>…</user_query>`` 的**第一段**内容作为用户真实提问。
+
+    整条没有标签时（典型即本工具写出的导入会话，正文本来就是干净的用户话）原样
+    保留；标签内容为空也回退原文——抽取是「提纯」，绝不把消息变成空串。
+    """
+    m = _WORKBUDDY_USER_QUERY_RX.search(text or "")
+    if not m:
+        return text or ""
+    inner = m.group(1).strip()
+    return inner if inner else (text or "")
+
+
+def count_workbuddy_forks(session_jsonl: str) -> int:
+    """事件流里 ``resend-fork-notice`` 的出现次数（编辑重发分叉数；读不了算 0）。"""
+    try:
+        raw = _read_text(session_jsonl)
+    except OSError:
+        return 0
+    return raw.count('"resend-fork-notice"')
+
+
+def _workbuddy_active_branch_ids(records: list) -> "set | None":
+    """以文件序**最后一条 message** 为叶子，沿 ``parentId`` 回溯出当前分支的记录 id 集。
+
+    WorkBuddy 的编辑重发会在同一份 jsonl 里留下树：被编辑消息及其回复是被放弃的
+    旧分支，产品渲染按 parentId 走树、走错边就是「会话只显示到分叉点」（W 文档
+    §5.2，本次故障的同型根因）。迁移的选边口径＝**保留当前分支**：当前分支必然
+    经过最后一条消息，沿它的祖先链走即可，多叉文件天然成立。
+
+    :return: 链上全部记录的 id 集合；链不完整（叶子没有 parentId / 断链）时返回
+        ``None``——调用方应退回线性读取，**宁可多带旧分支也不丢当前分支的前文**。
+    """
+    leaf = None
+    for r in reversed(records):
+        if isinstance(r, dict) and r.get("type") == "message" \
+                and r.get("role") in ("user", "assistant"):
+            leaf = r
+            break
+    if leaf is None or not leaf.get("parentId"):
+        return None
+    by_id: dict = {}
+    for r in records:
+        rid = r.get("id") if isinstance(r, dict) else None
+        if rid and rid not in by_id:
+            by_id[rid] = r
+    chain: set = set()
+    cur = leaf
+    while isinstance(cur, dict):
+        rid = cur.get("id")
+        if not rid or rid in chain:
+            break
+        chain.add(rid)
+        pid = cur.get("parentId")
+        if not pid:
+            break
+        cur = by_id.get(pid)
+    return chain
+
+
 def _open_sqlite_ro(db_path: str) -> sqlite3.Connection:
     """以只读方式打开 SQLite（URI mode=ro，不修改源库）。"""
     uri = "file:%s?mode=ro" % db_path.replace("\\", "/")
@@ -1007,6 +1072,17 @@ class SessionParser:
         「一段用户消息到下一段用户消息之间」的全部 assistant 产出（推理 + 工具调用 +
         工具结果 + 正文）**聚合为一条 assistant 消息**，得到与其它工具一致的用户/
         助手交替序列，便于跨软件往返而不丢内容。
+
+        **编辑重发分叉选边**（W 文档 §5.2）：文件里出现 ``resend-fork-notice`` 时，
+        同一对话线在 jsonl 里是树——被编辑消息及其回复是被放弃的旧分支，仍留在文件
+        里。此时以最后一条消息为叶子沿 ``parentId`` 回溯出**当前分支**，链外记录
+        （旧分支）全部弃用；链不完整则退回线性读取（宁可多带旧分支也不丢前文）。
+        没有 fork 标记的文件（含本工具写出的导入会话，事件无 parentId）走原线性
+        路径，零行为变化。
+
+        用户消息经 ``_extract_workbuddy_user_query`` 提纯：只取
+        ``<user_query>…</user_query>`` 标签内的真实提问，标签外的系统注入不带进
+        迁移结果。
         """
         title = ""
         msgs: list = []
@@ -1019,6 +1095,7 @@ class SessionParser:
             return cur
 
         raw = _read_text(session_jsonl)
+        records: list = []
         for line in raw.split("\n"):
             line = line.strip()
             if not line:
@@ -1027,6 +1104,22 @@ class SessionParser:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if isinstance(obj, dict):
+                records.append(obj)
+
+        # 分叉选边：仅当文件确有 fork 标记才过滤（快路径，绝大多数文件零开销）
+        active_ids = None
+        if any(r.get("type") == "resend-fork-notice" for r in records):
+            active_ids = _workbuddy_active_branch_ids(records)
+
+        for obj in records:
+            if active_ids is not None:
+                et = obj.get("type")
+                oid = obj.get("id")
+                if et in ("message", "reasoning", "function_call",
+                          "function_call_result") and oid \
+                        and oid not in active_ids:
+                    continue        # 被放弃的旧分支
             etype = obj.get("type")
             ts = _ms_to_iso(obj.get("timestamp"))
             if etype == "ai-title":
@@ -1044,6 +1137,8 @@ class SessionParser:
                     if cur is not None:
                         msgs.append(cur)
                         cur = None
+                    if role == "user":
+                        text = _extract_workbuddy_user_query(text)
                     msgs.append(SessionMessage(role=role, content=text, created_at=ts))
             elif etype == "reasoning":
                 a = _ensure_assistant()
@@ -2068,8 +2163,14 @@ def _scan_workbuddy(root: str) -> list:
                 continue
             sid = fn[: -len(".jsonl")]
             p = os.path.join(sdir, fn)
+            detail = "工作区 %s" % slug
+            forks = count_workbuddy_forks(p)
+            if forks:
+                # W 文档 §5.2：编辑重发在 jsonl 里留树，迁移时按当前分支选边；
+                # 在导入列表里如实注明，用户才知道这条会话搬过去的内容口径。
+                detail += "；含 %d 处编辑重发分叉（迁移保留当前分支）" % forks
             out.append({"id": p, "title": titles.get(sid, ""), "path": p,
-                        "detail": "工作区 %s" % slug,
+                        "detail": detail,
                         "cwd": cwds.get(sid, ""), "workspace_id": ""})
     return out
 
