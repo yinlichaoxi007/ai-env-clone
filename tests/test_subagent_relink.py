@@ -198,7 +198,12 @@ class TestRelinkPlan(RelinkFixture):
     def test_without_any_source_reports_honestly(self) -> None:
         """来源找不到时只上报，绝不猜（一条也不改）。"""
         with mock.patch.object(subagent_relink, "_source_dirs", return_value=[]):
-            plan = subagent_relink.plan_subagent_relink(self.home, live_roots={})
+            # live_roots 必须显式给一个**不存在**的路径：空 dict 会让 discover_sources
+            # 回退探测本机真实 ~/.zcode——在有 ZCode 数据的机器上「无来源」前提不成立
+            # （本机实测踩过：报告成了「本机 ZCode 数据：1 条会话」）。
+            plan = subagent_relink.plan_subagent_relink(
+                self.home,
+                live_roots={"zcode": os.path.join(self.tmp, "no-such-zcode")})
         self.assertEqual(plan.targets, [])
         self.assertFalse(plan.empty)
         self.assertTrue(plan.source_note)
