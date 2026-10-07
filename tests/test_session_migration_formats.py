@@ -13,6 +13,7 @@ import tempfile
 import unittest
 import uuid
 from unittest import mock
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -279,6 +280,33 @@ class TestDsh(unittest.TestCase):
         self.assertEqual(back.title, "DSH 标题")
         self.assertEqual([m.role for m in back.messages], ["user", "assistant"])
         self.assertEqual(back.messages[0].content, "问题")
+
+    def test_user_fork_session_is_not_subagent(self) -> None:
+        """DSH「分叉按钮」＝派生新会话：header 带 ``parentSession`` 但
+        ``delegationDepth: 0`` 且**无 ``origin``**（2026-10-07 真实样本
+        session-18005063 回归钉）。它是用户自己的会话，**不得**按子代理处理
+        ——旧判定「有 parentSession 即子代理」会把它从导入列表里吞掉。"""
+        lines = [
+            json.dumps({"type": "session", "version": 4, "id": "session-18005063",
+                        "createdAt": 1791343777195, "cwd": "D:\\project\\TeaVision",
+                        "parentSession": "session-79b5aaee", "isSeeded": True,
+                        "delegationDepth": 0, "agentPreset": "standard"}),
+            json.dumps({"type": "user/message", "seq": 0, "time": 1791343719746,
+                        "data": {"content": [{"type": "text", "text": "hello"}]}}),
+            json.dumps({"type": "assistant/message", "seq": 1, "time": 1791343720000,
+                        "data": {"message": {"content": [
+                            {"type": "output_text", "text": "Hi!"}]}}}),
+        ]
+        p = os.path.join(self.tmp, "fork-session.v4.jsonl")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        # 明文夹具：给解压函数打恒等桩（真实文件是 zstd，但判定逻辑与压缩无关）
+        with mock.patch.object(sm, "_dsh_decompress_bytes",
+                               side_effect=lambda b: b):
+            s = sm.SessionParser.parse_dsh(p)
+        self.assertFalse(s.is_subagent)
+        self.assertEqual(s.parent_source_id, "session-79b5aaee")   # 父会话线索保留
+        self.assertEqual([m.content for m in s.messages], ["hello", "Hi!"])
 
     def test_written_log_has_single_line_header_frame(self) -> None:
         """DSH 只解**首帧**取 header，且要求首帧明文恰好一行 ⇒ 必须多帧写。
