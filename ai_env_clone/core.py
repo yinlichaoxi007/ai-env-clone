@@ -127,6 +127,15 @@ ORIGIN_NOTE_CONVERSATION = "会话正文与命令输出会记录源机器上的�
 #: 会话数据库（SQLite）内的同类说明。
 ORIGIN_NOTE_SESSION_DB = "会话数据库内会记录源机器上的文件绝对路径"
 
+#: 明文逐条对话转录的说明（适配器给 ``pre_export_notice`` 用，共用措辞避免各写各的）。
+#: 为什么必须单列一条、不能只靠 ``export_transform_paths`` 的字段脱敏：对话正文里
+#: 用户可能粘贴过密钥、口令、内网地址或客户数据，这些内容**键名不固定、就藏在普通
+#: 文本里**，按字段名匹配的脱敏对它完全无效，只能让用户在导出前知情。
+TRANSCRIPT_PLAINTEXT_NOTE = (
+    "会话转录是明文的逐条对话原文，可能包含你曾在对话里粘贴过的密钥、口令、"
+    "内网地址或业务数据；这类内容无法按字段名脱敏，备份包内会原样保留。"
+)
+
 
 @dataclass
 class BackupItem:
@@ -151,6 +160,13 @@ class BackupItem:
     #: （``apiKeyEnv``），真密钥在 ``.credentials.yaml``；后者含明文、默认不勾
     #: ⇒ 必须让用户知道要单独备份它。
     companion: "tuple[str, str] | None" = None
+    #: 非空 = **导出前**必须先向用户明示并等其确认的内容，值是给用户看的说明
+    #: （见 :func:`pre_export_notices`）。用途是「本工具的脱敏机制对它无效」的原文类
+    #: 数据——典型是会话转录：正文里可能混着用户粘贴过的密钥或客户数据，键名不固定，
+    #: 无法按字段名替换成占位符。
+    #: 与 ``carries_origin`` 的区别：那个只登记「包里有源设备信息」、在拿到包之后提醒
+    #: 一次；这个必须在**写盘之前**问一句，用户不点头就不生成备份包。
+    pre_export_notice: str = ""
 
     @property
     def exists(self) -> bool:
@@ -206,6 +222,26 @@ def companion_notes(items: Sequence[BackupItem]) -> list[str]:
             continue
         comp_key, note = comp
         if note and comp_key not in selected and note not in out:
+            out.append(note)
+    return out
+
+
+def pre_export_notices(items: Sequence[BackupItem]) -> list[str]:
+    """挑出「本次勾选的条目里，导出前必须让用户知情并确认的说明」（去重、保序）。
+
+    面向的场景是**不可脱敏的原文类内容**：会话转录里可能混着用户曾粘贴的密钥、
+    口令、内网地址、客户数据，按字段名脱敏对它无效，所以只能在写盘前让用户点头。
+    文案放在条目自己身上（``pre_export_notice``），哪个适配器确认过就哪个声明，
+    没确认过的不猜、也就不会凭空弹提示。
+
+    :param items: **本次实际勾选**的条目（不是全量清单）——没勾上的内容不会进包，
+        提示它就是误导。
+    :return: 需要在导出前展示的说明列表；空列表表示本批内容无需额外确认。
+    """
+    out: list[str] = []
+    for it in items:
+        note = (getattr(it, "pre_export_notice", "") or "").strip()
+        if note and note not in out:
             out.append(note)
     return out
 

@@ -104,6 +104,7 @@ from ai_env_clone.core import (
     inspect_backup,
     manifest_origin_info,
     origin_info_lines,
+    pre_export_notices,
     scan_items,
     session_workspaces_lines,
 )
@@ -3628,6 +3629,23 @@ class QoderBackupApp:
         if not items:
             messagebox.showwarning("提示", "请至少勾选一项要备份的内容。")
             return
+
+        # 导出前知情确认：本批内容里有「无法按字段名脱敏」的原文（典型是会话转录）。
+        # 放在**选保存路径之前**问：用户若要中止，连文件名都不用填，更不会留下半个包。
+        notices = pre_export_notices(items)
+        if notices:
+            ok = self._show_plain_report_dialog(
+                "导出前请确认",
+                "本次勾选的内容包含无法自动脱敏的原文：\n\n%s\n\n"
+                "如果这些内容可能涉及密钥、口令或他人数据，建议先自行检查、"
+                "清理后再导出，并确保备份包只放在你自己可控的位置。\n"
+                "确认知悉上述风险后再继续；点「取消」不会生成任何文件。"
+                % "\n".join("· " + n for n in notices),
+                ask=True,
+            )
+            if not ok:
+                self._set_status("已取消导出：未生成备份包。")
+                return
 
         default = "%s_backup_%s.zip" % (self.adapter.name, datetime.now().strftime("%Y%m%d_%H%M%S"))
         initial_dir = self._tool_dir("backup")

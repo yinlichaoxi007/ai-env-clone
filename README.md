@@ -93,6 +93,8 @@
 > ⚠️ **skill 只备份「本机 skill 数据」，不备份「skill 市场数据」**。技能市场的**本地镜像与目录索引**属于「重新下载即可恢复」的内容，不进备份范围。最典型的是 CodeBuddy 的 `~/.codebuddy/skills-marketplace/` —— 本机实测它是**整份技能市场的本地镜像**（`skills/` 295 个技能目录 ≈ 市场清单 293 条全量、`icons/` 137 个市场条目图标、`marketplace.json` 410 KB 目录索引，合计 5019 文件 / 57.1 MB），已从备份条目中移除。反过来说，WorkBuddy 的 `~/.workbuddy/skills/` 装的是**本机安装的技能本体**（含你自己写的技能），照常默认勾选；Trae 家族的 `~/.trae-cn/skill-config.json`（本机技能的启用 / 禁用 / 删除记录，仅 132 字节）也是**本机状态**，同样默认勾选。判断依据是**目录里装的是什么**，不是目录名里有没有「skill」。
 
 > ⚠️ **含凭证的设置文件导出时一律脱敏**：像 CodeBuddy/WorkBuddy 的 `models.json`、Reasonix 的 `config.toml`（含 MCP `[[plugins]]` 段）这类「设置类」文件里可能写着明文 apiKey / token。既然它们**默认勾选**，默认备份就必须保证**不含明文密钥**：导出时把「键名像凭证」的值替换成 `***REDACTED***`（键名、缩进、注释、结构全部原样保留），还原后需在目标机手动补填。这一条与「凭证不入包」是同一原则的两面。
+>
+> 但这套规则**对会话转录无效**（正文里的凭证没有固定键名）⇒ 勾选转录类条目时，导出前会先要你确认知情，详见下文「对话原文无法脱敏：导出前先确认」。
 
 **一处显式例外（默认勾选）：「IDE 工作区记录」。** CodeBuddy CN 的 `%APPDATA%\CodeBuddy CN\User\workspaceStorage\*\workspace.json`（每个仅 50~70 字节）本身既不是会话也不是记忆，但它记录「哪个工程文件夹对应哪个工作区」——而 CodeBuddy 的会话是按 `md5(项目路径)` 派生的工作区 id 索引的（**哈希不可逆**），这份记录是**跨机还原后把会话正确归回原工程工作区的唯一结构化映射**。它不含任何 IDE 运行态（同目录的 `state.vscdb`、`globalStorage/storage.json` 属运行态，**不进包**），因此按「无法从零重复创建、且能让用户数据正确落位」归入默认勾选。
 
@@ -425,6 +427,14 @@ WorkBuddy（Electron 桌面版，数据根 `~/.workbuddy`）的会话**正文**�
 
 需注意：本工具**不备份环境变量本身**（它存在于系统/Shell 配置中，不属任何工具数据目录），因此即便凭证用了环境变量引用，目标机若没有对应环境变量，仍需你手动在目标机配置一次。这是「安全（备份包不含凭证）」与「方便（跨电脑即取即用）」之间必要的权衡：凭证始终只存在于你掌控的环境里。
 
+### 对话原文无法脱敏：导出前先确认
+
+脱敏靠的是「键名像凭证就替换其值」，这套规则对**会话转录无效**——你在对话里粘贴过的密钥、口令、内网地址、业务数据就混在普通正文里，键名不固定，任何自动规则想抹掉它都会连带破坏内容。
+
+所以对确认属于「明文逐条对话」的条目（当前为 WorkBuddy 的会话事件流 `projects/` 与快照 `workspace/sessions/`），点「备份」时会**先弹一次「导出前请确认」**，写明包内会原样保留对话原文：确认后才让你选保存路径，点「取消」则一个文件都不产生（不会留下半个包）。
+
+> 该提示挂在**条目自身**上（`BackupItem.pre_export_notice`），由适配器按实测结论声明；没有核实过转录形态的工具不会凭空弹这个框——到处弹、内容又不准的告警，只会让用户更快忽略真正该读的那一次。
+
 ### 深层会话消息长路径修复（Windows）
 
 部分工具的会话消息文件层级很深（例如 CodeBuddy 的 `history/<ws>/<sid>/messages/<id>.json`），其绝对路径常超过 Windows 的 **260 字符 MAX_PATH** 限制。旧版在扫描/`getsize`/`open` 时因 `WinError 3`（系统找不到指定的路径）**静默丢弃全部 `messages/` 文件**——表现为「历史会话列表看得到、点开却没内容」。**当前版本已对所有文件操作加 `\\?\` 长路径前缀**（`scan_items` 的 `os.walk` 入口目录与 `getsize`、`export_backup` 的 `zf.write`、`import_backup` 全程），深层会话消息可完整备份与还原。其中 `os.walk` 入口目录加前缀尤为关键：未加时超 260 的会话目录根本扫不进去、`scan_items` 直接返回空、导出报"没扫到文件"，比单文件 `getsize` 失败更彻底。
@@ -597,6 +607,8 @@ The criterion is **how costly an item is to re-obtain**, not merely "can it be r
 > ⚠️ **For skills, back up your local skill data only — never the skill marketplace data.** A skill marketplace's **local mirror and catalogue index** can always be re-downloaded, so they are out of scope. The clearest case is CodeBuddy's `~/.codebuddy/skills-marketplace/`: measured locally it is a **full local mirror of the skill marketplace** (`skills/` = 295 skill directories ≈ the entire 293-entry catalogue, `icons/` = 137 marketplace icons, `marketplace.json` = a 410 KB catalogue index — 5019 files / 57.1 MB in total), and it has been removed from the backup items. Conversely, WorkBuddy's `~/.workbuddy/skills/` holds **the skill bodies installed on this machine** (including skills you wrote yourself), so it stays checked by default; the Trae family's `~/.trae-cn/skill-config.json` (the local enable/disable/delete records for skills, a mere 132 bytes) is **local state** too and likewise stays checked. The test is **what the directory actually contains**, not whether its name contains "skill".
 
 > ⚠️ **Settings files that may contain credentials are always redacted on export**: files like CodeBuddy/WorkBuddy's `models.json` or Reasonix's `config.toml` (including its MCP `[[plugins]]` section) may hold a plaintext apiKey/token. Since these are **checked by default**, the default archive must never carry a plaintext secret: on export, any value whose **key name looks like a credential** is replaced with `***REDACTED***` (keys, indentation, comments and structure are preserved verbatim), and you fill the secret back in on the target machine. This is the same principle as "credentials never enter the archive", seen from the other side.
+>
+> The same rule, however, **cannot work on session transcripts** (secrets pasted into chat have no fixed key name) ⇒ when you tick transcript items the tool asks you to acknowledge this *before* export — see "Transcripts cannot be redacted: you confirm before export" below.
 
 **One explicit exception (checked by default): "IDE workspace records".** CodeBuddy CN's `%APPDATA%\CodeBuddy CN\User\workspaceStorage\*\workspace.json` (only 50–70 bytes each) is neither a session nor memory, but it records *which project folder maps to which workspace* — and CodeBuddy indexes its sessions by a workspace id derived as `md5(project path)` (**irreversible**). This record is therefore **the only structured mapping that lets sessions land back in their original project workspace after a cross-machine restore**. It contains no IDE runtime state (the sibling `state.vscdb` and `globalStorage/storage.json` *are* runtime state and are **never packed**), so it qualifies as "cannot be recreated from scratch and makes user data land correctly" → checked by default.
 
@@ -937,6 +949,14 @@ To address this, the tool **redacts at export time**: for such a file, any field
 > - **If a tool keeps its keys in a separate file, you are reminded to back that file up separately**: DSH is exactly this design — `~/.dsh/profiles/<profile>/cordis.patch.yml` only contains `apiKeyEnv` (a reference name), while the real keys live in the `refs` section of `~/.dsh/.credentials.yaml`. That file is unchecked by default (plaintext; sharing the archive would leak it), so if you tick the live config without ticking it, the backup-complete notice tells you plainly *which file holds the model keys and whether to back it up separately*.
 
 Note: this tool **does not back up environment variables themselves** (they live in system/Shell config, outside any tool's data directory). So even with the env-var form, if the target lacks that variable, you must still configure it once on the target. This is the necessary trade-off between **security (no keys in the backup)** and **convenience (plug-and-play across machines)**: keys always remain only in an environment you control.
+
+### Transcripts cannot be redacted: you confirm before export
+
+Redaction works by "if the key name looks like a credential, replace its value" — a rule that **does not work on session transcripts**. Whatever you once pasted into a chat (keys, passwords, internal addresses, customer data) sits inside ordinary prose, under no fixed key name; any automatic rule strong enough to remove it would also destroy the content.
+
+So for items confirmed to be verbatim plaintext conversation (currently WorkBuddy's `projects/` event stream and `workspace/sessions/` snapshots), clicking "备份" first shows an **"confirm before export"** dialog stating that the archive will keep the raw conversation text. Only after you acknowledge does it ask where to save; choosing "取消" produces **no file at all** (not even a half-written zip).
+
+> The notice lives on the **item itself** (`BackupItem.pre_export_notice`) and is declared per adapter, from verified observation. Tools whose transcript layout has not been confirmed never show it — an alert that fires everywhere and reads wrong in half the cases just teaches users to dismiss the one that matters.
 
 ### Deep session message long-path fix (Windows)
 

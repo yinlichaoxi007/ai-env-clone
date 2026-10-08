@@ -96,7 +96,12 @@ import os
 import sys
 
 from .. import merge_plan
-from ..core import ORIGIN_NOTE_CONVERSATION, ORIGIN_NOTE_SESSION_DB, BackupItem
+from ..core import (
+    ORIGIN_NOTE_CONVERSATION,
+    ORIGIN_NOTE_SESSION_DB,
+    TRANSCRIPT_PLAINTEXT_NOTE,
+    BackupItem,
+)
 from .base import BaseAdapter, register
 
 
@@ -190,6 +195,7 @@ def build_items(root: str | None = None, wb_home: str | None = None) -> list[Bac
                         "function_call / function_call_result 等）。真正的对话内容，核心数据，默认勾选。",
             recommended=True,
             carries_origin=ORIGIN_NOTE_CONVERSATION,
+            pre_export_notice=TRANSCRIPT_PLAINTEXT_NOTE,
         )
     )
 
@@ -203,6 +209,7 @@ def build_items(root: str | None = None, wb_home: str | None = None) -> list[Bac
             description="会话运行期在会话工作区内落盘的文件快照（用于会话内文件回溯）。默认勾选。",
             recommended=True,
             carries_origin=ORIGIN_NOTE_CONVERSATION,
+            pre_export_notice=TRANSCRIPT_PLAINTEXT_NOTE,
         )
     )
 
@@ -595,8 +602,9 @@ class WorkBuddyAdapter(BaseAdapter):
 
         ⚠️ ``projects/**/*.jsonl`` 是**明文逐条对话**，用户可能在对话里粘贴过密钥、
         口令、内网地址、客户数据 —— 这类内容**无法靠字段名脱敏**（键名不固定，且就
-        藏在普通正文里），故不在本清单内。导出前应让用户明确知情：会话转录包含全部
-        对话原文。
+        藏在普通正文里），故不在本清单内。改由条目的 ``pre_export_notice`` 在**导出前**
+        向用户明示并取得确认（见 :func:`core.pre_export_notices`，GUI 在 ``on_export``
+        里 gating）：知情的是用户，能决定的也只有用户。
         """
         return [
             "models.json",
