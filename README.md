@@ -233,9 +233,10 @@ python -m ai_env_clone inspect --package D:\wb.zip   # 只读：包里有什么
 python -m ai_env_clone restore --tool workbuddy --package D:\wb.zip
 ```
 
-- `backup` 缺省按**完整备份口径**（= GUI 的默认勾选项）；`--items session_db,projects` 只取其中几项（可写聚合前缀或完整项名）；`--root` 显式指定数据目录，`--uid` 指定登录用户标识。
+- `backup` 缺省按**完整备份口径**（= GUI 的默认勾选项）；`--items session_db,projects` 只取其中几项（可写聚合前缀或完整项名）；`--root` 显式指定数据目录，`--uid` 指定登录用户标识；`--max-mb` 单个文件体积上限（默认 200MB，`0` = 不限制；超限的单个文件跳过并计入「已跳过」提示，关键数据文件不受上限约束），`--compress-level 0-9` 压缩级别（默认 6，`0` 只归档不压缩）。
 - **写盘前必须显式 `--yes`**：备份含「无法脱敏的对话原文」的条目，以及任何 `restore`。没加时只打印将要做什么，以退出码 `2` 结束、一个文件都不写——CLI 不允许比 GUI 少任何一道闸门（导出脱敏、还原路径改写 / 索引合并、「包必须属于本工具」的识别全都照常执行）。
-- `restore` 缺省「合并」（不支持合并的工具自动改全覆盖），`--mode merge|replace` 可显式指定；覆盖前默认生成回滚快照，`--no-rollback` 关闭。
+- `restore` 缺省「合并」（不支持合并的工具自动改全覆盖），`--mode merge|replace` 可显式指定；覆盖前默认生成回滚快照，`--no-rollback` 关闭，`--rollback-dir` 改存放目录（默认为 `<程序目录>/backup/<工具名>/`，不受 `--out` 影响）。
+- `--strict`：**即使包里带清单也强制做一次结构指纹校验**。清单是导出时自写的「包内有什么」，可信但不等于结构对得上；指纹校验走的是识别层（`match_structure`），能更早发现「包属于本工具但形态是旧版 / 被改过」这类情况。校验不过即失败退出，不写盘。
 - 退出码：`0` 成功 / `1` 失败 / `2` 用法错误或未确认而中止。
 - 请在**源码模式**下使用：打包版是「无控制台窗口」的 exe，`sys.stdout` 为 `None`，此时子命令直接失败退出而不闷头执行。
 
@@ -247,7 +248,7 @@ from ai_env_clone.core import export_backup, import_backup
 
 ### 备份包说明
 
-- 备份产物是一个标准 `.zip` 文件，文件名形如 `<工具名>_backup_<时间戳>.zip`（例如 `qoder_backup_20260805_095519.zip`）。包内含 `<工具名>_backup_manifest.json` 清单，记录 `kind`（类型）、`tool`（工具名）、`created_at`（创建时间）、`source_root`（来源目录）、`items`（包含模块）、`origin_info`（该包携带的源设备信息，见「携带源设备信息」一节）、文件数等。
+- 备份产物是一个标准 `.zip` 文件，文件名形如 `<工具名>_backup_<时间戳>.zip`（例如 `qoder_backup_20260805_095519.zip`）。包内含 **固定名**清单 `ai_env_clone_manifest.json`（不随工具名变，便于「备份浏览器」不解压就能按名读到），记录 `version`、`kind`（类型）、`tool`（工具名）、`created_at`（创建时间）、`source_root`（来源目录）、`platform`、`items`（包含模块）、`origin_info`（该包携带的源设备信息，见「携带源设备信息」一节）、`file_count` / `total_bytes`、`skipped_count` / `skipped_bytes`（被排除与超大的文件），以及按扩展名分组的源/压缩后字节数；写失败的成员另记入 `failed`。
 - 在「备份浏览器」（点「还原备份包」打开）中可查看明细、校验完整性、选择还原。校验结果会显示在列表「完整性」列，切换选择后仍可见。
 - 恢复确认框提供**还原方式二选一**：**增量合并**（默认，仅 CodeBuddy / DSH / Reasonix / WorkBuddy 提供）或**全覆盖**。「全覆盖」在覆盖前于 `backup/<工具名>/` 生成 `<工具名>_rollback_<时间戳>.zip` 回滚快照，可随时还原到覆盖前状态；「合并」先算后写，失败同样**整体回滚**。备份默认导出到同一目录。
 - **备份目录位置**：与启动方式同级。
@@ -477,12 +478,19 @@ ai_env_clone/                包（import 名 ai_env_clone，产品名 AiEnvClon
 ├── cli.py             命令行子命令 tools/inspect/backup/restore（与 GUI 共用同一套适配器与核心规则：导出脱敏、还原改写照常执行，不可脱敏内容与还原写盘都要显式 --yes；不依赖 tkinter）
 ├── __main__.py        图形界面层（tkinter），统一入口，负责交互与进度展示
 ├── core.py            通用核心层（扫描/打包/校验/恢复/SQLite快照/ZipSlip防护），与具体工具解耦
+├── backup_scan.py     备份包目录的递归扫描与「所属工具」识别（不依赖 tkinter，便于单测）
+├── archive_source.py  把备份包当「只读的假数据目录」：按需解出会话子树，复用既有会话导入链路
 ├── compress_estimate.py  压缩体积预估（经验系数 + 可校准缓存）
 ├── import_matrix.py   跨软件「数据导入」能力矩阵（目标工具 ← 来源软件 + 版本 + 数据范围 + 状态）
 ├── session_migration.py  跨软件会话迁移（各工具原生格式的解析 / 原生写出，含来源扫描）
 ├── workspace_plan.py  导入落点自动判定（工作区派生规则 / 工具默认落点 / 手动覆盖与创建确认）
+├── merge_plan.py      还原「增量合并」的纯计算层（逐成员策略 replace/merge/keep_local；不依赖 tkinter）
+├── redact.py          导出脱敏的共享文本工具（键名像凭证的值→占位符，引用型键名原样保留；DSH / Reasonix / ZCode 复用，CodeBuddy / Qoder / WorkBuddy 暂各保持现状）
 ├── dsh_repair.py      DSH 旧会话「未分组/无法加载」检测与修复（纯标准库，CLI 可用；含会话文件内容修复）
 ├── workbuddy_repair.py WorkBuddy 会话索引检测与修复（纯标准库：归属 / 未登记 / 工作区缺行 / 陈旧侧栏快照；写库前备份并取写锁）
+├── subagent_relink.py  把「旧版导入留在 DSH 里的顶层子代理会话」修成 DSH 原生子代理会话（检测 + 修复，纯标准库）
+├── qoder_memory_convert.py Qoder 旧明文记忆 → 新版 ``memory/*.md`` 的一次性转换器（独立功能，默认 dry-run）
+├── elevate.py          更新替换的提权重试（仅打包版 Windows、需用户显式点击；系统调用收在模块级小函数里便于打桩）
 ├── adapters/
 │   ├── base.py        BaseAdapter 抽象接口 + 适配器注册表
 │   ├── qoder.py       Qoder 适配器（参考实现，自包含；覆盖三处数据面：旧代 ~/.qoder-cn 与 CLI/Agent 新族、桌面端 main.sqlite、本地工作区；含历史不可见诊断）
@@ -787,9 +795,10 @@ python -m ai_env_clone inspect --package D:\wb.zip   # read-only: what is inside
 python -m ai_env_clone restore --tool workbuddy --package D:\wb.zip
 ```
 
-- `backup` defaults to the **full-backup scope** (= the GUI's default ticks); `--items session_db,projects` narrows it down (aggregate prefix or full item key), `--root` sets the data directory explicitly, `--uid` the logged-in user id.
+- `backup` defaults to the **full-backup scope** (= the GUI's default ticks); `--items session_db,projects` narrows it down (aggregate prefix or full item key), `--root` sets the data directory explicitly, `--uid` the logged-in user id, `--max-mb` the per-file size cap (default 200 MB, `0` = unlimited; an oversized file is skipped and counted under "skipped", while critical data files are exempt), and `--compress-level 0-9` the zip level (default 6; `0` stores without compressing).
 - **Writing requires an explicit `--yes`**: for backups that include items with "un-redactable conversation text", and for every `restore`. Without it the command only prints what it *would* do and exits with code `2`, writing nothing — the CLI is never allowed to be a weaker gate than the GUI (export redaction, restore path rewriting / index merging, and the "package must belong to this tool" check all still run).
-- `restore` defaults to "merge" (tools that cannot merge automatically use full overwrite); override with `--mode merge|replace`. A rollback snapshot is written before overwriting by default; disable with `--no-rollback`.
+- `restore` defaults to "merge" (tools that cannot merge automatically use full overwrite); override with `--mode merge|replace`. A rollback snapshot is written before overwriting by default; disable it with `--no-rollback` or move it with `--rollback-dir` (default `<app dir>/backup/<tool>/`, independent of `--out`).
+- `--strict`: **force a structural fingerprint check even when the archive carries a manifest**. A manifest is what the export wrote about itself — trustworthy as an inventory, but not proof that the *shape* matches. The structural check runs the detection layer (`match_structure`), which catches "belongs to this tool, but is an older / altered layout" earlier. A failed check exits with an error and writes nothing.
 - Exit codes: `0` success / `1` failure / `2` bad usage or declined for lack of confirmation.
 - Use these in **source mode**: the packaged build is a console-less (`--windowed`) exe where `sys.stdout` is `None`, so the subcommands fail immediately instead of running silently.
 
@@ -801,7 +810,7 @@ from ai_env_clone.core import export_backup, import_backup
 
 ### About the backup archive
 
-- A standard `.zip` named `<tool>_backup_<timestamp>.zip`, with a `<tool>_backup_manifest.json` (kind, tool, creation time, source dir, modules, `origin_info` — the source-device info this archive carries, see "Carried Source-Device Info", file count, …).
+- A standard `.zip` named `<tool>_backup_<timestamp>.zip`, containing a **fixed-name** manifest `ai_env_clone_manifest.json` (the name does not vary by tool, so the backup browser can read it by name without extracting): `version`, `kind`, `tool`, creation time, source dir, `platform`, `items`, `origin_info` (the source-device info this archive carries, see "Carried Source-Device Info"), `file_count` / `total_bytes`, `skipped_count` / `skipped_bytes`, plus per-extension source and compressed byte totals. Members that failed to write are recorded under `failed`.
 - Viewable via the "备份浏览器" (open from "还原备份包"): inspect details, verify integrity, and choose what to restore.
 - The restore confirmation offers a **choice of restore mode**: **incremental merge** (default; only CodeBuddy / DSH / Reasonix / WorkBuddy offer it) or **full overwrite**. "Full overwrite" auto-creates a `<tool>_rollback_<timestamp>.zip` snapshot beforehand in the same `backup/<tool>/` directory so you can revert anytime; "merge" computes first and writes later, rolling back **as a whole** on failure. Type is verified against the manifest to prevent accidental restore of a misnamed file. Backups are exported to the same directory by default.
 - **Backup directory location**: next to the launch method. Source mode (`python -m ai_env_clone` / `run.bat`) → `<repo root>/backup/<tool>/`. Packaged mode (single-file exe / app / binary) → the executable is a standalone distributable, so backups go to `backup/<tool>/` **next to the exe** (e.g. `dist/backup/qoder/`), keeping the program and its data together. Re-packaging (`build_exe.py` / `build.bat`) only overwrites the exe itself and never clears the `backup/` subfolder, so backups are safe.
@@ -1026,21 +1035,35 @@ ai_env_clone/                package (import name ai_env_clone, product name AiE
 ├── cli.py             CLI subcommands tools/inspect/backup/restore (same adapters and core rules as the GUI: export redaction and restore rewriting still apply; un-redactable content and any restore need an explicit --yes; no tkinter dependency)
 ├── __main__.py        GUI layer (tkinter), unified entry point, interaction & progress
 ├── core.py            generic core (scan / pack / verify / restore / SQLite snapshot / Zip Slip guard), tool-agnostic
+├── backup_scan.py     recursive scan of the backup directory + "which tool owns this archive" detection (tkinter-free, unit-testable)
+├── archive_source.py  treats a backup archive as a read-only pseudo data dir (extracts only the needed session subtree, reuses the existing import chain)
 ├── compress_estimate.py  compressed-size estimation (empirical ratios + calibratable cache)
+├── import_matrix.py   cross-tool "import data" capability matrix (target ← source + version + data scope + status)
+├── session_migration.py  cross-tool session migration (parsers / native writers per tool, incl. source scanning)
+├── workspace_plan.py  automatic import destination (workspace derivation rules / tool default destination / manual override and creation confirmation)
+├── merge_plan.py      pure computation for incremental-merge restore (per-member strategy replace/merge/keep_local; tkinter-free)
+├── redact.py          shared text redaction for export (credential-looking keys → placeholder, reference-style keys kept as-is; used by DSH / Reasonix / ZCode, while CodeBuddy / Qoder / WorkBuddy keep their own behaviour for now)
 ├── dsh_repair.py         DSH legacy-session "ungrouped/unloadable" detect & repair (stdlib-only, CLI-capable; includes session-file content repair)
 ├── workbuddy_repair.py   WorkBuddy session-index detect & repair (stdlib-only: wrong owner / unregistered rows / missing workspaces / stale sidebar snapshot; backs up and locks the DB before writing)
+├── subagent_relink.py    Repairs "top-level subagent sessions left in DSH by older imports" into DSH-native subagent sessions (detect & repair, stdlib-only)
+├── qoder_memory_convert.py One-off converter: Qoder legacy plaintext memory → new ``memory/*.md`` format (standalone feature, dry-run by default)
+├── elevate.py            Elevation retry for update replacement (packaged Windows only, requires an explicit user click; syscalls wrapped in module-level stubs)
 ├── adapters/
 │   ├── base.py        BaseAdapter interface + adapter registry
-│   ├── qoder.py       Qoder adapter (reference implementation, self-contained)
-│   └── codebuddy.py   CodeBuddy adapter (user-level & global data, common root = user home)
-│   └── reasonix.py    Reasonix adapter (config/data under AppData/Roaming/reasonix, cache under AppData/Local/reasonix)
-│   └── dsh.py         DeepSeek Harness adapter (data under ~/.dsh: session logs / storage indexes / user global instructions)
+│   ├── qoder.py       Qoder adapter (reference implementation, self-contained; covers three data planes: legacy ~/.qoder-cn plus the CLI/Agent family, desktop main.sqlite, local workspaces; incl. "history invisible" diagnosis)
+│   ├── codebuddy.py   CodeBuddy adapter (user-level & global data, common root = user home)
+│   ├── reasonix.py    Reasonix adapter (config/data under AppData/Roaming/reasonix, cache under AppData/Local/reasonix)
+│   ├── dsh.py         DeepSeek Harness adapter (data under ~/.dsh: session logs / storage indexes / user global instructions)
+│   ├── workbuddy.py   WorkBuddy adapter (data under ~/.workbuddy: session event streams / memory profiles & local MEMORY.md / personas / custom models)
+│   ├── trae_cn.py     Trae CN adapter (family-wide implementation, incl. the "not backed up" list)
+│   ├── trae_solo_cn.py  TraeWork CN adapter (reuses the Trae family implementation, incl. sandbox VM notes)
+│   └── zcode.py       ZCode adapter (covers both the new .zcode/cli and legacy .zcode/v2 desktop layout, incl. HOME-mismatch cases)
 └── backup/            backup/restore execution & rollback snapshots
 build_exe.py           package into cross-platform executables via PyInstaller (Windows / macOS arm64 / macOS x86_64 / Linux)
 .github/workflows/     build-release.yml (tag → auto-build multi-platform binaries, publish GitHub Release & sync it to Gitee) + sync-gitee.yml (manual re-upload of release assets to Gitee) + mirror-to-gitee.yml (mirror code & tags to Gitee)
 ```
 
-**Multi-tool**: a unified adapter interface (`detect_root()` / `detect_data_roots()` / `build_items()` / `export()` / `restore()`). Each AI tool maps to one adapter module; adding a tool never touches the main flow. See `docs/CONTRIBUTING.md`.
+**Multi-tool**: a unified adapter interface (`detect_root()` / `detect_data_roots()` / `build_items()` / `export()` / `restore()`). Each AI tool maps to one adapter module; adding a tool never touches the main flow. See `docs/CONTRIBUTING.md`. Cross-tool "session import" capability is declared centrally in `import_matrix.py`, with parsing / native writing in `session_migration.py`; supporting one more importable source means adding one parser and registering it in the matrix.
 
 ## Testing
 

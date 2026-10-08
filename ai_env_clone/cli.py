@@ -429,7 +429,8 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--root", help="还原目标；缺省为本工具探测结果")
     pr.add_argument("--mode", choices=[RESTORE_MODE_MERGE, RESTORE_MODE_REPLACE],
                     help="还原方式；缺省为「合并」（不支持合并的工具自动用全覆盖）")
-    pr.add_argument("--rollback-dir", help="回滚快照存放目录（默认与备份包同目录）")
+    pr.add_argument("--rollback-dir", help="回滚快照存放目录（缺省 <程序目录>/backup/<工具名>/，"
+                                          "不随 --out 变）")
     pr.add_argument("--no-rollback", action="store_true",
                     help="不生成回滚快照（覆盖前不备份旧文件）")
     pr.add_argument("--strict", action="store_true",
