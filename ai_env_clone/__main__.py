@@ -994,13 +994,22 @@ class QoderBackupApp:
             diag_row, text="检测历史会话", command=self._qoder_diag, width=14
         )
         self.qoder_diag_btn.pack(side=tk.LEFT)
+        # 旧版明文记忆 → 新版 md 的一次性转换（独立功能，不属于备份适配器）：
+        # 产品换代会话时没回填记忆，本机实测 1043 条仍是明文，只有本工具能转
+        # （见 ai_env_clone/qoder_memory_convert.py 的模块说明）。
+        self.qoder_convert_btn = ttk.Button(
+            diag_row, text="转换旧版记忆…", command=self._memory_convert, width=14
+        )
+        self.qoder_convert_btn.pack(side=tk.LEFT, padx=(6, 0))
         # 说明文字另起一行：原先与按钮挤在同一行时整行请求宽达 1016px（可视仅 939），
         # 于是内容区常年出现横向滚动条、右侧被挤出可视区；且每次切换工具宽度都要在
         # 「够/不够」之间反复，白多刷一遍整屏。独立成行后按宽度自动折行。
         qoder_hint = ttk.Label(
             self.qoder_diag_frame,
             text="诊断「新版导入数据后仍看不到历史会话」：对比新旧两处数据根"
-            "（新版 main.sqlite / 旧版 local.db）与导入账本，给出成因结论",
+            "（新版 main.sqlite / 旧版 local.db）与导入账本，给出成因结论；"
+            "「转换旧版记忆」把旧版明文记忆转成新版可读的 markdown（先看计划、确认后才写盘，"
+            "同名一律跳过不覆盖）",
             foreground="#666", anchor="w", justify="left", wraplength=760,
         )
         qoder_hint.pack(fill=tk.X, pady=(4, 0))
@@ -2870,6 +2879,10 @@ class QoderBackupApp:
             text,
         )
         self._set_status("Qoder 历史会话诊断完成")
+
+    def _memory_convert(self) -> None:
+        """打开「转换旧版记忆」对话框（Qoder 明文记忆 → 新版 md / CodeBuddy .mdc）。"""
+        MemoryConvertDialog(self)
 
     def _set_dsh_buttons_state(self) -> None:
         """数据目录有效时启用检测按钮；修复按钮另需「存在可修复项」才启用。
@@ -6232,6 +6245,473 @@ class MigrateDialog:
             if self.warns:
                 detail += "\n\n附带提示：\n" + "\n".join("· " + w for w in self.warns)
             messagebox.showerror("导入失败", detail, parent=self.win)
+
+
+#: 「转换旧版记忆」的两个导出目标（取值与 CLI 的 ``--target`` 完全一致）。
+MEMORY_TARGET_QODER = "qoder"
+MEMORY_TARGET_CODEBUDDY = "codebuddy"
+
+
+def memory_convert_target_options() -> list[tuple[str, str, str]]:
+    """导出目标单选项 ``[(value, label, description), ...]``（纯函数，文案可单测）。"""
+    return [
+        (MEMORY_TARGET_QODER, "写回 Qoder 新版记忆",
+         "落到「落点数据根」下的 memories/<记忆归属用户 UID>/…，Qoder 新版直接读取"),
+        (MEMORY_TARGET_CODEBUDDY, "导出为 CodeBuddy 用户级 .mdc",
+         "落到「CodeBuddy 的 .memories 目录」，跨工具迁移，不动 Qoder 自己的数据"),
+    ]
+
+
+def memory_convert_layout_options() -> list[tuple[str, str, str]]:
+    """落点布局单选项（纯函数）。仅「写回 Qoder」时有意义：CodeBuddy 的 .mdc 是平铺的。"""
+    return [
+        ("legacy", "产品已证实可见的布局（推荐）",
+         "memories/<UID>/{global,projects/<项目 key>}/<分类>/<标题>.md —— "
+         "逐字段对照产品自己转出的真实样本"),
+        ("new", "要点文档设想的布局",
+         "memory/<分类>/<标题>.md 与 projects/<项目 key>/memory/… —— 产品是否会读取尚未实测证实"),
+    ]
+
+
+def memory_convert_confirm_text(plan, dest_line: str) -> tuple[str, str]:
+    """「确认写盘」弹窗的 ``(标题, 正文)``（纯函数）。
+
+    正文必须把「只新建、不覆盖」与**回退方式**说清楚：这个功能改的是产品的磁盘数据，
+    用户点下去之前要能看到自己会得到什么、失去什么。
+    """
+    return (
+        "确认转换旧版记忆（写盘）",
+        "即将按上面的计划写盘：\n\n"
+        "· 新建 %d 个文件\n"
+        "· 已存在并跳过 %d 个（合并不覆盖，绝不改写既有记忆）\n"
+        "%s\n\n"
+        "写下的全部是**新文件**，删掉它们即可完全回退。是否继续？"
+        % (plan.to_create, plan.existing, dest_line),
+    )
+
+
+class MemoryConvertDialog:
+    """「转换旧版记忆」对话框：Qoder 旧版明文记忆 → 新版 markdown（或 CodeBuddy ``.mdc``）。
+
+    与 CLI（``python -m ai_env_clone.qoder_memory_convert``）共用同一套核心
+    :mod:`ai_env_clone.qoder_memory_convert`，因此界面也必须守住那条底线：
+    **先出 dry-run 计划 → 用户确认 → 才写盘**，写盘**只新建、绝不覆盖**。打开对话框
+    本身不产生任何写入（连读库都要用户点「生成计划」才开始）。
+
+    为什么值得单独做一个入口：产品换代会话时没有回填旧记忆，旧库里两张表仍是明文，
+    产品自带的导入认不到它们——这是本工具相对产品能拉开差距的功能（见该模块 docstring）。
+
+    ⚠️ 落点必须带「记忆归属用户 UID」：写到 ``memories/unknown/`` 产品读不到，白写一场，
+    所以 UID 为空时直接拦住并说明原因，不静默落一个没人看的目录。
+
+    读上千行 sqlite、写上千个小文件都会卡界面，两步都放后台线程，结果经本对话框自有
+    队列 + ``win.after`` 回主线程渲染（与 :class:`MigrateDialog` 同构）。
+    """
+
+    def __init__(self, app: "QoderBackupApp") -> None:
+        from ai_env_clone.adapters import codebuddy as cb_adapter
+        from ai_env_clone.adapters import qoder as qoder_adapter
+
+        self.app = app
+        base = app.root_dir or os.path.expanduser("~")
+        paths = qoder_adapter.detect_qoder_root(os.path.join(base, ".qoder-cn"))
+        uids = qoder_adapter.detect_memory_uids(paths.root, paths.shared)
+        #: 默认 UID：主界面「当前用户」下拉选中的算素 > 适配器自动检测 > 探测到的第一个
+        chosen = (app.uid_var.get() or "").strip()
+        if chosen and getattr(app, "_uid_short_map", None):
+            chosen = app._uid_short_map.get(chosen, chosen)
+        default_uid = (chosen
+                       or getattr(app.adapter, "last_detected_uid", None)
+                       or qoder_adapter.detect_current_uid(paths.root, paths.shared)
+                       or (uids[0] if uids else ""))
+
+        self._queue: queue.Queue = queue.Queue()
+        self._plan = None
+        self._running = False
+        #: 轮询用的 ``after`` 句柄：关窗时必须撤销，否则 Tk 还会去调已销毁窗口的
+        #: 回调（主窗口同一套做法，见 ``_cancel_after``；残留会打出 bgerror 噪音）。
+        self._after_id = None
+
+        self.win = tk.Toplevel(app.root)
+        self.win.title("转换旧版记忆 → 新版 markdown")
+        _clamp_dialog_size(self.win, 820, 660)
+        self.win.transient(app.root)
+        # 点标题栏的 ✕ 也必须走 _on_close（撤掉待触发的轮询 after）
+        self.win.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.win.rowconfigure(0, weight=1, minsize=0)
+        self.win.columnconfigure(0, weight=1)
+        self._scroll = _ScrollBody(self.win, row=0, column=0)
+        self.body = self._scroll.frame
+        for _seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.win.bind(_seq, self._scroll.wheel)
+        self._build(paths, cb_adapter.detect_public_memories_root(),
+                    uids, default_uid)
+        self._on_target_change()
+        self._scroll.sync()
+
+    # ---------------------------------------------------------------- UI --
+    def _build(self, paths, cb_memories: str,
+               uids: "list[str]", default_uid: str) -> None:
+        self.db_var = tk.StringVar(
+            value=os.path.join(paths.shared, "cache", "db", "local.db"))
+        self.home_var = tk.StringVar(value=paths.root)
+        self.cb_mem_var = tk.StringVar(value=cb_memories)
+        tip = ttk.Label(
+            self.body, justify="left", anchor="w", wraplength=740,
+            text="Qoder 换代会话时没有回填旧版记忆：旧库的 agent_memory / lingma_memory "
+                 "两张表仍是明文，产品自带的导入认不到。本对话框把它们转成新版读取的"
+                 "markdown。\n默认只生成计划、不写盘；写盘只新建文件，同名一律跳过。")
+        tip.pack(fill=tk.X, padx=12, pady=(12, 6))
+
+        loc = ttk.LabelFrame(self.body, text="数据位置")
+        loc.pack(fill=tk.X, padx=12, pady=(4, 6))
+        self.db_row = self._path_row(loc, "旧版会话库 local.db", self.db_var,
+                                     self._pick_db)
+        self.home_row = self._path_row(loc, "落点数据根（Qoder）", self.home_var,
+                                       self._pick_home)
+        self.cb_row = self._path_row(loc, "CodeBuddy 的 .memories 目录",
+                                     self.cb_mem_var, self._pick_cb)
+
+        opt = ttk.LabelFrame(self.body, text="转换选项")
+        opt.pack(fill=tk.X, padx=12, pady=6)
+        self.box_target = ttk.Frame(opt)
+        self.box_target.pack(fill=tk.X)
+        ttk.Label(self.box_target, text="导出目标：").pack(anchor="w", pady=(6, 0))
+        self.target_var = tk.StringVar(value=MEMORY_TARGET_QODER)
+        for value, label, desc in memory_convert_target_options():
+            row = ttk.Frame(self.box_target)
+            row.pack(fill=tk.X, padx=8)
+            ttk.Radiobutton(row, text=label, value=value,
+                            variable=self.target_var,
+                            command=self._on_target_change).pack(anchor="w")
+            ttk.Label(row, text=desc, justify="left", anchor="w", wraplength=700,
+                      foreground="#555555").pack(anchor="w", padx=(22, 0))
+        # 「落点布局」与「记忆归属用户 UID」只对写回 Qoder 有意义：CodeBuddy 的 .mdc
+        # 是平铺文件、也不按 UID 分目录。整组收起而不是置灰——置灰会被读成
+        # 「本来能选，只是现在不能点」。
+        self.box_layout = ttk.Frame(opt)
+        self.box_layout.pack(fill=tk.X)
+        ttk.Label(self.box_layout, text="落点布局：").pack(anchor="w", pady=(6, 0))
+        self.layout_var = tk.StringVar(value="legacy")
+        for value, label, desc in memory_convert_layout_options():
+            row = ttk.Frame(self.box_layout)
+            row.pack(fill=tk.X, padx=8)
+            ttk.Radiobutton(row, text=label, value=value,
+                            variable=self.layout_var).pack(anchor="w")
+            ttk.Label(row, text=desc, justify="left", anchor="w", wraplength=700,
+                      foreground="#555555").pack(anchor="w", padx=(22, 0))
+        self.box_uid = ttk.Frame(opt)
+        self.box_uid.pack(fill=tk.X)
+        uid_row = ttk.Frame(self.box_uid)
+        uid_row.pack(fill=tk.X, padx=8, pady=(8, 2))
+        ttk.Label(uid_row, text="记忆归属用户 UID：").pack(side=tk.LEFT)
+        self.uid_var = tk.StringVar(value=default_uid or "")
+        self.uid_combo = ttk.Combobox(uid_row, textvariable=self.uid_var,
+                                      values=uids, width=40, state="readonly")
+        self.uid_combo.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(
+            self.box_uid, text="默认取当前登录用户；写到别的 UID 目录下产品不会显示那些记忆。",
+            foreground="#666", anchor="w", justify="left",
+            wraplength=740).pack(fill=tk.X, padx=8)
+        self.box_lingma = ttk.Frame(opt)
+        self.box_lingma.pack(fill=tk.X)
+        self.lingma_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.box_lingma, text="并入更老一代的 lingma_memory 表",
+                        variable=self.lingma_var).pack(anchor="w", padx=8, pady=(4, 0))
+        self.box_scope = ttk.Frame(opt)
+        self.box_scope.pack(fill=tk.X)
+        scope_row = ttk.Frame(self.box_scope)
+        scope_row.pack(fill=tk.X, padx=8, pady=(4, 4))
+        ttk.Label(scope_row, text="只转该工作区前缀：").pack(side=tk.LEFT)
+        self.scope_var = tk.StringVar(value="")
+        ttk.Entry(scope_row, textvariable=self.scope_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(
+            self.box_scope,
+            text="前缀留空＝全量转换；填工程目录（如 D:\\demo）则只把属于该工作区的"
+                 "记忆转写，全局记忆不受影响。",
+            foreground="#666", anchor="w", justify="left",
+            wraplength=740).pack(fill=tk.X, padx=8, pady=(0, 8))
+
+        out_frame = ttk.LabelFrame(self.body, text="计划 / 结果")
+        out_frame.pack(fill=tk.X, padx=12, pady=(6, 10))
+        self.out = tk.Text(out_frame, height=10, wrap="word", relief="flat",
+                           padx=10, pady=8, bg="white", fg="black", font=("", 10))
+        out_bar = ttk.Scrollbar(out_frame, orient="vertical", command=self.out.yview)
+        self.out.configure(yscrollcommand=out_bar.set)
+        out_bar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.out.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.out.configure(state="disabled", takefocus=0)
+        self._write_output(["点「生成计划」查看会转哪些文件（此步不写盘）。"])
+
+        act = ttk.Frame(self.win)
+        act.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+        ttk.Button(act, text="关闭", width=8, command=self._on_close).pack(
+            side=tk.RIGHT)
+        self.apply_btn = ttk.Button(act, text="执行转换（写盘）", width=16,
+                                    command=self._apply, state="disabled")
+        self.apply_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.gen_btn = ttk.Button(act, text="生成计划", width=12,
+                                  command=self._gen_plan)
+        self.gen_btn.pack(side=tk.LEFT)
+        self.status_lbl = ttk.Label(act, text="", foreground="#666")
+        self.status_lbl.pack(side=tk.LEFT, padx=10)
+
+    def _path_row(self, parent, label: str, var: tk.StringVar,
+                  picker) -> ttk.Frame:
+        """一行「标签 + 路径输入框 + 选择…」，返回该行的 Frame（供整行收起）。"""
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, padx=8, pady=3)
+        ttk.Label(row, text=label, width=24, anchor="w").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(row, text="选择…", width=8,
+                   command=picker).pack(side=tk.LEFT, padx=(4, 0))
+        return row
+
+    def _pick_db(self) -> None:
+        d = filedialog.askopenfilename(
+            title="选择旧版会话库", initialdir=os.path.dirname(self.db_var.get()),
+            filetypes=[("SQLite 库", "*.db"), ("全部文件", "*.*")])
+        if d:
+            self.db_var.set(d)
+
+    def _pick_home(self) -> None:
+        d = filedialog.askdirectory(title="选择 Qoder 数据根目录",
+                                    initialdir=self.home_var.get())
+        if d:
+            self.home_var.set(d)
+
+    def _pick_cb(self) -> None:
+        d = filedialog.askdirectory(title="选择 CodeBuddy 的用户级记忆目录",
+                                    initialdir=self.cb_mem_var.get())
+        if d:
+            self.cb_mem_var.set(d)
+
+    def _on_target_change(self) -> None:
+        """按导出目标收放互斥的行：布局/UID/数据根只对写回 Qoder 有意义，
+        ``.memories`` 目录只对 CodeBuddy 有意义。
+
+        重新显示一律带 ``after=`` 锚点：不带锚点时 pack 会把该行排到父容器的
+        **最末尾**，切换一次目标就把「落点布局」甩到了说明文字下面。
+        """
+        is_qoder = self.target_var.get() == MEMORY_TARGET_QODER
+        if is_qoder:
+            self.box_layout.pack(fill=tk.X, after=self.box_target)
+            self.box_uid.pack(fill=tk.X, after=self.box_layout)
+            self.box_lingma.pack(fill=tk.X, after=self.box_uid)
+            self.home_row.pack(fill=tk.X, padx=8, pady=3, after=self.db_row)
+            self.cb_row.pack_forget()
+        else:
+            self.box_layout.pack_forget()
+            self.box_uid.pack_forget()
+            self.box_lingma.pack(fill=tk.X, after=self.box_target)
+            self.home_row.pack_forget()
+            self.cb_row.pack(fill=tk.X, padx=8, pady=3, after=self.db_row)
+        self._scroll.sync()
+
+    # ------------------------------------------------------------ 取参 --
+    def _plan_kwargs(self) -> dict:
+        """把界面选项凑成 :func:`qoder_memory_convert.plan_conversion` 的关键字参数。"""
+        return {
+            "db_path": self.db_var.get().strip(),
+            "qoder_home": self.home_var.get().strip(),
+            "layout": self.layout_var.get(),
+            "uid": self.uid_var.get().strip(),
+            "include_lingma": bool(self.lingma_var.get()),
+            "target": self.target_var.get(),
+            "codebuddy_memories_dir": self.cb_mem_var.get().strip(),
+            "scope_prefix": self.scope_var.get().strip(),
+        }
+
+    def _validate(self) -> "list[str] | None":
+        """写盘前置校验，返回给用户的提示行（``None``＝可以继续）。
+
+        UID 为空必须拦住：落点会变成 ``memories/unknown/``，产品读不到，等于白写。
+        """
+        target = self.target_var.get()
+        if not os.path.isfile(self.db_var.get().strip()):
+            return ["找不到旧版会话库 local.db：%s\n"
+                    "请点「选择…」指到实际文件（标准位置是 "
+                    "<数据根>/shared_client/cache/db/local.db）。"
+                    % self.db_var.get().strip()]
+        if target == MEMORY_TARGET_QODER and not self.uid_var.get().strip():
+            return ["未指定「记忆归属用户 UID」。\n"
+                    "不指定会落到 memories/unknown/，产品读不到那份目录，等于白写。\n"
+                    "请从下拉里选一个 UID（若列表为空，先登录一次 Qoder 再重开本工具）。"]
+        if target == MEMORY_TARGET_CODEBUDDY \
+                and not self.cb_mem_var.get().strip():
+            return ["未指定 CodeBuddy 的 .memories 目录。\n"
+                    "标准位置是 %LOCALAPPDATA%/CodeBuddyExtension/Data/Public/.memories，"
+                    "请点「选择…」指定。"]
+        return None
+
+    def _dest_line(self) -> str:
+        """落点的一行描述（确认弹窗与结果里都要出现，让用户知道文件到底写去哪）。"""
+        if self.target_var.get() == MEMORY_TARGET_CODEBUDDY:
+            return "· 落点：%s" % self.cb_mem_var.get().strip()
+        uid = self.uid_var.get().strip() or "unknown"
+        return "· 落点：%s（布局=%s，UID=%s）" % (
+            os.path.join(self.home_var.get().strip(), "memories", uid),
+            self.layout_var.get(), uid)
+
+    def _schedule_poll(self, delay: int = 120) -> None:
+        self._after_id = self.win.after(delay, self._poll)
+
+    def _cancel_poll(self) -> None:
+        if self._after_id is not None:
+            try:
+                self.win.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+            self._after_id = None
+
+    # ------------------------------------------------------------ 生成 --
+    def _gen_plan(self) -> None:
+        """后台跑 dry-run（不写盘），结果回主线程渲染。"""
+        problems = self._validate()
+        if problems:
+            self._write_output(problems)
+            self._plan = None
+            self._set_apply_state()
+            self.status_lbl.configure(text="未生成计划")
+            return
+        kwargs = self._plan_kwargs()
+        self._set_running(True, "正在生成转换计划（dry-run，不写盘）…")
+
+        def worker() -> None:
+            from ai_env_clone import qoder_memory_convert as qmc
+
+            try:
+                plan = qmc.plan_conversion(**kwargs)
+            except Exception as exc:  # noqa: BLE001
+                self._queue.put(("error", "%s: %s" % (type(exc).__name__, exc)))
+                return
+            self._queue.put(("plan", plan))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._schedule_poll()
+
+    def _show_plan(self, plan) -> None:
+        from ai_env_clone import qoder_memory_convert as qmc
+
+        self._plan = plan
+        self._set_running(False, "计划已生成（未写盘）")
+        lines = plan.summary_lines()
+        lines.append(self._dest_line())
+        lines.append("")
+        lines.append("目标文件（[create]=新建，[exists]=已存在将跳过）：")
+        base = (self.cb_mem_var.get().strip()
+                if plan.target == MEMORY_TARGET_CODEBUDDY
+                else self.home_var.get().strip())
+        lines.extend(qmc.plan_detail_lines(plan, base))
+        if not plan.to_create:
+            lines.append("")
+            lines.append("没有需要新建的文件（全部已存在）→ 无需写盘。")
+        self._write_output(lines)
+        self._set_apply_state()
+
+    def _apply(self) -> None:
+        """确认后才写盘：只新建、绝不覆盖；成功后自动复盘一次计划（此时应全变已存在）。"""
+        plan = self._plan
+        if plan is None or not plan.to_create or self._running:
+            return
+        title, text = memory_convert_confirm_text(plan, self._dest_line())
+        if not self.app._show_plain_report_dialog(title, text, ask=True):
+            self.status_lbl.configure(text="已取消，未写盘")
+            return
+        self._set_running(True, "正在写盘…")
+
+        def worker() -> None:
+            from ai_env_clone import qoder_memory_convert as qmc
+
+            try:
+                result = qmc.apply_conversion(plan)
+            except Exception as exc:  # noqa: BLE001
+                self._queue.put(("error", "%s: %s" % (type(exc).__name__, exc)))
+                return
+            self._queue.put(("result", result))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._schedule_poll()
+
+    def _show_result(self, result: dict) -> None:
+        self._set_running(False, "写盘完成")
+        lines = ["写盘完成：新建 %d，跳过（已存在）%d，失败 %d"
+                 % (result["created"], result["skipped"], len(result["errors"]))]
+        lines += ["· 失败：%s" % e for e in result["errors"][:10]]
+        lines.append("")
+        lines.append("重新打开 Qoder 即可查看转换出的记忆；"
+                     "下列出的都是新文件，删掉即可回退。")
+        self._write_output(lines)
+        self._plan = None
+        self._set_apply_state()
+        if result["created"]:
+            # 复盘一次：同一条记忆再转就应显示「已存在跳过」，这条性质只有真写一遍才验得着。
+            self._gen_plan()
+
+    # ------------------------------------------------------------ 队列 --
+    def _poll(self) -> None:
+        if not self._alive():
+            return
+        while True:
+            try:
+                kind, payload = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "plan":
+                self._show_plan(payload)
+            elif kind == "result":
+                self._show_result(payload)
+            elif kind == "error":
+                self._set_running(False, "操作失败")
+                self._plan = None
+                self._set_apply_state()
+                self._write_output(["转换失败：%s" % payload])
+        if self._running:
+            self._schedule_poll(150)
+
+    def _alive(self) -> bool:
+        try:
+            return bool(self.win.winfo_exists())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _set_running(self, flag: bool, status: str) -> None:
+        self._running = flag
+        try:
+            self.gen_btn.configure(state="disabled" if flag else "normal")
+        except tk.TclError:
+            pass
+        if flag:
+            try:
+                self.apply_btn.configure(state="disabled")
+            except tk.TclError:
+                pass
+        else:
+            self._set_apply_state()
+        self.status_lbl.configure(text=status)
+
+    def _set_apply_state(self) -> None:
+        """「执行转换（写盘）」只在「有一份仍有可新建条目的计划」时可用。"""
+        ok = bool(self._plan) and self._plan.to_create > 0 and not self._running
+        try:
+            self.apply_btn.configure(state="normal" if ok else "disabled")
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------ 输出 --
+    def _write_output(self, lines) -> None:
+        text = lines if isinstance(lines, str) else "\n".join(lines)
+        self.out.configure(state="normal")
+        self.out.delete("1.0", tk.END)
+        self.out.insert("1.0", text)
+        self.out.configure(state="disabled")
+        self.out.yview_moveto(0.0)
+        self._scroll.sync()
+
+    def _on_close(self) -> None:
+        self._cancel_poll()
+        self.win.destroy()
 
 
 #: 链接色：浅底用深蓝、深底用浅蓝。Tk 没有「链接色」这个概念，而**硬编码一种蓝**

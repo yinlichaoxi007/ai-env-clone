@@ -38,6 +38,7 @@ __all__ = [
     "derive_project_key",
     "plan_conversion",
     "apply_conversion",
+    "plan_detail_lines",
 ]
 
 #: 非法文件名字符（Windows 保留集）→ 替换为 ``-``。
@@ -388,6 +389,34 @@ def infer_qoder_home(db_path: str) -> str:
     return home
 
 
+def plan_detail_lines(plan: ConversionPlan, home: str,
+                      limit: int = 20, exists_examples: int = 5) -> "list[str]":
+    """计划条目的可读明细（CLI 与 GUI 共用同一份，避免两处文案漂移）。
+
+    新建条目最多列 ``limit`` 条；``exists``（已存在、将跳过）只取 ``exists_examples``
+    条例外，避免一次全量转换时「跳过」把「新建」挤出可视区。
+    """
+    lines: "list[str]" = []
+    shown = 0
+    for entry in plan.entries:
+        if entry.action != "create" and shown >= exists_examples:
+            continue
+        if shown >= limit:
+            break
+        try:
+            rel = os.path.relpath(entry.target_path, home)
+        except ValueError:                      # 跨盘符（如 Qoder 根在 C:、.memories 在 D:）
+            rel = entry.target_path
+        if rel.startswith(".."):                # 落在 home 之外：相对路径反而更难读
+            rel = entry.target_path
+        lines.append("  [%s] %s ← %s（%s）" % (
+            entry.action, rel, entry.memory.title[:40], entry.memory.source_table))
+        shown += 1
+    if len(plan.entries) > limit:
+        lines.append("  …共 %d 条（其余省略）" % len(plan.entries))
+    return lines
+
+
 def main(argv: "list[str] | None" = None) -> int:
     """CLI：``python -m ai_env_clone.qoder_memory_convert <local.db> [选项]``。
 
@@ -449,17 +478,8 @@ def main(argv: "list[str] | None" = None) -> int:
                            scope_prefix=args.scope_prefix)
     for line in plan.summary_lines():
         print(line)
-    shown = 0
-    for entry in plan.entries:
-        if entry.action != "create" and shown >= 5:
-            continue
-        if shown < 20:
-            print("  [%s] %s ← %s（%s）" % (
-                entry.action, os.path.relpath(entry.target_path, qoder_home),
-                entry.memory.title[:40], entry.memory.source_table))
-            shown += 1
-    if len(plan.entries) > 20:
-        print("  …共 %d 条（其余省略）" % len(plan.entries))
+    for line in plan_detail_lines(plan, qoder_home):
+        print(line)
     if not args.apply:
         print("\ndry-run 未写盘；确认无误后加 --apply 执行（合并不覆盖）。")
         return 0
