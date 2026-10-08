@@ -69,6 +69,15 @@ _rc = handle_update_flags(sys.argv[1:])
 if _rc is not None:
     raise SystemExit(_rc)
 
+# 备份 / 还原的命令行子命令（``tools`` / ``inspect`` / ``backup`` / ``restore``）也排在
+# ``import tkinter`` 之前：脚本与没装 tkinter 的环境要能驱动同一套逻辑（见 cli 模块
+# docstring）。未命中子命令时返回 None，裸 ``python -m ai_env_clone`` 照旧启动界面。
+from ai_env_clone.cli import handle_backup_restore_flags  # noqa: E402
+
+_rc = handle_backup_restore_flags(sys.argv[1:])
+if _rc is not None:
+    raise SystemExit(_rc)
+
 import tkinter as tk  # noqa: E402 - 必须在版本查询之后导入，见上
 import tkinter.font as tkfont  # noqa: E402
 from tkinter import filedialog, messagebox, scrolledtext, ttk  # noqa: E402
@@ -100,6 +109,7 @@ from ai_env_clone.core import (
     ProgressInfo,
     classify_zip_name,
     companion_notes,
+    human_size,
     import_backup,
     inspect_backup,
     manifest_origin_info,
@@ -319,14 +329,6 @@ class _ScrollBody:
 
 # 无头开关：单元测试置 True 时隐藏备份浏览器子窗口，避免测试闪窗（仅影响测试）。
 HEADLESS = False
-
-
-def human_size(n: float) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return "%.1f %s" % (n, unit)
-        n /= 1024
-    return "%.1f GB" % n
 
 
 # --------------------------------------------------------------------------- #

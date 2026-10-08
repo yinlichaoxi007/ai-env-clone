@@ -39,6 +39,7 @@ __all__ = [
     "ScanResult",
     "ProgressInfo",
     "BackupError",
+    "human_size",
     "MANIFEST_NAME",
     "MANIFEST_VERSION",
     "DEFAULT_EXCLUDES",
@@ -108,6 +109,19 @@ ALWAYS_INCLUDE: tuple[str, ...] = (
     "*/.workbuddy/workbuddy.db-wal",
     "*/.workbuddy/workbuddy.db-shm",
 )
+
+
+def human_size(n: float) -> str:
+    """把字节数写成人类可读的一档单位（``1.5 GB``）。
+
+    放在 core 而不是界面里：GUI 的状态栏、完成提示与命令行输出必须报同一个数、
+    同一种写法，否则用户对照两处会以为是两套统计口径。
+    """
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return "%.1f %s" % (n, unit)
+        n /= 1024
+    return "%.1f GB" % n
 
 
 class BackupError(Exception):

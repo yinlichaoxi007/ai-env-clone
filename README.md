@@ -224,7 +224,22 @@ python -m ai_env_clone --check-update
 
 > 打包版 exe 的「属性 → 详细信息」里是**同一个版本号**——它由 `ai_env_clone/version.py` 生成，与「帮助 → 关于」对话框、`--version` 同源，不会出现「关于里一个号、属性页另一个号」。
 
-备份 / 还原的 CLI 子命令**尚未实现**：当前 `python -m ai_env_clone` 只会启动图形界面，核心逻辑层 `ai_env_clone.core` 已完全解耦，脚本里可直接调用。
+**备份 / 还原的 CLI 子命令**（已可用；不启动界面，同一套适配器与核心逻辑）：
+
+```bash
+python -m ai_env_clone tools                        # 列出支持的工具及数据目录探测结果
+python -m ai_env_clone backup  --tool workbuddy --out D:\wb.zip
+python -m ai_env_clone inspect --package D:\wb.zip   # 只读：包里有什么
+python -m ai_env_clone restore --tool workbuddy --package D:\wb.zip
+```
+
+- `backup` 缺省按**完整备份口径**（= GUI 的默认勾选项）；`--items session_db,projects` 只取其中几项（可写聚合前缀或完整项名）；`--root` 显式指定数据目录，`--uid` 指定登录用户标识。
+- **写盘前必须显式 `--yes`**：备份含「无法脱敏的对话原文」的条目，以及任何 `restore`。没加时只打印将要做什么，以退出码 `2` 结束、一个文件都不写——CLI 不允许比 GUI 少任何一道闸门（导出脱敏、还原路径改写 / 索引合并、「包必须属于本工具」的识别全都照常执行）。
+- `restore` 缺省「合并」（不支持合并的工具自动改全覆盖），`--mode merge|replace` 可显式指定；覆盖前默认生成回滚快照，`--no-rollback` 关闭。
+- 退出码：`0` 成功 / `1` 失败 / `2` 用法错误或未确认而中止。
+- 请在**源码模式**下使用：打包版是「无控制台窗口」的 exe，`sys.stdout` 为 `None`，此时子命令直接失败退出而不闷头执行。
+
+核心逻辑层同样可以直接被脚本调用（无需经过 CLI）：
 
 ```python
 from ai_env_clone.core import export_backup, import_backup
@@ -449,6 +464,7 @@ ai_env_clone/                包（import 名 ai_env_clone，产品名 AiEnvClon
 ├── resources.py       随包资源定位（使用说明、打赏图片等；源码模式读仓库、打包模式读 sys._MEIPASS）
 ├── prefs.py           用户偏好持久化（记住上次工具 + 更新设置；读-改-写，深度合并）
 ├── updater.py         更新检测的只读部分（GitHub→Gitee 降级、版本/资产选择、SHA256SUMS 白名单；不依赖 tkinter）
+├── cli.py             命令行子命令 tools/inspect/backup/restore（与 GUI 共用同一套适配器与核心规则：导出脱敏、还原改写照常执行，不可脱敏内容与还原写盘都要显式 --yes；不依赖 tkinter）
 ├── __main__.py        图形界面层（tkinter），统一入口，负责交互与进度展示
 ├── core.py            通用核心层（扫描/打包/校验/恢复/SQLite快照/ZipSlip防护），与具体工具解耦
 ├── compress_estimate.py  压缩体积预估（经验系数 + 可校准缓存）
@@ -752,7 +768,22 @@ so it is clear whether to change network or proxy. A proxy can be set in
 
 > The packaged `.exe` shows the **same version** under Properties → Details — it is generated from `ai_env_clone/version.py`, the same source as the **Help → About** dialog and `--version`, so they cannot disagree.
 
-Backup / restore CLI subcommands are **not implemented yet**: `python -m ai_env_clone` currently just opens the GUI. The core layer `ai_env_clone.core` is fully decoupled and can be called directly from scripts:
+**Backup / restore CLI subcommands** (available; no GUI is started, and they run the very same adapter and core logic):
+
+```bash
+python -m ai_env_clone tools                        # list supported tools and detected data roots
+python -m ai_env_clone backup  --tool workbuddy --out D:\wb.zip
+python -m ai_env_clone inspect --package D:\wb.zip   # read-only: what is inside the package
+python -m ai_env_clone restore --tool workbuddy --package D:\wb.zip
+```
+
+- `backup` defaults to the **full-backup scope** (= the GUI's default ticks); `--items session_db,projects` narrows it down (aggregate prefix or full item key), `--root` sets the data directory explicitly, `--uid` the logged-in user id.
+- **Writing requires an explicit `--yes`**: for backups that include items with "un-redactable conversation text", and for every `restore`. Without it the command only prints what it *would* do and exits with code `2`, writing nothing — the CLI is never allowed to be a weaker gate than the GUI (export redaction, restore path rewriting / index merging, and the "package must belong to this tool" check all still run).
+- `restore` defaults to "merge" (tools that cannot merge automatically use full overwrite); override with `--mode merge|replace`. A rollback snapshot is written before overwriting by default; disable with `--no-rollback`.
+- Exit codes: `0` success / `1` failure / `2` bad usage or declined for lack of confirmation.
+- Use these in **source mode**: the packaged build is a console-less (`--windowed`) exe where `sys.stdout` is `None`, so the subcommands fail immediately instead of running silently.
+
+The core layer can also be called directly from scripts (without going through the CLI):
 
 ```python
 from ai_env_clone.core import export_backup, import_backup
@@ -972,6 +1003,7 @@ ai_env_clone/                package (import name ai_env_clone, product name AiE
 ├── resources.py       bundled-resource lookup (usage doc, images; repo root in source mode, sys._MEIPASS when packaged)
 ├── prefs.py           user preferences (last tool + update settings; read-modify-write with deep merge)
 ├── updater.py         read-only update discovery (GitHub→Gitee failover, release/asset selection, SHA256SUMS whitelist; tkinter-free)
+├── cli.py             CLI subcommands tools/inspect/backup/restore (same adapters and core rules as the GUI: export redaction and restore rewriting still apply; un-redactable content and any restore need an explicit --yes; no tkinter dependency)
 ├── __main__.py        GUI layer (tkinter), unified entry point, interaction & progress
 ├── core.py            generic core (scan / pack / verify / restore / SQLite snapshot / Zip Slip guard), tool-agnostic
 ├── compress_estimate.py  compressed-size estimation (empirical ratios + calibratable cache)

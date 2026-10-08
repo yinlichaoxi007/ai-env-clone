@@ -223,6 +223,9 @@ __marimo__/
 _full_out.txt
 backups/
 *.backup/
+# GUI 与 CLI 的默认出包目录（<仓库根>/backup/<工具名>/）：整目录都是真实用户数据，
+# 按工具名逐个列 *.zip 的写法会漏（工具名一改就漏），所以整目录豁免。
+backup/
 qoder_rollback_*.zip
 qoder_backup_*.zip
 aienv_rollback_*.zip
