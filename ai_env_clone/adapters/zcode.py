@@ -56,6 +56,7 @@ import json
 import os
 import sys
 
+from .. import redact
 from ..core import BackupItem
 from .base import BaseAdapter, register
 
@@ -226,7 +227,7 @@ def build_items(root: str | None = None, zcode_home: str | None = None) -> list[
         for path, suffix in _sqlite_comp(cli_db):
             items.append(
                 BackupItem(
-                    key="cli_db%s%s" % (suffix, _suffix_for(idx, homes)),
+                    key="cli_db%s%s" % (_suffix_for(idx, homes), suffix),
                     label="CLI 会话库（cli/db/db.sqlite）%s" % tag,
                     path=path,
                     uid=None,
@@ -255,7 +256,7 @@ def build_items(root: str | None = None, zcode_home: str | None = None) -> list[
             for path, suffix in _sqlite_comp(os.path.join(v2, "tasks-index.sqlite")):
                 items.append(
                     BackupItem(
-                        key="v2_tasks%s%s" % (suffix, _suffix_for(idx, homes)),
+                        key="v2_tasks%s%s" % (_suffix_for(idx, homes), suffix),
                         label="旧版桌面任务库（v2/tasks-index.sqlite）%s" % tag,
                         path=path,
                         uid=None,
@@ -330,7 +331,13 @@ def build_items(root: str | None = None, zcode_home: str | None = None) -> list[
 
 
 def _suffix_for(idx: int, homes: list[str]) -> str:
-    """多 ``.zcode`` 根时为 key 追加区分后缀，保证 key 唯一且聚合前缀统一。"""
+    """多 ``.zcode`` 根时为 key 追加区分后缀，保证 key 唯一且聚合前缀统一。
+
+    ⚠️ 拼进 key 时必须放在 ``:wal`` / ``:shm`` 这类**子项后缀之前**
+    （``cli_db@0:wal``，不是 ``cli_db:wal@0``）：界面按 ``key.split(":", 1)[0]``
+    聚合成行，顺序颠倒会让主库落在 ``cli_db@0`` 行、配套文件落到 ``cli_db`` 行——
+    同一处的库被拆成两行，还会把两个数据根的配套文件并进同一行、勾一条误伤两条。
+    """
     return "" if len(homes) <= 1 else "@%d" % idx
 
 
@@ -427,21 +434,24 @@ class ZCodeAdapter(BaseAdapter):
         """凭证与模型配置在导出前脱敏。"""
         return ["credentials.json", "provider_config.json", "config.json"]
 
-    #: 字段名（含 ``oauth:bigmodel:access_token`` 这类复合键）出现这些片段即视为敏感
-    SENSITIVE_HINTS = (
-        "apikey", "api_key", "token", "secret", "password", "passwd",
-        "accesskey", "access_key", "privatekey", "private_key",
-        "credential", "auth", "cookie", "session_key",
-    )
+    #: 字段名（含 ``oauth:bigmodel:access_token`` 这类复合键）的敏感判定，
+    #: 统一走 :mod:`ai_env_clone.redact` 的口径，见 :meth:`_looks_sensitive`。
 
     @staticmethod
     def _looks_sensitive(key: str) -> bool:
-        k = key.lower()
-        return any(hint in k for hint in ZCodeAdapter.SENSITIVE_HINTS)
+        """键名是否像凭证，且不是「引用」。
+
+        为什么不在这里各写一份清单：本适配器原先收录了宽泛的 ``auth``，会把
+        ``author`` 一起误伤；而 ``apiKeyEnv`` 这类**引用**（值是环境变量名）一旦
+        被换成占位符，还原后的配置就指向一个不存在的变量名——模型静默失效，用户
+        完全看不出原因。``redact`` 里那套已按实测收敛（用 ``authorization`` 代替
+        ``auth``，并单独识别引用键），故此处只做转发。
+        """
+        return redact.key_looks_sensitive(key) and not redact.key_is_reference(key)
 
     def export_transform(self) -> "Callable[[str, bytes], bytes] | None":
         """把敏感字段的值替换为占位符 ``***REDACTED***``（非 JSON 原样保留）。"""
-        REDACTED = "***REDACTED***"
+        REDACTED = redact.REDACTED
 
         def _transform(rel_path: str, source: bytes) -> bytes:
             text = source.decode("utf-8", "replace")

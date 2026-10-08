@@ -450,6 +450,16 @@ WorkBuddy（Electron 桌面版，数据根 `~/.workbuddy`）的会话**正文**�
 
 > 该提示挂在**条目自身**上（`BackupItem.pre_export_notice`），由适配器按实测结论声明；没有核实过转录形态的工具不会凭空弹这个框——到处弹、内容又不准的告警，只会让用户更快忽略真正该读的那一次。
 
+### ZCode 多数据根与 TraeWork CN 扩展目录：补测带出的三处修正
+
+给 ZCode 补单元测试时（此前它**一个测试文件都没有**）暴露出三处「功能测试全绿也照不出来」的问题，均已修正并各留回归用例（`tests/test_zcode.py`、`tests/test_trae_cn.py`）：
+
+- **两个 `.zcode` 根的 WAL 配套文件串到别的行**：条目 key 拼成了 `cli_db:wal@0`，而界面按第一个冒号聚合 ⇒ 主库在 `cli_db@0` 行、`-wal`/`-shm` 落到 `cli_db` 行，同一处的库被拆成两行；更糟的是**两个数据根的 `-wal`/`-shm` 前缀相同、并成了同一行**，勾一条会连带另一处。现在统一为 `cli_db@0:wal`：每个数据根的会话库各自成行，配套文件留在本行。
+- **ZCode 的 JSON 脱敏口径与产品规则不一致**：它自带一份含 `auth` 的键名清单，于是 `author` 会被当成凭证抹掉，`apiKeyEnv`（值是环境变量名）也被抹掉——还原后 provider 指向一个不存在的变量名，模型静默失效。现改为复用 `ai_env_clone/redact.py` 的统一口径（凭证判定 + 引用键识别），与上文「引用型键名一律不脱敏」的承诺对齐。
+- **TraeWork CN 状态区不显示实际在用的扩展目录**：本机没有独立 `~/.trae-solo-cn` 时，扩展装在家族共用的 `~/.trae-cn`，备份条目也确实指向后者，但状态区只列 `.trae-solo-cn` 并显示「未找到」，那句「与 Trae CN 共用扩展目录」的标注是永远命中不到的死代码。现在状态区显示**真正被备份的那个目录**并注明共用来源。
+
+> 尚未统一：CodeBuddy / Qoder / WorkBuddy 三个适配器的 JSON 脱敏仍各存一份含 `auth` 的旧清单（同样会误伤 `author`、会抹掉引用键）。改它等于同时缩小这三家的脱敏范围，属产品口径决策，留待确认后再动。
+
 ### 深层会话消息长路径修复（Windows）
 
 部分工具的会话消息文件层级很深（例如 CodeBuddy 的 `history/<ws>/<sid>/messages/<id>.json`），其绝对路径常超过 Windows 的 **260 字符 MAX_PATH** 限制。旧版在扫描/`getsize`/`open` 时因 `WinError 3`（系统找不到指定的路径）**静默丢弃全部 `messages/` 文件**——表现为「历史会话列表看得到、点开却没内容」。**当前版本已对所有文件操作加 `\\?\` 长路径前缀**（`scan_items` 的 `os.walk` 入口目录与 `getsize`、`export_backup` 的 `zf.write`、`import_backup` 全程），深层会话消息可完整备份与还原。其中 `os.walk` 入口目录加前缀尤为关键：未加时超 260 的会话目录根本扫不进去、`scan_items` 直接返回空、导出报"没扫到文件"，比单文件 `getsize` 失败更彻底。
@@ -988,6 +998,16 @@ Redaction works by "if the key name looks like a credential, replace its value" 
 So for items confirmed to be verbatim plaintext conversation (currently WorkBuddy's `projects/` event stream and `workspace/sessions/` snapshots), clicking "备份" first shows an **"confirm before export"** dialog stating that the archive will keep the raw conversation text. Only after you acknowledge does it ask where to save; choosing "取消" produces **no file at all** (not even a half-written zip).
 
 > The notice lives on the **item itself** (`BackupItem.pre_export_notice`) and is declared per adapter, from verified observation. Tools whose transcript layout has not been confirmed never show it — an alert that fires everywhere and reads wrong in half the cases just teaches users to dismiss the one that matters.
+
+### ZCode multi-root rows and TraeWork CN's extension directory: three fixes surfaced by new tests
+
+Writing unit tests for ZCode (it previously had **no test file at all**) exposed three problems that functional testing alone never catches. All three are fixed, each with a regression test (`tests/test_zcode.py`, `tests/test_trae_cn.py`):
+
+- **WAL companions leaked across the two `.zcode` roots**: keys were built as `cli_db:wal@0`, and the UI groups rows by the text before the first colon ⇒ the main DB sat in row `cli_db@0` while `-wal`/`-shm` fell into row `cli_db`, splitting one library across two rows. Worse, **both roots' `-wal`/`-shm` shared the bare `cli_db` prefix and merged into a single row**, so checking one silently checked the other machine location too. Keys are now `cli_db@0:wal`: each root's session library is its own row, companions stay inside it.
+- **ZCode's JSON redaction disagreed with the documented rule**: it carried its own key list containing `auth`, so `author` got wiped as if it were a credential, and `apiKeyEnv` (whose value is an *environment variable name*) too — after a restore the provider points at a variable that does not exist and the model fails silently. It now reuses the single set of rules in `ai_env_clone/redact.py` (credential detection plus reference-key recognition), matching "reference keys are never redacted" above.
+- **TraeWork CN's status area hid the extension directory actually in use**: when this machine has no own `~/.trae-solo-cn`, extensions live in the family-shared `~/.trae-cn` — which is also what the backup items point at — yet the status area only listed `.trae-solo-cn` as "not found", making its "shared with Trae CN" annotation unreachable dead code. The status area now shows **the directory that is really backed up** and says it is shared.
+
+> Not yet unified: the CodeBuddy / Qoder / WorkBuddy adapters still keep their own JSON key lists containing `auth` (same `author` false positive, same reference-key wiping). Changing them narrows those three tools' redaction scope at once, which is a product-policy call — left pending confirmation.
 
 ### Deep session message long-path fix (Windows)
 

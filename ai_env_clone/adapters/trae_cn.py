@@ -450,11 +450,17 @@ def build_family_items(
     return items
 
 
-def family_data_roots(root: str, product: str, product_dir: str, has_vm: bool = False) -> list[dict]:
-    """返回 Trae 家族各数据根目录信息（供 GUI 识别状态区展示）。"""
+def family_data_roots(root: str, product: str, product_dir: str, has_vm: bool = False,
+                      ext_dir: "str | None" = None) -> list[dict]:
+    """返回 Trae 家族各数据根目录信息（供 GUI 识别状态区展示）。
+
+    :param ext_dir: 实际在用的 extensions 目录。默认按 ``product_dir`` 推导；
+        SOLO 形态会回退到家族共用目录，必须把**真正被备份的那一个**传进来，
+        否则状态区显示「``.trae-solo-cn`` 未找到」，而备份条目指向的是共用目录。
+    """
     home = root or _home()
     ud = user_data_dir(product)
-    ext = extensions_dir(product_dir)
+    ext = ext_dir or extensions_dir(product_dir)
 
     # userData 下的会话数备注
     note = ""

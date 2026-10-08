@@ -104,7 +104,8 @@ class TraeSoloCnAdapter(BaseAdapter):
 
     def detect_data_roots(self, root: str | None = None) -> list[dict]:
         """返回 Trae SOLO CN 各数据根目录信息（含沙箱虚拟机备注）。"""
-        roots = family_data_roots(root, TRAE_SOLO_PRODUCT, TRAE_SOLO_PRODUCT_DIR, has_vm=True)
+        roots = family_data_roots(root, TRAE_SOLO_PRODUCT, TRAE_SOLO_PRODUCT_DIR,
+                                  has_vm=True, ext_dir=_solo_ext_dir())
         # 标注扩展目录来源：独立还是与 Trae CN 共用
         own = extensions_dir(TRAE_SOLO_PRODUCT_DIR)
         for r in roots:

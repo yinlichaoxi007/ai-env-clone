@@ -12,14 +12,22 @@
 
 另外覆盖「IDE 工作区记录」条目：Trae 的会话库是产品侧加密的、挖不出路径，
 ``workspaceStorage/*/workspace.json`` 是库外唯一的结构化「工作区 -> 工程路径」线索。
+
+TraeWork CN（安装目录 ``TRAE SOLO CN``）复用家族实现，因此单独测它**替换掉的那三件**：
+扩展目录回退（本机没有 ``.trae-solo-cn`` 时共用 ``.trae-cn``）、沙箱虚拟机 ``vm/``
+不列入备份、以及结构指纹必须把同族两个形态分清（否则拿 TraeCode CN 的包能往
+TraeWork CN 上还原）。
 """
 
 import os
+import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from ai_env_clone.adapters import get_adapter, list_adapters
 from ai_env_clone.adapters import trae_cn as tc
+from ai_env_clone.adapters import trae_solo_cn as ts
 
 
 def _agg(key: str) -> str:
@@ -180,6 +188,134 @@ class TestUiMiscRowsAreDistinct(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertEqual(len({_agg(it.key) for it in rows}), 3)
         self.assertEqual(len({it.label for it in rows}), 3)
+
+
+class TestTraeWorkCnSolo(unittest.TestCase):
+    """TraeWork CN（``TRAE SOLO CN``）：复用家族实现，只测它替换掉的那几处。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="trae-solo-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.adp = ts.TraeSoloCnAdapter()
+        self.home = os.path.join(self.tmp, "home")
+        self.appdata = os.path.join(self.tmp, "appdata")
+        self.user_data = os.path.join(self.appdata, ts.TRAE_SOLO_PRODUCT)
+        os.makedirs(os.path.join(self.user_data, "ModularData", "ai-agent"), exist_ok=True)
+        with open(os.path.join(self.user_data, "ModularData", "ai-agent", "database.db"),
+                  "wb") as f:
+            f.write(b"\x00encrypted-not-sqlite\x00")
+        os.makedirs(self.home, exist_ok=True)
+        # 主目录与 %APPDATA% 都指向临时目录：适配器所有路径都由这两处派生
+        mock.patch.object(tc, "_home", return_value=self.home).start()
+        mock.patch.object(tc, "appdata_dir",
+                          side_effect=lambda name: os.path.join(self.appdata, name)).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _mk_ext(self, product_dir: str) -> str:
+        d = os.path.join(self.home, "." + product_dir)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    # --- 1. 扩展目录解析（本产品目录优先，缺了就退回家族共用） ------------------- #
+
+    def test_ext_dir_prefers_own_product_dir(self) -> None:
+        own = self._mk_ext(ts.TRAE_SOLO_PRODUCT_DIR)
+        self._mk_ext(ts.FAMILY_SHARED_PRODUCT_DIR)
+        self.assertEqual(ts._solo_ext_dir(), own)
+
+    def test_ext_dir_falls_back_to_shared_family_dir(self) -> None:
+        """本机实测：SOLO 形态常常不建 ``.trae-solo-cn``，扩展装在共用的 ``.trae-cn``。"""
+        shared = self._mk_ext(ts.FAMILY_SHARED_PRODUCT_DIR)
+        self.assertEqual(ts._solo_ext_dir(), shared)
+
+    def test_ext_dir_keeps_own_path_when_neither_exists(self) -> None:
+        """两处都没有时仍返回本产品目录：条目显示「本机未找到」，行结构不随安装状态漂移。"""
+        self.assertEqual(ts._solo_ext_dir(),
+                         os.path.join(self.home, "." + ts.TRAE_SOLO_PRODUCT_DIR))
+        by_key = {it.key: it for it in self.adp.build_items(self.home)}
+        self.assertFalse(by_key["trae_solo_cn_extensions"].exists)
+
+    def test_shared_ext_dir_is_announced_in_status(self) -> None:
+        self._mk_ext(ts.FAMILY_SHARED_PRODUCT_DIR)
+        rows = {r["rel"].replace("\\", "/"): r for r in self.adp.detect_data_roots(self.home)}
+        shared = [r for r in rows.values() if r["rel"].replace("\\", "/").endswith(".trae-cn")]
+        self.assertTrue(shared)
+        self.assertIn("与 Trae CN 共用扩展目录", shared[0]["note"])
+        self.assertTrue(shared[0]["exists"], "共用目录确实存在，不该显示「未找到」")
+
+    def test_own_ext_dir_is_announced_as_own(self) -> None:
+        """有独立扩展目录时不标注共用，状态区显示的就是它自己。"""
+        self._mk_ext(ts.TRAE_SOLO_PRODUCT_DIR)
+        self._mk_ext(ts.FAMILY_SHARED_PRODUCT_DIR)
+        rows = {r["rel"].replace("\\", "/"): r for r in self.adp.detect_data_roots(self.home)}
+        own = rows["." + ts.TRAE_SOLO_PRODUCT_DIR]
+        self.assertNotIn("共用", own["note"])
+
+    def test_items_follow_the_shared_ext_dir(self) -> None:
+        """条目路径必须跟着解析结果走，否则备的是空目录、还原后扩展全丢。"""
+        shared = self._mk_ext(ts.FAMILY_SHARED_PRODUCT_DIR)
+        by_key = {it.key: it for it in self.adp.build_items(self.home)}
+        self.assertEqual(os.path.dirname(by_key["trae_solo_cn_extensions"].path), shared)
+
+    # --- 2. 沙箱虚拟机：运行态，不进备份 -------------------------------------- #
+
+    def test_vm_dir_is_never_a_backup_item(self) -> None:
+        os.makedirs(os.path.join(self.user_data, "ModularData", "ai-agent", "vm"),
+                    exist_ok=True)
+        for it in self.adp.build_items(self.home):
+            self.assertNotIn("ai-agent/vm", it.path.replace("\\", "/"), it.key)
+
+    def test_vm_dir_is_listed_as_runtime_in_status(self) -> None:
+        os.makedirs(os.path.join(self.user_data, "ModularData", "ai-agent", "vm"),
+                    exist_ok=True)
+        notes = " ".join(r["note"] for r in self.adp.detect_data_roots(self.home))
+        self.assertIn("沙箱虚拟机", notes)
+        self.assertIn("不列入备份", notes)
+
+    def test_status_lists_vm_only_when_present(self) -> None:
+        rels = [r["rel"].replace("\\", "/") for r in self.adp.detect_data_roots(self.home)]
+        self.assertFalse([p for p in rels if p.endswith("/vm")], rels)
+
+    # --- 3. 同族隔离：key 前缀与结构指纹都不能互相认错 -------------------------- #
+
+    def test_display_name_is_the_product_name(self) -> None:
+        """安装目录叫 TRAE SOLO CN，界面必须叫用户认识的 TraeWork CN。"""
+        self.assertEqual(self.adp.name, "trae-solo-cn")
+        self.assertEqual(self.adp.display_name, "TraeWork CN")
+
+    def test_item_keys_never_collide_with_trae_cn(self) -> None:
+        """两个形态同屏勾选：key 相同会让一边覆盖另一边的勾选状态与还原目标。"""
+        solo = {it.key for it in self.adp.build_items(self.home)}
+        cn = tc.TraeCnAdapter().build_items(self.home)
+        cn_keys = {it.key for it in cn}
+        self.assertTrue(solo and cn_keys)
+        self.assertEqual(solo & cn_keys, set())
+
+    def test_prefix_does_not_break_row_aggregation(self) -> None:
+        """前缀改用下划线后，聚合仍按冒号切：主库 / -wal / -shm 合成一行。"""
+        aa = os.path.join(self.user_data, "ModularData", "ai-agent")
+        for name in ("database.db-wal", "database.db-shm"):
+            with open(os.path.join(aa, name), "wb") as f:
+                f.write(b"x")
+        solo = self.adp.build_items(self.home)
+        rows = [it for it in solo if _agg(it.key) == "trae_solo_cn_ai_agent_db"]
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(len({it.label for it in rows}), 1)
+        for it in solo:
+            self.assertTrue(it.key.startswith(ts.KEY_PREFIX_TRAE_SOLO_CN), it.key)
+
+    def test_match_structure_separates_the_two_forms(self) -> None:
+        solo_db = "h/TRAE SOLO CN/ModularData/ai-agent/database.db"
+        cn_db = "h/Trae CN/ModularData/ai-agent/database.db"
+        self.assertTrue(self.adp.match_structure([solo_db])[0])
+        self.assertFalse(self.adp.match_structure([cn_db])[0],
+                         "TraeCode CN 的包不能被认成 TraeWork CN")
+        self.assertFalse(self.adp.match_structure([])[0])
+        self.assertTrue(tc.TraeCnAdapter().match_structure([cn_db])[0])
+        self.assertFalse(tc.TraeCnAdapter().match_structure([solo_db])[0])
+
+    def test_restore_library_files_is_database_db(self) -> None:
+        self.assertEqual(self.adp.RESTORE_LIBRARY_FILES, ("database.db",))
 
 
 if __name__ == "__main__":
