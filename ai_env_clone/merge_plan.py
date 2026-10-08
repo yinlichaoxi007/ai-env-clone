@@ -234,3 +234,93 @@ WORKBUDDY_MERGE_TABLES: dict[str, str] = {
 def merge_workbuddy_db(target_path: str, source_bytes: bytes) -> dict:
     """WorkBuddy ``workbuddy.db`` 的就地合并（白名单三表）。"""
     return merge_sqlite_tables(target_path, source_bytes, WORKBUDDY_MERGE_TABLES)
+
+
+# --------------------------------------------------------------------------- #
+# 版本倒挂检测（只读，不写任何库）
+# --------------------------------------------------------------------------- #
+#: WorkBuddy 里「描述 App 自身迁移进度」的表，及其**代表迁移身份**的列。
+#: 合并时这些表**绝不写**（本机优先），但它们恰好是「包来自哪个版本」的证据：
+#: 包里有而本机没有的迁移项 ⇒ 源机 App 比本机新。
+WORKBUDDY_VERSION_TABLES: tuple[tuple[str, str], ...] = (
+    ("migration_meta", "key"),
+    ("__workbuddy_drizzle_migrations", "hash"),
+)
+
+
+def _open_ro(path: str) -> sqlite3.Connection:
+    """只读打开 SQLite（``mode=ro``：绝不因为一次提示就把用户库写出改动）。"""
+    uri = "file:%s?mode=ro" % path.replace("?", "%3f").replace("#", "%23")
+    return sqlite3.connect(uri, uri=True)
+
+
+def _key_column_values(conn: sqlite3.Connection, table: str, column: str) -> "set | None":
+    """取该表该列的取值集合；**表或列不存在返回 ``None``**（区别于「空表」的空集合）。"""
+    if table not in _tables(conn):
+        return None
+    cols = _table_columns(conn, table)
+    if column not in cols:
+        return None
+    return {r[0] for r in conn.execute("SELECT %s FROM %s" % (_quote(column), _quote(table)))}
+
+
+def detect_version_regression(
+    source_bytes: bytes,
+    target_path: str,
+    version_tables: "Sequence[tuple[str, str]]",
+    label: str = "",
+) -> list[str]:
+    """判断「包比本机新」，返回给用户看的提示（没有则空列表）。
+
+    为什么需要它：增量合并刻意**不动**应用自身的迁移记录（本机优先），于是当包来自
+    更高版本时，会出现「数据行已经并进、本机 App 却没跑过对应的迁移」的状态——
+    轻则新字段读不出，重则会话列表看不全。这一步在写盘**之前**只做只读比对，
+    把这件事告诉用户，而不是让它变成一次神秘的「还原成功但界面不对」。
+
+    判定口径：``version_tables`` 里每张表取「代表迁移身份」的那一列，
+    **包里有、本机没有**的取值数 > 0 即视为倒挂。反方向（本机更新）是安全的，不提示。
+
+    任何读取失败都返回空列表：一个提示不值得打断已经算好的还原计划。
+    """
+    if not version_tables or not source_bytes:
+        return []
+    if not os.path.isfile(target_path):
+        return []          # 本机还没有这个库 ⇒ 不存在「比本机新」
+    fd, tmp_path = tempfile.mkstemp(prefix="aienv_verchk_", suffix=".db")
+    os.close(fd)
+    src = dst = None
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(source_bytes)
+        src = _open_ro(tmp_path)
+        dst = _open_ro(target_path)
+        gaps: list[tuple[str, int]] = []
+        for table, column in version_tables:
+            src_keys = _key_column_values(src, table, column)
+            if not src_keys:
+                continue
+            dst_keys = _key_column_values(dst, table, column)
+            missing = src_keys if dst_keys is None else (src_keys - dst_keys)
+            if missing:
+                gaps.append((table, len(missing)))
+        if not gaps:
+            return []
+        who = label or "该工具"
+        detail = "、".join("%s 有 %d 项" % (t, n) for t, n in gaps)
+        return [
+            "包内的数据比本机 %s 更新（%s，本机没有对应的迁移记录）。"
+            "「合并」只并数据行、不会替本机 %s 执行迁移，低版本可能读不出新结构下的内容；"
+            "建议先把本机 %s 升到不低于源机的版本，或改用「全覆盖」（会先给本机生成回滚快照）。"
+            % (who, detail, who, who)
+        ]
+    except Exception:  # noqa: BLE001 - 提示环节不得影响还原
+        return []
+    finally:
+        if src is not None:
+            src.close()
+        if dst is not None:
+            dst.close()
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass

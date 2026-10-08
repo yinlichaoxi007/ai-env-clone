@@ -386,6 +386,8 @@ def cmd_restore(args: argparse.Namespace, emit: Emit) -> int:
         emit("  保留本机已有 %d 项（未改动）" % r["skipped"])
     if r.get("blocked"):
         emit("  被跳过 %d 项" % len(r["blocked"]))
+    for note in r.get("notes") or []:
+        emit("  ⚠️ %s" % note)
     if r["rollback"]:
         emit("  回滚快照：%s" % r["rollback"])
     emit("  %s" % adapter.restore_result_note(mode))

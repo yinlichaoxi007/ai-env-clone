@@ -497,6 +497,12 @@ class WorkBuddyAdapter(BaseAdapter):
         ``session_usage`` 三表记录并入本机库，其余表（应用自身状态）绝不触碰。"""
         return _merge_workbuddy_db
 
+    def restore_merge_version_tables(self) -> "tuple[tuple[str, str], ...]":
+        """本机实测（``workbuddy.db`` 11 张表）里的两张迁移记录表：
+        ``migration_meta.key`` 与 ``__workbuddy_drizzle_migrations.hash``。
+        包里有而本机没有 ⇒ 包来自更新的 WorkBuddy，合并只并数据行、不替本机跑迁移。"""
+        return merge_plan.WORKBUDDY_VERSION_TABLES
+
     #: WorkBuddy 专属压缩经验系数（档位 -> 类别 -> 压缩后/源 占比）。
     #:
     #: 备份数据构成（据此归类）：

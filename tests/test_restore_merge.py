@@ -312,5 +312,166 @@ class TestMergeAtomicRollback(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.root, "c.txt")))
 
 
+class TestVersionRegressionNotice(unittest.TestCase):
+    """「包比本机新」的只读检测：合并只并数据行、不替本机跑迁移 ⇒ 必须提示。"""
+
+    TABLES = (("migration_meta", "key"),)
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.target = os.path.join(self.tmp, "local.db")
+        self.source = os.path.join(self.tmp, "src.db")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _mk(self, path, keys, table="migration_meta", column="key"):
+        if os.path.exists(path):
+            os.remove(path)          # 同一用例里可能建两次（本机 / 包内），必须从零开始
+        conn = sqlite3.connect(path)
+        conn.execute('CREATE TABLE %s("%s" TEXT PRIMARY KEY, value TEXT)' % (table, column))
+        conn.executemany('INSERT INTO %s("%s", value) VALUES (?, ?)' % (table, column),
+                         [(k, "v") for k in keys])
+        conn.commit()
+        conn.close()
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    def _detect(self, source_bytes, target=None, tables=None, label="WorkBuddy"):
+        return merge_plan.detect_version_regression(
+            source_bytes, target if target is not None else self.target,
+            self.TABLES if tables is None else tables, label=label)
+
+    def test_source_has_extra_migration_yields_notice(self):
+        self._mk(self.target, ["m1"])
+        src = self._mk(self.source, ["m1", "m2", "m3"])
+        notes = self._detect(src)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("migration_meta 有 2 项", notes[0])
+        self.assertIn("包内的数据比本机 WorkBuddy 更新", notes[0])
+
+    def test_same_or_older_source_is_silent(self):
+        """本机更新（或多跑过迁移）是安全方向 ⇒ 不提示，避免到处报警。"""
+        self._mk(self.target, ["m1", "m2"])
+        self.assertEqual(self._detect(self._mk(self.source, ["m1"])), [])
+        self.assertEqual(self._detect(self._mk(self.source, ["m1", "m2"])), [])
+
+    def test_same_key_different_value_is_not_a_gap(self):
+        """比对的是**迁移身份**（key），不是 value：同一条迁移的 value 两侧不同属正常。"""
+        self._mk(self.target, ["m1"])
+        conn = sqlite3.connect(self.source)
+        conn.execute('CREATE TABLE migration_meta(key TEXT PRIMARY KEY, value TEXT)')
+        conn.execute("INSERT INTO migration_meta VALUES ('m1', '完全不同的 value')")
+        conn.commit()
+        conn.close()
+        with open(self.source, "rb") as fh:
+            self.assertEqual(self._detect(fh.read()), [])
+
+    def test_target_missing_table_yields_notice(self):
+        self._mk(self.target, ["m1"], table="other_table")
+        src = self._mk(self.source, ["m1", "m2"])
+        notes = self._detect(src)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("migration_meta 有 2 项", notes[0])
+
+    def test_missing_local_db_is_silent(self):
+        """本机还没有这个库 ⇒ 谈不上「比本机新」（全新机器直接接收包）。"""
+        src = self._mk(self.source, ["m1", "m2"])
+        self.assertEqual(self._detect(src, target=os.path.join(self.tmp, "nope.db")), [])
+
+    def test_garbage_or_empty_bytes_never_raise(self):
+        self._mk(self.target, ["m1"])
+        for bad in (b"", b"not a sqlite file at all", b"\x00\x01\x02"):
+            self.assertEqual(self._detect(bad), [])
+
+    def test_no_declared_tables_is_silent(self):
+        self._mk(self.target, ["m1"])
+        src = self._mk(self.source, ["m1", "m2"])
+        self.assertEqual(self._detect(src, tables=()), [])
+
+    def test_workbuddy_declares_real_tables(self):
+        """声明的表名必须是本机实测存在的那两张，否则检测等于没做。"""
+        ad = get_adapter("workbuddy")
+        declared = dict(ad.restore_merge_version_tables())
+        self.assertIn("migration_meta", declared)
+        self.assertIn("__workbuddy_drizzle_migrations", declared)
+        self.assertEqual(declared["migration_meta"], "key")
+        self.assertEqual(declared["__workbuddy_drizzle_migrations"], "hash")
+
+    def test_adapters_without_declaration_default_to_empty(self):
+        for name in ("qoder", "zcode", "dsh"):
+            self.assertEqual(get_adapter(name).restore_merge_version_tables(), (), name)
+
+
+class TestMergeRestoreSurfacesNotes(unittest.TestCase):
+    """core 全链路：``mode="merge"`` 时检测结果出现在 ``r["notes"]``，且不改变写入决策。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.root = os.path.join(self.tmp, "root")
+        self.local_dir = os.path.join(self.root, ".workbuddy")
+        os.makedirs(self.local_dir, exist_ok=True)
+        self.zip_path = os.path.join(self.tmp, "wb.zip")
+        self.ad = get_adapter("workbuddy")
+
+        base = os.path.join(self.tmp, "base.db")
+        self._mk_db(base, [("s1", "本机")], ["m1"])
+        shutil.copy(base, os.path.join(self.local_dir, "workbuddy.db"))
+        src = os.path.join(self.tmp, "src.db")
+        self._mk_db(src, [("s1", "包内"), ("s2", "包内独有")], ["m1", "m2"])
+        with open(src, "rb") as fh:
+            db_bytes = fh.read()
+        with zipfile.ZipFile(self.zip_path, "w") as zf:
+            zf.writestr(MANIFEST_NAME, json.dumps(_manifest("workbuddy"), ensure_ascii=False))
+            zf.writestr(".workbuddy/workbuddy.db", db_bytes)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _mk_db(path, sessions, meta_keys):
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY, title TEXT)")
+        conn.execute("CREATE TABLE workspaces(path TEXT PRIMARY KEY, last_opened_at INTEGER)")
+        conn.execute("CREATE TABLE session_usage(session_id TEXT PRIMARY KEY, tokens INTEGER)")
+        conn.execute("CREATE TABLE migration_meta(key TEXT PRIMARY KEY, value TEXT)")
+        conn.executemany("INSERT INTO sessions VALUES (?, ?)", sessions)
+        conn.executemany("INSERT INTO migration_meta VALUES (?, 'v')",
+                         [(k,) for k in meta_keys])
+        conn.commit()
+        conn.close()
+
+    def _restore(self):
+        return import_backup(
+            self.zip_path, self.root, mode="merge",
+            restore_policy_for=self.ad.restore_policy_for,
+            restore_merge_target=self.ad.restore_merge_target(),
+            merge_version_tables=self.ad.restore_merge_version_tables(),
+            merge_version_label=self.ad.display_name,
+        )
+
+    def test_notice_present_and_data_still_merged(self):
+        r = self._restore()
+        self.assertTrue(r["notes"], "包比本机新 ⇒ 应给出提示")
+        self.assertIn("migration_meta 有 1 项", r["notes"][0])
+        # 提示不改变写入决策：包内独有会话仍然并入，本机迁移记录不动
+        conn = sqlite3.connect(os.path.join(self.local_dir, "workbuddy.db"))
+        try:
+            self.assertEqual(
+                conn.execute("SELECT id FROM sessions ORDER BY id").fetchall(),
+                [("s1",), ("s2",)])
+            self.assertEqual(
+                conn.execute("SELECT key FROM migration_meta").fetchall(), [("m1",)])
+        finally:
+            conn.close()
+
+    def test_no_notice_when_local_is_already_current(self):
+        # 本机迁移记录已包含包内全部 ⇒ 无提示（方向不能反）
+        newer = os.path.join(self.local_dir, "workbuddy.db")
+        os.remove(newer)
+        self._mk_db(newer, [("s1", "本机")], ["m1", "m2", "m3"])
+        self.assertEqual(self._restore()["notes"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

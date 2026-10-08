@@ -324,5 +324,79 @@ class TestPackageDir(unittest.TestCase):
         self.assertTrue(name.endswith(".zip"), name)
 
 
+class TestRestoreVersionNotice(unittest.TestCase):
+    """「包比本机新」的提示必须从 CLI 输出：还原成功却不提示，症状会被当成工具坏了。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="cli_notice_")
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.root = os.path.join(self.tmp, "dst")
+        os.makedirs(os.path.join(self.root, ".workbuddy"))
+        self.zip = os.path.join(self.tmp, "wb.zip")
+
+    def _db(self, path, session_ids, meta_keys):
+        import sqlite3
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY, title TEXT)")
+        conn.execute("CREATE TABLE workspaces(path TEXT PRIMARY KEY, last_opened_at INTEGER)")
+        conn.execute("CREATE TABLE session_usage(session_id TEXT PRIMARY KEY, tokens INTEGER)")
+        conn.execute("CREATE TABLE migration_meta(key TEXT PRIMARY KEY, value TEXT)")
+        conn.executemany("INSERT INTO sessions VALUES (?, 't')",
+                         [(i,) for i in session_ids])
+        conn.executemany("INSERT INTO migration_meta VALUES (?, 'v')",
+                         [(k,) for k in meta_keys])
+        conn.commit()
+        conn.close()
+
+    def _package(self, meta_keys):
+        src = os.path.join(self.tmp, "src.db")
+        self._db(src, ["s1", "s2"], meta_keys)
+        with open(src, "rb") as fh:
+            db_bytes = fh.read()
+        with zipfile.ZipFile(self.zip, "w") as zf:
+            zf.writestr("ai_env_clone_manifest.json", json.dumps({
+                "version": 2, "kind": "backup", "tool": "workbuddy",
+                "created_at": "2026-10-08T00:00:00", "source_root": self.tmp,
+                "platform": os.name, "items": ["session_db"], "file_count": 1,
+                "total_bytes": len(db_bytes),
+            }, ensure_ascii=False))
+            zf.writestr(".workbuddy/workbuddy.db", db_bytes)
+
+    def _run(self, argv) -> "tuple[int, str]":
+        c = Collector()
+        return cli.run(argv, emit=c), c.text
+
+    def test_notice_printed_and_package_rows_merged(self):
+        local = os.path.join(self.root, ".workbuddy", "workbuddy.db")
+        self._db(local, ["s1"], ["m1"])            # 本机只跑过 m1
+        self._package(["m1", "m2"])                # 包来自跑过 m2 的更新版本
+        rc, text = self._run(["restore", "--tool", "workbuddy", "--package", self.zip,
+                              "--root", self.root, "--mode", "merge",
+                              "--yes", "--no-rollback"])
+        self.assertEqual(rc, cli.EXIT_OK, text)
+        self.assertIn("⚠️", text)
+        self.assertIn("migration_meta 有 1 项", text)
+        import sqlite3
+        conn = sqlite3.connect(local)
+        try:
+            self.assertEqual([r[0] for r in conn.execute(
+                "SELECT id FROM sessions ORDER BY id")], ["s1", "s2"])
+            # 迁移记录属本机：提示归提示，绝不替本机写迁移状态
+            self.assertEqual([r[0] for r in conn.execute(
+                "SELECT key FROM migration_meta")], ["m1"])
+        finally:
+            conn.close()
+
+    def test_no_notice_when_local_already_current(self):
+        local = os.path.join(self.root, ".workbuddy", "workbuddy.db")
+        self._db(local, ["s1"], ["m1", "m2", "m3"])
+        self._package(["m1", "m2"])
+        rc, text = self._run(["restore", "--tool", "workbuddy", "--package", self.zip,
+                              "--root", self.root, "--mode", "merge",
+                              "--yes", "--no-rollback"])
+        self.assertEqual(rc, cli.EXIT_OK, text)
+        self.assertNotIn("⚠️", text)
+
+
 if __name__ == "__main__":
     unittest.main()

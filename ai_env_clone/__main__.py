@@ -4084,12 +4084,16 @@ class QoderBackupApp:
                 mode=mode,
                 restore_policy_for=self.adapter.restore_policy_for,
                 restore_merge_target=self.adapter.restore_merge_target(),
+                merge_version_tables=self.adapter.restore_merge_version_tables(),
+                merge_version_label=self.adapter.display_name,
             )
             extra = "\n回滚快照：%s" % r["rollback"] if r["rollback"] else ""
             if r.get("skipped"):
                 extra += "\n保留本机已有 %d 项（未改动）" % r["skipped"]
             if r["blocked"]:
                 extra += "\n\n被跳过 %d 项" % len(r["blocked"])
+            for note in r.get("notes") or []:
+                extra += "\n\n⚠️ " + note
             self.msg_queue.put(
                 (
                     "done",

@@ -858,6 +858,8 @@ def _run_merge_restore(
     tool: str | None,
     zip_path: str,
     progress: ProgressCb,
+    merge_version_tables: "Sequence[tuple[str, str]] | None" = None,
+    merge_version_label: str = "",
 ) -> dict:
     """增量合并还原（方案 §3.4 的两阶段 + 失败整体回滚）。
 
@@ -865,9 +867,14 @@ def _run_merge_restore(
     阶段 2【快照】：对所有将被写入/合并且目标已存在的文件生成回滚快照；
     阶段 3【提交】：逐个目标落地（新文件走 tmp+replace，合并走适配器就地钩子）；
     阶段 5【回滚】：任一目标失败 ⇒ 删除新建文件 + 从快照写回被覆盖文件，再抛错。
+
+    ``merge_version_tables`` 为适配器声明的「App 自身迁移记录表 + 身份列」，
+    仅用于**只读**比对包与本机，产出 ``notes``（「包比本机新」这类提示）；
+    它不改变任何写入决策。
     """
     restored = skipped = 0
     blocked: list[str] = []
+    notes: list[str] = []
     plan: list[tuple[str, str, str, zipfile.ZipInfo]] = []
 
     for m in members:
@@ -903,6 +910,22 @@ def _run_merge_restore(
             raise BackupError(
                 "读取备份包内容失败，未改动本机数据：%s（%s）" % (m.filename, exc)
             ) from exc
+
+    # 版本倒挂提示（只读，不参与任何写入决策）：包里有而本机没有的迁移记录
+    # ⇒ 合并只并数据行、不会替本机 App 执行迁移，还原后可能出现「数据在、界面读不出」。
+    # 必须在阶段 2/3 之前判，否则比对的就是「已被本次改动过」的本机库。
+    if merge_version_tables:
+        for kind_, arc_norm, target, _m in plan:
+            if kind_ != "merge":
+                continue
+            notes.extend(
+                merge_plan.detect_version_regression(
+                    merge_bytes.get(arc_norm, b""),
+                    target,
+                    merge_version_tables,
+                    label=merge_version_label,
+                )
+            )
 
     # 阶段 2：回滚快照（覆盖 / 合并的既有目标）。
     victims = [
@@ -944,6 +967,7 @@ def _run_merge_restore(
         "restored": restored,
         "skipped": skipped,
         "blocked": blocked,
+        "notes": notes,
         "rollback": rollback_path,
         "restored_targets": written,
     }
@@ -1122,6 +1146,8 @@ def import_backup(
     mode: str = "replace",
     restore_policy_for: "Callable[[str], str] | None" = None,
     restore_merge_target: "Callable[[str, str, bytes], None] | None" = None,
+    merge_version_tables: "Sequence[tuple[str, str]] | None" = None,
+    merge_version_label: str = "",
 ) -> dict:
     """
     恢复备份到根目录。
@@ -1180,7 +1206,13 @@ def import_backup(
     :param restore_merge_target: 仅合并模式使用：``callback(relpath, target_abs, source_bytes)``，
         就地完成记录级合并（如把包内 SQLite 的会话行并入本机库）。声明了 ``"merge"`` 策略的
         适配器必须提供，否则那些成员会退化为覆盖写入。
-    :return: {'restored': int, 'skipped': int, 'blocked': [str], 'rollback': str|None,
+    :param merge_version_tables: 仅合并模式使用：适配器声明的「App 自身迁移记录表 + 身份列」
+        ``[(表名, 列名), ...]``。写盘**前**只读比对包与本机，包里有而本机没有的迁移项 ⇒ 往
+        ``notes`` 里加一条「包比本机新」的提示（合并不会替本机 App 执行迁移，低版本可能读不出
+        新结构）。``None`` / 空元组表示不做该检测。
+    :param merge_version_label: 上述提示里对该工具的称呼（一般传 ``display_name``）。
+    :return: {'restored': int, 'skipped': int, 'blocked': [str], 'notes': [str],
+              'rollback': str|None,
               'kind': str|None, 'tool': str|None, 'source_root': str|None,
               'structure_match': bool|None, 'structure_missing': list[str]}
     """
@@ -1265,6 +1297,8 @@ def import_backup(
                 tool,
                 zip_path,
                 progress,
+                merge_version_tables=merge_version_tables,
+                merge_version_label=merge_version_label,
             )
             progress(ProgressInfo(total, total, "完成"))
             merged.update(
@@ -1369,6 +1403,7 @@ def import_backup(
         "restored": restored,
         "skipped": skipped,
         "blocked": blocked,
+        "notes": [],          # 版本倒挂检测只在「合并」分支做（见 _run_merge_restore）
         "rollback": rollback_path,
         "kind": kind,
         "tool": tool,

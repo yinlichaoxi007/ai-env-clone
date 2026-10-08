@@ -201,6 +201,10 @@ class BaseAdapter(ABC):
             kw["restore_policy_for"] = self.restore_policy_for
         if "restore_merge_target" not in kw:
             kw["restore_merge_target"] = self.restore_merge_target()
+        if "merge_version_tables" not in kw:
+            kw["merge_version_tables"] = self.restore_merge_version_tables()
+        if "merge_version_label" not in kw:
+            kw["merge_version_label"] = self.display_name
         return import_backup(zip_path, root, progress=progress, **kw)
 
     # ------------------------------------------------------------------ #
@@ -283,6 +287,19 @@ class BaseAdapter(ABC):
         默认返回 ``None``（不做记录级合并）；声明了 ``"merge"`` 策略的适配器必须实现它。
         """
         return None
+
+    def restore_merge_version_tables(self) -> "tuple[tuple[str, str], ...]":
+        """声明「App 自身迁移记录表」用于**版本倒挂提示**（``(表名, 身份列)`` 序列）。
+
+        合并模式刻意不动这些表（本机优先），于是当包来自更高版本时，会出现
+        「数据行已并进、本机 App 却没跑过对应迁移」的状态，症状通常是
+        「还原成功，但会话列表少了 / 点开没内容」。core 在写盘前用
+        :func:`ai_env_clone.merge_plan.detect_version_regression` **只读**比对包与本机，
+        把这种情况写成一条提示（``notes``）交给界面 / 命令行展示。
+
+        默认返回空元组（该工具没有可比的迁移记录表，或尚未实测确认表名）。
+        """
+        return ()
 
     def restore_merge_config_files(self) -> tuple[str, ...]:
         """合并模式下**以包为准替换本机**的唯一配置类文件（相对路径后缀），供确认框逐项列出。
