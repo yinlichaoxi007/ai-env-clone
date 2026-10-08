@@ -437,7 +437,7 @@ class SessionOnDisk:
     header_error: str = ""      # header 读取失败原因（空串=成功/未尝试）
     legacy_replay: bool = False  # 内容含扁平 replayState（旧格式，需 zstd）
     dup_call_ids: bool = False   # 同 step 内重复宣告 tool-call id（需 zstd）
-    descriptor_bad: bool = False  # 含官方迁移不支持的 subagent/descriptor 版本（无法加载，暂不修复）
+    descriptor_bad: bool = False  # 含官方迁移不支持的 subagent/descriptor 版本（无法加载；载荷满足 v3 语义时由 _fix_descriptor_version 升 version，否则跳过并上报）
     log_file: str = ""          # 生效的会话日志文件（同目录内代际最高者）
     log_version: int = 0        # 该文件的格式代际（0 = session.jsonl.zstd）
 
