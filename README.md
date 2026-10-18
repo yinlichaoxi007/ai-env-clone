@@ -194,7 +194,7 @@ GUI 界面要点：
 
 ```bash
 python -m ai_env_clone --version
-# → AiEnvClone 0.2.0-rc.1
+# → AiEnvClone 0.3.0-rc.1
 ```
 
 **使用说明**（已可用；不启动界面）：在终端打印使用说明的**纯文字**版本，
@@ -789,7 +789,7 @@ On Windows you can also double-click `run.bat` (requires Python 3.10+ installed 
 
 ```bash
 python -m ai_env_clone --version
-# → AiEnvClone 0.2.0-rc.1
+# → AiEnvClone 0.3.0-rc.1
 ```
 
 **Usage doc** (available now; does not start the GUI): prints the **plain text** form of

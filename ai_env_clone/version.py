@@ -43,7 +43,7 @@ __all__ = [
 ]
 
 #: 版本号。发布时打 tag ``v`` + 本值（见模块 docstring）。
-__version__ = "0.2.0-rc.1"
+__version__ = "0.3.0-rc.1"
 
 #: 产物基础名：与 ``build_exe.py --name`` 的默认值、打包产物名一致。
 APP_NAME = "AiEnvClone"
