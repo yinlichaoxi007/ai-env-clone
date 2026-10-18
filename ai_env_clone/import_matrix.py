@@ -335,7 +335,9 @@ _MATRIX: dict[str, TargetCapability] = {
                 tool="*", display="Qoder CN 会话",
                 versions=_SRC_META["qoder"][1], scope=(),
                 status=BACKUP_ONLY,
-                note="Qoder 会话正文不可解析（旧版 local.db 为列级密文），只能整体备份 / 还原，不能与其它软件互换会话。",
+                note="Qoder 会话正文不可解析（旧版 local.db 为列级密文），只能整体备份 / 还原，不能与其它软件互换会话。"
+                     "（换代前 lingma 账号旧会话的回填不走这里：那是同一工具内写回它自己的库，"
+                     "入口在选中 Qoder CN 后的「历史会话诊断」行，见 qoder_session_import。）",
             ),
         ),
     ),

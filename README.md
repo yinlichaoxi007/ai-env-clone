@@ -57,7 +57,8 @@
 | WorkBuddy | Reasonix / CodeBuddy CN / ZCode / DeepSeek Harness | 同时登记 workbuddy.db 会话索引 |
 | DeepSeek Harness | Reasonix / CodeBuddy CN / WorkBuddy / ZCode | 需 zstd 后端；会话写为 `session.v3.jsonl.zstd` |
 | ZCode | —（仅可作来源，反向导出） | 写出格式待实测，为避免写坏其库暂不作为导入目标 |
-| Qoder CN / TraeCode CN / TraeWork CN | —（仅整库备份 / 还原） | 会话正文取不出（Qoder 旧版为**列级密文**、Trae 为加密库），无法跨软件转换 |
+| Qoder CN | —（仅整库备份 / 还原） | 会话正文取不出（旧版 `local.db` 为**列级密文**），无法跨软件转换；换代前 lingma 账号旧会话的**回填**不走这一区，见 [Qoder CN 换代回填](#qoder-cn-换代回填把-lingma-账号的旧会话导入新版) |
+| TraeCode CN / TraeWork CN | —（仅整库备份 / 还原） | 会话为产品侧加密库，正文取不出，无法跨软件转换 |
 
 > **为什么有些工具不能互相导入？** 会话正文的形态决定了一切：明文 JSONL / JSON / SQLite 可解析、可复写，因而能跨软件迁移；而 Qoder 旧版 `local.db` 的**会话正文列是列级密文**（容器本身是标准 SQLite，`chat_session` / `agent_memory` 等元数据与记忆表均为明文），Trae 家族（`ModularData/ai-agent/database.db`）则是产品侧加密库——两者正文都取不出，本工具只能做整库不透明备份 / 还原。这是产品设计造成的，不是本工具的缺陷。
 
@@ -181,7 +182,7 @@ GUI 界面要点：
 - **未找到项标红**：当数据目录未正确识别时，备份内容中找不到的每一项会标红并注明「（未找到）」，备份内容区右上角同时显示「N 项未找到」；已勾选项保持不变，仅作提示，不会自动取消勾选。
 - **估算大小**：点击「估算大小」按钮可预估所选备份项打包后的体积。
 - **数据导入区**：位于「备份内容」与「选项」之间，随所选工具刷新。直接列出**该工具可导入的来源软件、实测版本、可导入的数据范围与状态**（`支持导入` / `仅备份/还原` / `待支持`）；支持导入时「导入会话…」按钮可用，点击即打开导入对话框；「导入说明」按钮弹出全部工具的支持矩阵。
-- **仅特定工具显示的行**：选中 **DeepSeek Harness** 时出现「会话健康」行（检测未分组会话 / 旧格式 replayState 等）；选中 **WorkBuddy** 时同样出现「会话健康」行（检测「导入行归属写错 ⇒ 侧栏看不到会话」「磁盘有正文、库里没登记」「工作区缺行」「侧栏秒开快照陈旧」，并可一键修复）；选中 **Qoder CN** 时出现「历史会话诊断」行，两个按钮：**「检测历史会话」**（对比新版 `main.sqlite` 与旧版 `local.db` 两处数据根及导入账本，给出「导入后仍看不到历史会话」的成因结论）与 **「转换旧版记忆…」**（把旧库里产品换代没回填的明文记忆转成新版可读的 markdown，dry-run 出计划 → 确认 → 只新建不覆盖，也可导出为 CodeBuddy 的 `.mdc`）。这些行对其他工具隐藏，不影响各区域自适应布局。
+- **仅特定工具显示的行**：选中 **DeepSeek Harness** 时出现「会话健康」行（检测未分组会话 / 旧格式 replayState 等）；选中 **WorkBuddy** 时同样出现「会话健康」行（检测「导入行归属写错 ⇒ 侧栏看不到会话」「磁盘有正文、库里没登记」「工作区缺行」「侧栏秒开快照陈旧」，并可一键修复）；选中 **Qoder CN** 时出现「历史会话诊断」行，三个按钮：**「检测历史会话」**（对比新版 `main.sqlite` 与旧版 `local.db` 两处数据根及导入账本，给出「导入后仍看不到历史会话」的成因结论）、**「转换旧版记忆…」**（把旧库里产品换代没回填的明文记忆转成新版可读的 markdown，dry-run 出计划 → 确认 → 只新建不覆盖，也可导出为 CodeBuddy 的 `.mdc`）与 **「导入 lingma 会话…」**（把换代前的旧会话回填到新版当前账号的库里；只在运行期条件满足时开放，见「Qoder CN 换代回填」一节）。这些行对其他工具隐藏，不影响各区域自适应布局。
 - **菜单（「AI 工具」行右侧）**：**设置 → 更新设置…** 配置「启动时自动检查更新 / 检查频率 / 是否包含预发布版本 / 代理」；**帮助 → 使用说明（`F1`）** 打开纯文字使用说明（与 `--docs` 同源，不显示图片；**表格按查看器当前宽度排版**——列间画 `|` 的等宽网格，放得下的表一行一行铺开、放不下的列**自己折行**（列边界仍对齐，所以把窗口拉宽、表格跟着变宽）；只有窄到每列放不下几个字才改成「条目名 + `列名：值`」的分条样式；**表格与分条之间只有一个切换阈值**，同一宽度下所有表格形态一致——把窗口缩小时变分条的宽度与放大时变回表格的宽度是同一个，不会出现「缩小时先分条、放大要更宽才回来」的错开；也不会出现被窗口裁掉或折行后列错位的表格；正文按字符折行，适配中文）；**帮助 → 关于** 显示版本号、作者与版权、项目主页，并可点「检查更新」查询最新版本（**只查询，不下载、不替换**）。**关于里的项目地址可直接点击打开浏览器**，也可以拖选后 `Ctrl+C` 复制（右键菜单另有「复制链接地址 / 全选」）。菜单与「AI 工具」下拉同处一行，**不额外占用窗口高度**。
 - **高分屏与窗口高度适配**：窗口声明 DPI 感知（Per-Monitor v2），缩放系数超过 100% 时不会被系统虚化放大。**首次打开的默认高度为屏幕高的 75%**（下限 460px），各工具完全一致、与内容多少无关——内容少的工具也不会缩成一小条；之后高度**完全由你控制**：拖高时备份内容区与数据导入说明区**按比例放大**（一屏能看到更多条目），拖矮时**按比例压缩**（为下方区域腾空间）；压到各自下限仍装不下时出现竖向滚动条，**进度条与状态栏始终固定在窗口最下方**，任何窗口高度下都不会被裁掉看不见——小尺寸屏幕上也不会因窗口超高而被遮挡。默认高度按屏幕**比例**而非固定像素计算，故在任意 DPI 缩放下占屏比例恒定。备份内容区高度只取决于窗口高度、与工具项数无关。窗口宽度不足时内容区出现横向滚动条，各区域的文字与控件不会被裁掉。
 
@@ -289,6 +290,39 @@ from ai_env_clone.core import export_backup, import_backup
 - **状态**（`支持导入` / `仅备份/还原` / `待支持`）与针对性说明（落点要求、是否需要 zstd 等）。
 
 点击「导入会话…」即打开导入对话框：选择来源软件与来源目录 → 扫描出可导入会话（`Ctrl` / `Shift` 可多选，一次导入多条）→ **目标工作区自动判定，无需填写**（该栏只读展示**实际会落到的**工作区，并随选中项实时刷新）→ 导入。
+
+#### Qoder CN 换代回填：把 lingma 账号的旧会话导入新版
+
+产品换代（lingma 账号 → 阿里云账号）时，官方入口只搬了**记忆**、没搬**会话**：旧 `local.db` 里的会话仍归属 lingma 账号，新版 `main.sqlite` 按新的阿里云账号查询，于是侧栏看不到任何历史。这条路径不是跨软件转换，而是**同一工具内的回填**（实现见 `ai_env_clone/qoder_session_import.py`，与 `qoder_memory_convert.py` 同一套「dry-run 计划 → 确认 → 写盘 → 读回校验 → 台账回滚」范式）。
+
+入口在选中 Qoder CN 后的**「历史会话诊断」行**（与「检测历史会话」「转换旧版记忆…」同行），按钮文案为**「导入 lingma 会话…」**，且**只有四条运行期条件全部满足才开放**（缺哪条就把哪条写在按钮下面）。放在这一行而不是「数据导入」区，是因为那一区讲的是**跨软件**转换：Qoder 的会话正文取不出，跨软件口径下它照旧只有 `仅备份/还原`；换代回填写回的是 Qoder **自己的**新版库，与「转换旧版记忆」同属一类换代遗留问题。
+
+1. 旧版会话库 `local.db` 存在（`~/.qoder-cn/shared_client/cache/db/` 与 `~/.lingma/cache/db/`）；
+2. 新版会话库 `main.sqlite` 存在（不存在 = 新版桌面端还没建库，写进去也没人读）；
+3. **当前所选用户是新版阿里云账号**（UUIDv7 形态）且与旧会话归属账号不同——仍停在旧账号说明本机还没发生换代；**取不到账号同样算不满足**；
+4. 取到产品自写的**明文文字稿**（`~/.qoder-cn/cache/projects/<工程>/conversation-history/<会话前 8 位>/`）：旧库正文是列级密文，明文只有这一份。
+
+安全边界：
+
+- 打开对话框与 `plan` **只读**（dry-run），逐条列出「能导的」与「为什么跳过」（没有文字稿的、本机工程目录已消失的）。
+- 写盘前先给 `main.sqlite` 建**在线快照并复核 SHA-256**，再抢数据库写锁（`begin immediate`，取不到锁即整体不写——**请先完全退出 Qoder CN 含系统托盘**），单个事务插入、失败整体回滚；写后逐字段与哈希读回校验 + `integrity_check`。
+- 写前预检还会挡住：目标库结构与验证过的形状不一致（schema 漂移）、`payload_schema_version` 不在已验证白名单内、账号形态不符（命令行没有界面把关，同样拦得住）。
+- **回滚只按写入台账摘除本工具写入的行**，产品自己写的会话与消息一律不碰；台账只记会话 / 消息 id 与哈希，**不含正文与标题**。
+- 新会话、消息、片段 id 由旧会话 id 经 `uuid5` 确定性推导，**重复执行不会写出第二份**（命中即显示「已存在于目标库，跳过」）。
+
+代价（有损导入，界面与命令行都会事先讲清）：只有文字稿里的可见文字，**没有推理过程与工具调用**；导入的旧轮次**只进展示层与全文检索，不进模型上下文**；轮次时间按会话首尾插值；不写官方导入账本 `sessionMigration.sqlite`。
+
+命令行（默认只出计划，`apply` 才写盘）：
+
+```
+python -m ai_env_clone.qoder_session_import eligibility   # 四条运行期条件判定
+python -m ai_env_clone.qoder_session_import list          # 旧会话与文字稿命中情况
+python -m ai_env_clone.qoder_session_import plan --limit 1        # dry-run 计划
+python -m ai_env_clone.qoder_session_import apply --limit 1       # 快照后写入
+python -m ai_env_clone.qoder_session_import rollback --session <新会话id前8位>
+```
+
+`--uid` 指定当前所选账号，`--new-db` / `--old-db` 覆盖自动探测，`--include-all` 才纳入「本机工程目录已不存在」的会话，`--drop-snapshot` 让回滚后一并删除快照。
 
 #### 子代理会话：默认不导入，导入时按目标工具的原生结构挂到父会话下
 
@@ -491,6 +525,7 @@ ai_env_clone/                包（import 名 ai_env_clone，产品名 AiEnvClon
 ├── workbuddy_repair.py WorkBuddy 会话索引检测与修复（纯标准库：归属 / 未登记 / 工作区缺行 / 陈旧侧栏快照；写库前备份并取写锁）
 ├── subagent_relink.py  把「旧版导入留在 DSH 里的顶层子代理会话」修成 DSH 原生子代理会话（检测 + 修复，纯标准库）
 ├── qoder_memory_convert.py Qoder 旧明文记忆 → 新版 ``memory/*.md`` 的一次性转换器（独立功能，默认 dry-run）
+├── qoder_session_import.py Qoder 换代回填：旧 lingma 会话 → 新版 ``main.sqlite`` 的有损导入（条件开放，默认只出计划）
 ├── elevate.py          更新替换的提权重试（仅打包版 Windows、需用户显式点击；系统调用收在模块级小函数里便于打桩）
 ├── adapters/
 │   ├── base.py        BaseAdapter 抽象接口 + 适配器注册表
@@ -507,7 +542,7 @@ build_exe.py           用 PyInstaller 跨平台打包（Windows / macOS arm64 /
 .github/workflows/     build-release.yml（打 tag 自动构建多平台可执行程序、发布 GitHub Release 并同步 Release 到 Gitee）+ sync-gitee.yml（手动补传 Gitee 资产）+ mirror-to-gitee.yml（推送代码与 tag 到 Gitee 镜像）
 ```
 
-**多工具扩展**：已采用统一的适配器接口（`detect_root()` / `detect_data_roots()` / `build_items()` / `export()` / `restore()`）。每种 AI 工具对应一个适配器模块，新增工具无需改动主流程，详见 `docs/CONTRIBUTING.md`。跨软件「会话导入」的能力声明集中在 `import_matrix.py`，解析 / 写出实现在 `session_migration.py`；新增一个「可导入」来源只需补一个解析器并在矩阵中登记。
+**多工具扩展**：已采用统一的适配器接口（`detect_root()` / `detect_data_roots()` / `build_items()` / `export()` / `restore()`）。每种 AI 工具对应一个适配器模块，新增工具无需改动主流程，详见 `docs/CONTRIBUTING.md`。跨软件「会话导入」的能力声明集中在 `import_matrix.py`，解析 / 写出实现在 `session_migration.py`；新增一个「可导入」来源只需补一个解析器并在矩阵中登记。这张表只讲**跨软件**转换，所以同一工具内的特例不进表：Qoder 的换代回填（`qoder_session_import.py`，界面在「历史会话诊断」行、命令行独立入口）能否使用由**运行期实测**决定（适配器的 `lingma_import_gate()` → `check_eligibility()`），条件不满足时入口保持关闭并逐条写明缺什么。
 
 ## 支持的平台与架构
 
@@ -607,7 +642,8 @@ Beyond whole-archive backup/restore, the tool can write another tool's chat hist
 | WorkBuddy | Reasonix / CodeBuddy CN / ZCode / DeepSeek Harness | also registers the session in `workbuddy.db` |
 | DeepSeek Harness | Reasonix / CodeBuddy CN / WorkBuddy / ZCode | needs a zstd backend; written as `session.v3.jsonl.zstd` |
 | ZCode | — (source only; reverse export) | write format not yet verified; not a target, to avoid corrupting its DB |
-| Qoder CN / TraeCode CN / TraeWork CN | — (whole-archive backup/restore only) | session content is unreadable (Qoder legacy = column-level ciphertext; Trae = encrypted DB), so it cannot be converted |
+| Qoder CN | — (whole-archive backup/restore only) | session content is unreadable (legacy `local.db` = column-level ciphertext), so it cannot be converted across tools. The pre-regeneration lingma-account sessions get a **same-tool backfill** instead — on the session-diagnostics row, see the "Qoder CN regeneration backfill" subsection |
+| TraeCode CN / TraeWork CN | — (whole-archive backup/restore only) | sessions live in a product-side encrypted DB; content unreadable, so it cannot be converted |
 
 > **Why can't some tools import from each other?** The shape of the session *content* decides everything: plaintext JSONL / JSON / SQLite is parseable and re-writable, hence portable across tools; whereas Qoder's legacy `local.db` keeps its **session content columns encrypted** (the container itself is a standard SQLite DB — `chat_session`, `agent_memory` and other metadata are plaintext), and the Trae family (`ModularData/ai-agent/database.db`) is a product-side encrypted DB. Since the content is unreadable in both cases, this tool can only do an opaque whole-archive backup/restore. That is a product design constraint, not a defect of this tool.
 
@@ -741,7 +777,7 @@ GUI highlights:
 - **Missing items highlighted**: when the data directory is not correctly detected, every item that cannot be found is shown in red and labelled "(未找到 / not found)"; the top-right of the backup list also shows "N 项未找到" (N items not found). Already-checked items keep their state — only a hint, no auto-uncheck.
 - **Estimate size**: click "估算大小" (estimate size) to preview the packed size of selected items.
 - **Data-import area**: sits between "备份内容" and "选项", refreshed for the selected tool. It directly lists **the source tools that can be imported, their tested versions, the importable scope, and the status** (`支持导入` / `仅备份/还原` / `待支持`); when import is possible the "导入会话…" button is enabled and opens the import dialog, while "导入说明" shows the full capability matrix for every tool.
-- **Rows shown only for specific tools**: selecting **DeepSeek Harness** shows a "会话健康 / session health" row (detects ungrouped sessions, old-format `replayState`, etc.); selecting **WorkBuddy** shows the same kind of "session health" row (detects imported session rows the sidebar filters out, sessions present on disk but unregistered, missing `workspaces` rows and a stale sidebar snapshot — see "WorkBuddy session index"); selecting **Qoder CN** shows a "历史会话诊断 / session diagnostics" row with two buttons: **"检测历史会话 / Check history"** (compares the new `main.sqlite` and the legacy `local.db` data roots plus the import ledger, and explains why "history sessions are still missing after import") and **"转换旧版记忆… / Convert legacy memories…"** (turns the plaintext memories the product never carried over into the markdown form the new version reads — dry-run plan first, then confirm, create-only and never overwrite; can also export as CodeBuddy `.mdc`). These rows are hidden for other tools and do not affect the adaptive layout.
+- **Rows shown only for specific tools**: selecting **DeepSeek Harness** shows a "会话健康 / session health" row (detects ungrouped sessions, old-format `replayState`, etc.); selecting **WorkBuddy** shows the same kind of "session health" row (detects imported session rows the sidebar filters out, sessions present on disk but unregistered, missing `workspaces` rows and a stale sidebar snapshot — see "WorkBuddy session index"); selecting **Qoder CN** shows a "历史会话诊断 / session diagnostics" row with three buttons: **"检测历史会话 / Check history"** (compares the new `main.sqlite` and the legacy `local.db` data roots plus the import ledger, and explains why "history sessions are still missing after import"), **"转换旧版记忆… / Convert legacy memories…"** (turns the plaintext memories the product never carried over into the markdown form the new version reads — dry-run plan first, then confirm, create-only and never overwrite; can also export as CodeBuddy `.mdc`) and **"导入 lingma 会话… / Import lingma sessions…"** (backfills the pre-regeneration sessions into the new version's DB under the current account; offered only when the runtime conditions hold — see the "Qoder CN regeneration backfill" subsection). These rows are hidden for other tools and do not affect the adaptive layout.
 - **Menus (right side of the "AI 工具" row)**: **设置 → 更新设置…** configures "check for updates on startup / check frequency / include pre-releases / proxy"; **帮助 → 使用说明 (`F1`)** opens the plain-text manual (same source as `--docs`, no images; **tables are laid out for the viewer's current width** — they render as an aligned grid when they fit, otherwise they **wrap by column while keeping the columns aligned**, so widening the window widens the table; only when a column would be too narrow does it switch to a "record name + `column: value`" list, so nothing is ever clipped or wrapped into misaligned columns; body text wraps by character, which suits Chinese); **帮助 → 关于** shows the version, author, copyright and project home, and offers a "检查更新" button that **only queries — it never downloads or replaces** anything. **The project URLs in 关于 are clickable (they open your browser) and can be selected and copied with `Ctrl+C`** (the right-click menu also offers "copy link address / select all"). The menus share the row with the tool dropdown, so they **add no window height**.
 - **Hi-DPI & adaptive window height**: the window declares DPI awareness (Per-Monitor v2), so it is not blurry-scaled by the OS when the scaling factor exceeds 100%. **On first launch the height is 75% of the screen height** (floored at 460px) — identical for every tool and independent of how much content it has, so a tool with few items no longer opens as a thin strip; afterwards the height is **fully under your control**: drag it taller and the backup content area and the import-notes area **scale up proportionally** (more items visible at once); drag it shorter and they **shrink proportionally** (freeing room for the sections below); once both reach their floors a vertical scrollbar appears, and the **progress bar and status bar stay pinned to the bottom** of the window — they are never clipped out of view at any window height, so small screens won't hide part of the window either. The default height is a **fraction of the screen**, not a fixed pixel value, so its share of the screen stays constant at any DPI scaling. The backup content area's height depends only on the window height, never on the tool or item count. If the window is too narrow, a horizontal scrollbar appears in the content area so labels and controls are never clipped.
 
@@ -849,6 +885,37 @@ With a target tool selected, the "数据导入 / Data import" area lists:
 - the **status** (`supported` / `backup-restore only` / `planned`) plus targeted notes (landing requirements, whether zstd is needed, etc.).
 
 Clicking "导入会话…" (import session) opens the import dialog: pick a source tool and its source directory → scan for importable sessions (`Ctrl` / `Shift` multi-select, import several at once) → **the target workspace is resolved automatically — nothing to fill in** (that row is read-only and shows the workspace actually in use, refreshing as the selection changes) → import.
+
+#### Qoder CN regeneration backfill: bring lingma-account sessions into the new version
+
+When the product moved from the lingma account to an Aliyun account, the official importer carried over **memories** but not **sessions**: legacy rows in `local.db` still belong to the lingma account, while the new `main.sqlite` is queried by the new account — so the sidebar shows no history. This path is a **same-tool backfill**, not a cross-tool conversion (implementation: `ai_env_clone/qoder_session_import.py`, reusing the "dry-run plan → confirm → write → read-back verify → ledger rollback" pattern of `qoder_memory_convert.py`).
+
+The entry sits on the **"历史会话诊断 / session diagnostics" row** (alongside "检测历史会话" and "转换旧版记忆…") as **"导入 lingma 会话…"**, and is offered **only when all four runtime conditions hold** (whatever fails is spelled out right under the buttons). It deliberately stays out of the "Data import" area, which describes **cross-tool** conversion only: Qoder's session bodies are unreadable there, so across tools it remains `backup-restore only`, while this backfill writes into Qoder's **own** new DB — the same family of regeneration leftovers as "Convert legacy memories".
+
+1. a legacy `local.db` exists (`~/.qoder-cn/shared_client/cache/db/` and `~/.lingma/cache/db/`);
+2. the new `main.sqlite` exists (no DB yet = the desktop client never ran, so nothing would read what we write);
+3. **the currently selected user is the new Aliyun account** (UUIDv7 shape) and differs from the account owning the legacy sessions — still on the old account means no regeneration happened here; **an undetectable account also counts as unmet**;
+4. the product's own **plaintext transcripts** exist (`~/.qoder-cn/cache/projects/<project>/conversation-history/<first 8 of session id>/`): legacy message bodies are column-level ciphertext, so the transcript is the only plaintext.
+
+Safety boundaries:
+
+- Opening the dialog and `plan` are **read-only** (dry-run), listing what can be imported and why the rest is skipped (no transcript, project directory gone locally).
+- Before writing, an **online snapshot of `main.sqlite` is taken and re-checked by SHA-256**; then the writer lock is acquired (`begin immediate` — if it fails, nothing is written, so **fully quit Qoder CN including the system tray first**), insert inside one transaction, roll back entirely on failure, then verify every field and hash plus `integrity_check` on read-back.
+- Pre-flight also blocks schema drift, a `payload_schema_version` outside the validated allow-list, and a wrong account shape (the CLI has no GUI gate, so it is enforced here too).
+- **Rollback removes only the rows this tool wrote**, per its ledger; sessions and messages written by the product are never touched. The ledger stores ids and hashes only — **no bodies, no titles**.
+- New session / message / segment ids are deterministic `uuid5` values derived from the legacy session id, so **re-running never writes a second copy** (they show up as "already in the target DB, skipped").
+
+The cost (stated up front in both GUI and CLI): only the visible text in the transcript — **no reasoning, no tool calls**; imported turns land in the **display layer and full-text search but not in the model context**; turn timestamps are interpolated; the official `sessionMigration.sqlite` ledger is not written.
+
+CLI (plan-only by default; `apply` writes):
+
+```
+python -m ai_env_clone.qoder_session_import eligibility
+python -m ai_env_clone.qoder_session_import list
+python -m ai_env_clone.qoder_session_import plan --limit 1
+python -m ai_env_clone.qoder_session_import apply --limit 1
+python -m ai_env_clone.qoder_session_import rollback --session <first 8 of new session id>
+```
 
 #### Subagent sessions: not imported by default; when imported they attach to their parent in the target's native structure
 
@@ -1049,6 +1116,7 @@ ai_env_clone/                package (import name ai_env_clone, product name AiE
 ├── workbuddy_repair.py   WorkBuddy session-index detect & repair (stdlib-only: wrong owner / unregistered rows / missing workspaces / stale sidebar snapshot; backs up and locks the DB before writing)
 ├── subagent_relink.py    Repairs "top-level subagent sessions left in DSH by older imports" into DSH-native subagent sessions (detect & repair, stdlib-only)
 ├── qoder_memory_convert.py One-off converter: Qoder legacy plaintext memory → new ``memory/*.md`` format (standalone feature, dry-run by default)
+├── qoder_session_import.py Qoder regeneration backfill: legacy lingma sessions → new ``main.sqlite`` (lossy, gated by runtime conditions, plan-only by default)
 ├── elevate.py            Elevation retry for update replacement (packaged Windows only, requires an explicit user click; syscalls wrapped in module-level stubs)
 ├── adapters/
 │   ├── base.py        BaseAdapter interface + adapter registry
@@ -1065,7 +1133,7 @@ build_exe.py           package into cross-platform executables via PyInstaller (
 .github/workflows/     build-release.yml (tag → auto-build multi-platform binaries, publish GitHub Release & sync it to Gitee) + sync-gitee.yml (manual re-upload of release assets to Gitee) + mirror-to-gitee.yml (mirror code & tags to Gitee)
 ```
 
-**Multi-tool**: a unified adapter interface (`detect_root()` / `detect_data_roots()` / `build_items()` / `export()` / `restore()`). Each AI tool maps to one adapter module; adding a tool never touches the main flow. See `docs/CONTRIBUTING.md`. Cross-tool "session import" capability is declared centrally in `import_matrix.py`, with parsing / native writing in `session_migration.py`; supporting one more importable source means adding one parser and registering it in the matrix.
+**Multi-tool**: a unified adapter interface (`detect_root()` / `detect_data_roots()` / `build_items()` / `export()` / `restore()`). Each AI tool maps to one adapter module; adding a tool never touches the main flow. See `docs/CONTRIBUTING.md`. Cross-tool "session import" capability is declared centrally in `import_matrix.py`, with parsing / native writing in `session_migration.py`; supporting one more importable source means adding one parser and registering it in the matrix. That table only covers **cross-tool** conversion, so same-tool special cases stay out of it: Qoder's regeneration backfill (`qoder_session_import.py`; the GUI entry sits on the "历史会话诊断 / session diagnostics" row, plus a standalone CLI) decides availability by **runtime checks** (the adapter's `lingma_import_gate()` → `check_eligibility()`), and when the conditions fail the entry stays disabled and lists what is missing.
 
 ## Testing
 

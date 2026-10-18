@@ -1004,6 +1004,15 @@ class QoderBackupApp:
             diag_row, text="转换旧版记忆…", command=self._memory_convert, width=14
         )
         self.qoder_convert_btn.pack(side=tk.LEFT, padx=(6, 0))
+        # 换代前的旧会话回填：产品换代只搬记忆没搬会话，与上一行的「转换旧版记忆」
+        # 同源，所以入口放这一行，不放「数据导入」区（那是跨软件转换的能力位，
+        # Qoder 的会话正文取不出，跨软件口径下只能整库备份 / 还原）。
+        # 按钮状态由本机实测的运行期条件决定（见 _refresh_qoder_diag_gate）。
+        self.qoder_import_btn = ttk.Button(
+            diag_row, text="导入 lingma 会话…", command=self._lingma_import, width=16
+        )
+        self.qoder_import_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.qoder_import_btn.configure(state=tk.DISABLED)
         # 说明文字另起一行：原先与按钮挤在同一行时整行请求宽达 1016px（可视仅 939），
         # 于是内容区常年出现横向滚动条、右侧被挤出可视区；且每次切换工具宽度都要在
         # 「够/不够」之间反复，白多刷一遍整屏。独立成行后按宽度自动折行。
@@ -1017,6 +1026,14 @@ class QoderBackupApp:
         )
         qoder_hint.pack(fill=tk.X, pady=(4, 0))
         self._hint_labels.append(qoder_hint)
+        # 「导入 lingma 会话」的运行期条件逐条摆出来：条件不满足时按钮是灰的，
+        # 这里必须写明**还缺哪一条**，否则用户只知道「灰了」而不知怎么补齐。
+        self.qoder_gate_lbl = ttk.Label(
+            self.qoder_diag_frame, text="", foreground="#666",
+            anchor="w", justify="left", wraplength=760,
+        )
+        self.qoder_gate_lbl.pack(fill=tk.X, pady=(4, 0))
+        self._hint_labels.append(self.qoder_gate_lbl)
         self.qoder_diag_frame.pack_forget()
 
         # 备份内容
@@ -2064,6 +2081,38 @@ class QoderBackupApp:
             self._redetect()
 
     # ----------------------------------------------------------- 数据导入 --
+    def _selected_uid(self) -> str:
+        """「当前用户」下拉选中的**真实** UID（下拉里显示的是截短串，需还原）。"""
+        var = getattr(self, "uid_var", None)
+        chosen = (var.get() or "").strip() if var is not None else ""
+        if chosen and getattr(self, "_uid_short_map", None):
+            chosen = self._uid_short_map.get(chosen, chosen)
+        return chosen
+
+    def _lingma_gate(self):
+        """运行期实测「导入 lingma 会话」的条件（按 数据目录 + 所选账号 缓存）。
+
+        条件里包含「当前所选用户是否已是新版阿里云账号」，而下拉随时会切，所以缓存
+        键必须带上 UID；数据目录换了指向（克隆目录 / 另一台机器）同样要重测。
+        探测本身只读、约几十毫秒，代价远低于把旧状态显示给用户。
+        """
+        probe = getattr(self.adapter, "lingma_import_gate", None)
+        if probe is None:
+            return None
+        key = (self.root_dir or "", self._selected_uid())
+        cache = getattr(self, "_lingma_gate_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        try:
+            gate = probe(key[1], key[0])
+        except Exception as exc:  # noqa: BLE001 探测失败不能拖垮界面构建
+            gate = None
+            self._lingma_gate_error = "%s: %s" % (type(exc).__name__, exc)
+        else:
+            self._lingma_gate_error = ""
+        self._lingma_gate_cache = (key, gate)
+        return gate
+
     def _refresh_import_matrix(self) -> None:
         """把「当前所选工具」的导入能力矩阵渲染进导入区（工具切换时刷新）。"""
         name = self.adapter.name
@@ -2091,6 +2140,40 @@ class QoderBackupApp:
             self.imp_text.configure(state="disabled")
             self.imp_btn.configure(state="normal" if info["has_importable"] else "disabled")
         except tk.TclError:  # 极端情况下控件已销毁，忽略
+            pass
+
+    def _lingma_gate_lines(self, gate) -> "tuple[list, str]":
+        """换代回填入口的门控文本 + 按钮状态（条件不满足即不提供该功能）。"""
+        if gate is None:
+            return (["运行期条件：探测失败（%s）"
+                     % getattr(self, "_lingma_gate_error", "")], "disabled")
+        if gate.ready:
+            return (["运行期条件：已满足（旧会话 %d 条，其中 %d 条取到明文文字稿）。"
+                      "写入前请先完全退出 Qoder CN（含系统托盘）。"
+                      % (gate.sessions_total, gate.sessions_with_transcript)],
+                    "normal")
+        return (["运行期条件：未满足，本功能不提供"] +
+                ["缺：%s" % r for r in gate.reasons], "disabled")
+
+    def _refresh_qoder_diag_gate(self) -> None:
+        """刷新「历史会话诊断」行的「导入 lingma 会话…」入口（仅 qoder 时）。
+
+        入口放在诊断行而不是「数据导入」区：那是**跨软件**转换的能力位，Qoder 的
+        会话主库取不出正文，跨软件口径下它和 Trae 家族一样只能整库备份 / 还原。
+        换代回填是**同一工具内**把旧账号的会话写回新账号自己的库，属于诊断行
+        「旧数据没搬过来」这一类问题，与「转换旧版记忆」同源。
+        """
+        btn = getattr(self, "qoder_import_btn", None)
+        lbl = getattr(self, "qoder_gate_lbl", None)
+        if btn is None or lbl is None:
+            return
+        if self.adapter.name != "qoder":
+            return
+        try:
+            lines, state = self._lingma_gate_lines(self._lingma_gate())
+            btn.configure(state=state)
+            lbl.configure(text="\n".join(lines))
+        except tk.TclError:
             pass
 
     def _show_import_help(self) -> None:
@@ -2677,6 +2760,7 @@ class QoderBackupApp:
             return
         if self.adapter.name == "qoder":
             frame.pack(fill=tk.X, padx=10, pady=(0, 8))
+            self._refresh_qoder_diag_gate()
         else:
             frame.pack_forget()
 
@@ -2886,6 +2970,25 @@ class QoderBackupApp:
     def _memory_convert(self) -> None:
         """打开「转换旧版记忆」对话框（Qoder 明文记忆 → 新版 md / CodeBuddy .mdc）。"""
         MemoryConvertDialog(self)
+
+    def _lingma_import(self) -> None:
+        """打开「导入 lingma 会话」对话框（换代回填：旧账号会话 → 新版 main.sqlite）。
+
+        按钮只在运行期条件满足时可点，但条件随时会变（换账号、退出又启动新版），
+        所以点击时**再实测一次**：不满足就只列出「还缺哪一条」，不开对话框。
+        """
+        gate = self._lingma_gate()
+        if gate is None or not gate.ready:
+            reasons = (gate.reasons if gate is not None
+                       else (getattr(self, "_lingma_gate_error", "探测失败"),))
+            messagebox.showinfo(
+                "条件未满足，暂不提供导入",
+                "「导入 lingma 会话」要同时满足四个运行期条件，请补齐后再来：\n\n%s"
+                % "\n".join("· " + str(r) for r in reasons),
+            )
+            self._refresh_qoder_diag_gate()
+            return
+        LingmaImportDialog(self, gate)
 
     def _set_dsh_buttons_state(self) -> None:
         """数据目录有效时启用检测按钮；修复按钮另需「存在可修复项」才启用。
@@ -3341,6 +3444,9 @@ class QoderBackupApp:
         if new_cur and new_cur != chosen:
             from ai_env_clone.adapters.codebuddy import short_uid
             self.uid_var.set(short_uid(new_cur))
+        # 「导入 lingma 会话」的入口取决于**当前所选账号是不是新版阿里云账号**，
+        # 切账号后必须重测门控，否则入口停在旧账号下的判定结果。
+        self._refresh_qoder_diag_gate()
         self._set_status("已切换当前用户：%s" % (chosen or "自动检测"))
 
     def _tool_dir(self, sub: str) -> str:
@@ -6312,6 +6418,368 @@ def memory_convert_confirm_text(plan, dest_line: str) -> tuple[str, str]:
         "写下的全部是**新文件**，删掉它们即可完全回退。是否继续？"
         % (plan.to_create, plan.existing, dest_line),
     )
+
+
+class LingmaImportDialog:
+    """「导入 lingma 会话」对话框：换代前的旧会话 → 新版 ``main.sqlite``（**有损**）。
+
+    与 CLI（``python -m ai_env_clone.qoder_session_import``）共用同一套核心
+    :mod:`ai_env_clone.qoder_session_import`，因此界面也守住同一条底线：
+    **先出计划 → 用户确认 → 才写盘**；打开对话框本身不写盘（读旧库也在点
+    「生成计划」之后才发生）。
+
+    和 :class:`MigrateDialog` 的区别是这条通路**不跨工具**：产品从 lingma 账号
+    换代到阿里云账号时只回填了记忆、没回填会话，所以这里是往产品自己的活库里
+    按实测形状补行。正因为写的是活库，多了三道硬闸（都在核心模块里，界面只负责
+    如实转达）：门控条件、载荷版本校验（版本对不上即拒写）、写前在线快照 +
+    按台账回滚。
+
+    读旧库、glob 文字稿、复制快照都会卡界面，三步统一放后台线程，结果经本对话框
+    自有队列 + ``win.after`` 回主线程渲染（与 :class:`MemoryConvertDialog` 同构）。
+    """
+
+    def __init__(self, app: "QoderBackupApp", gate) -> None:
+        from ai_env_clone import qoder_session_import as qsi
+
+        self.app = app
+        self.qsi = qsi
+        self.gate = gate
+        self.home = app.root_dir or os.path.expanduser("~")
+        self.uid = gate.current_uid or app._selected_uid()
+        self._queue: queue.Queue = queue.Queue()
+        self._plan = None
+        self._running = False
+        self._after_id = None
+
+        self.win = tk.Toplevel(app.root)
+        self.win.title("导入 lingma 会话 → 新版 Qoder CN")
+        _clamp_dialog_size(self.win, 900, 720)
+        self.win.transient(app.root)
+        self.win.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.win.rowconfigure(0, weight=1, minsize=0)
+        self.win.columnconfigure(0, weight=1)
+        self._scroll = _ScrollBody(self.win, row=0, column=0)
+        self.body = self._scroll.frame
+        for _seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.win.bind(_seq, self._scroll.wheel)
+        self._build()
+        self._scroll.sync()
+        self._gen_plan()
+
+    # ---------------------------------------------------------------- UI --
+    def _build(self) -> None:
+        tip = ttk.Label(
+            self.body, justify="left", anchor="w", wraplength=820,
+            text="产品换代（lingma 账号 → 阿里云账号）时只搬了记忆、没回填会话。"
+                 "旧库正文是列级密文，能取出的只有产品自己写的明文文字稿，所以这是"
+                 "**有损**导入：旧轮次进得了侧栏与搜索，进不了模型上下文。\n"
+                 "先出计划、确认后才写盘；写入前自动给 main.sqlite 建快照，"
+                 "「回滚」只摘本工具写入的行。")
+        tip.pack(fill=tk.X, padx=12, pady=(12, 6))
+        for note in self.gate.notices:
+            ttk.Label(self.body, text="⚠ " + note, justify="left", anchor="w",
+                      wraplength=820, foreground="#a05a00").pack(fill=tk.X, padx=12)
+
+        loc = ttk.LabelFrame(self.body, text="数据位置（点开计划后才会读库）")
+        loc.pack(fill=tk.X, padx=12, pady=(6, 6))
+        for label, value in (
+                ("新版会话库 main.sqlite", self.gate.new_db),
+                ("旧版会话库 local.db", "、".join(self.gate.old_dbs) or "（无）"),
+                ("当前所选账号", "%s（会话归属 %s）" % (
+                    self.uid or "（未取到）", self.gate.legacy_uid or "（未知）")),
+                ("明文文字稿根", self.gate.transcript_root)):
+            row = ttk.Frame(loc)
+            row.pack(fill=tk.X, padx=8, pady=2)
+            ttk.Label(row, text=label + "：", width=24, anchor="w").pack(side=tk.LEFT)
+            ttk.Label(row, text=value, anchor="w", foreground="#333").pack(
+                side=tk.LEFT, fill=tk.X, expand=True)
+
+        opt = ttk.Frame(self.body)
+        opt.pack(fill=tk.X, padx=12)
+        self.all_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            opt, text="连「本机工程目录已不存在」的会话也纳入计划",
+            variable=self.all_var, command=self._gen_plan).pack(anchor="w")
+        ttk.Label(
+            self.body,
+            text="选中会话后可只导这些条；不选任何一条＝导计划里的全部。",
+            foreground="#666", anchor="w", justify="left",
+            wraplength=820).pack(fill=tk.X, padx=12)
+
+        lst = ttk.LabelFrame(self.body, text="可导入的旧会话（Ctrl / Shift 可多选）")
+        lst.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 6))
+        listwrap = ttk.Frame(lst)
+        listwrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.listbox = tk.Listbox(listwrap, activestyle="dotbox", selectmode="extended")
+        lsb = ttk.Scrollbar(listwrap, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=lsb.set)
+        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        lsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        out_frame = ttk.LabelFrame(self.body, text="计划 / 结果")
+        out_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
+        self.out = tk.Text(out_frame, height=12, wrap="word", relief="flat",
+                           padx=10, pady=8, bg="white", fg="black", font=("", 10))
+        out_bar = ttk.Scrollbar(out_frame, orient="vertical", command=self.out.yview)
+        self.out.configure(yscrollcommand=out_bar.set)
+        out_bar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.out.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.out.configure(state="disabled", takefocus=0)
+        self._write_output(["正在生成计划（此步不写盘）…"])
+
+        act = ttk.Frame(self.win)
+        act.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+        ttk.Button(act, text="关闭", width=8, command=self._on_close).pack(side=tk.RIGHT)
+        self.rollback_btn = ttk.Button(act, text="回滚本工具写入", width=16,
+                                       command=self._rollback, state="normal")
+        self.rollback_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        self.apply_btn = ttk.Button(act, text="执行导入（写盘）", width=16,
+                                    command=self._apply, state="disabled")
+        self.apply_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.gen_btn = ttk.Button(act, text="重新生成计划", width=14,
+                                  command=self._gen_plan)
+        self.gen_btn.pack(side=tk.LEFT)
+        self.status_lbl = ttk.Label(act, text="", foreground="#666")
+        self.status_lbl.pack(side=tk.LEFT, padx=10)
+
+    # ------------------------------------------------------------ 计划 --
+    def _gen_plan(self) -> None:
+        """后台生成计划（不写盘）。"""
+        if self._running:
+            return
+        include_all = bool(self.all_var.get())
+        self._set_running(True, "正在读取旧库与文字稿（不写盘）…")
+
+        def worker() -> None:
+            try:
+                plan = self.qsi.plan_import(self.home, self.uid, self.gate.new_db,
+                                            list(self.gate.old_dbs), None, 0,
+                                            include_all)
+            except Exception as exc:  # noqa: BLE001
+                self._queue.put(("error", "%s: %s" % (type(exc).__name__, exc)))
+                return
+            self._queue.put(("plan", plan))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._schedule_poll()
+
+    def _show_plan(self, plan) -> None:
+        self._plan = plan
+        self._set_running(False, "计划已生成（未写盘）")
+        self.listbox.delete(0, tk.END)
+        for p in plan.sessions:
+            self.listbox.insert(
+                tk.END, "%s… %-40s 轮次=%-3d 字数=%-7d %s" % (
+                    p.legacy.session_id[:8], p.legacy.title[:38], p.turns_written,
+                    p.chars_written, p.legacy.project_path))
+        if plan.sessions:
+            self.listbox.selection_set(0, len(plan.sessions) - 1)
+        lines = plan.summary_lines() + [""] + plan.detail_lines()
+        self._write_output(lines)
+        self._set_apply_state()
+
+    def _selected_plans(self) -> list:
+        idx = set(self.listbox.curselection())
+        return [p for i, p in enumerate(self._plan.sessions) if not idx or i in idx]
+
+    # ------------------------------------------------------------ 写盘 --
+    def _apply(self) -> None:
+        if self._plan is None or self._running or not self._plan.sessions:
+            return
+        chosen = self._selected_plans()
+        if not chosen:
+            self.status_lbl.configure(text="没有选中任何会话")
+            return
+        sub = self.qsi.ImportPlan(
+            old_dbs=self._plan.old_dbs, new_db=self._plan.new_db,
+            current_uid=self._plan.current_uid, legacy_uid=self._plan.legacy_uid,
+            shape=self._plan.shape, sessions=list(chosen),
+            skipped=list(self._plan.skipped), sessions_total=self._plan.sessions_total,
+            with_transcript=self._plan.with_transcript,
+            ambiguous_prefixes=self._plan.ambiguous_prefixes)
+        c = sub.counts()
+        text = "\n".join([
+            "将向 %s 写入：" % sub.new_db,
+            "  %d 条会话 / %d 个轮次 / %d 行消息 / %d 行检索片段 / %d 个新工作区行"
+            % (c["sessions"], c["turns"], c["messages"], c["segments"], c["workspaces"]),
+            "",
+            "写入前会先给 main.sqlite 建一份快照（.before-lingma-import）并记 sha256；",
+            "全部写入在一个事务里完成，任何一步失败都不提交。",
+            "",
+            "⚠ 请先**完全退出 Qoder CN（含系统托盘图标）**，否则拿不到写锁，",
+            "  或新版内存态把刚写入的行覆盖掉（那不算写坏数据，但会白导一次）。",
+            "",
+            "确认已退出并继续写入？",
+        ])
+        if not self.app._show_plain_report_dialog("确认导入 lingma 会话（写盘）",
+                                                  text, ask=True):
+            self.status_lbl.configure(text="已取消，未写盘")
+            return
+        self._set_running(True, "正在写入 main.sqlite…")
+
+        def worker() -> None:
+            try:
+                res = self.qsi.apply_import(sub)
+            except self.qsi.ImportAbort as exc:
+                self._queue.put(("result", {"ok": False, "error": str(exc), "written": [],
+                                            "skipped_existing": [], "problems": []}))
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._queue.put(("error", "%s: %s" % (type(exc).__name__, exc)))
+                return
+            self._queue.put(("result", res))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._schedule_poll()
+
+    def _show_result(self, res: dict) -> None:
+        self._set_running(False, "导入结束")
+        snap = res.get("snapshot") or {}
+        lines = []
+        if res.get("ok"):
+            lines.append("写入完成：%d 条会话（另有 %d 条已在库里，跳过未重复写）"
+                         % (len(res.get("written") or []),
+                            len(res.get("skipped_existing") or [])))
+            if res.get("problems"):
+                lines.append("⚠ 读回校验发现问题（库已写入，请逐条核对）：")
+                lines += ["  · %s" % p for p in res["problems"]]
+            else:
+                lines.append("读回校验通过：逐字段与哈希一致、侧栏可见、库完整性正常。")
+            if snap.get("path"):
+                lines.append("快照：%s" % snap["path"])
+            lines.append("")
+            lines.append("重新打开 Qoder CN 即可在侧栏看到旧会话（按更新时间排序，"
+                         "排在最旧的位置，可用标题或搜索定位）。")
+            lines.append("接着聊时模型看不到这些旧轮次，除非它主动查本会话。")
+        else:
+            lines.append("未写入（库保持原样）：%s" % (res.get("error") or "未知原因"))
+            if snap.get("path"):
+                lines.append("快照已存在：%s" % snap["path"])
+        lines.append("")
+        lines.append("点「重新生成计划」可查看剩余可导的会话；"
+                     "重复执行导入不会写出第二份（确定性 id 命中即跳过）。")
+        self._write_output(lines)
+
+    # ------------------------------------------------------------ 回滚 --
+    def _rollback(self) -> None:
+        if self._running:
+            return
+        new_db = (self._plan.new_db if self._plan else self.gate.new_db)
+        text = "\n".join([
+            "按写入台账摘除本工具写入的行（先片段、再消息、后会话，",
+            "最后回收没有其它会话引用的新建工作区行）。",
+            "",
+            "· 目标库：%s" % new_db,
+            "· 产品自己写的会话与消息一律不碰；台账里没有的记录不会被删。",
+            "",
+            "确认回滚？",
+        ])
+        if not self.app._show_plain_report_dialog("确认回滚导入", text, ask=True):
+            self.status_lbl.configure(text="已取消，未回滚")
+            return
+        self._set_running(True, "正在回滚…")
+
+        def worker() -> None:
+            try:
+                res = self.qsi.rollback_import(new_db)
+            except Exception as exc:  # noqa: BLE001
+                self._queue.put(("error", "%s: %s" % (type(exc).__name__, exc)))
+                return
+            self._queue.put(("rollback", res))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._schedule_poll()
+
+    def _show_rollback(self, res: dict) -> None:
+        self._set_running(False, "回滚结束")
+        if not res.get("ok"):
+            self._write_output(["未回滚（库保持原样）：%s" % (res.get("error") or ""), "",
+                                "点「重新生成计划」可刷新当前列表。"])
+            return
+        lines = ["已摘除 %d 个会话：%s" % (
+            len(res.get("rolled_back") or []),
+            "、".join(s[:8] for s in res.get("rolled_back") or []))]
+        if res.get("workspaces_removed"):
+            lines.append("回收的本工具自建工作区行：%s"
+                         % "、".join(w[:12] for w in res["workspaces_removed"]))
+        lines.append("")
+        lines.append("快照文件仍保留（%s%s），确认无误后可以删。"
+                     % (self.gate.new_db, self.qsi.SNAPSHOT_SUFFIX))
+        lines.append("")
+        lines.append("点「重新生成计划」可刷新当前列表。")
+        self._write_output(lines)
+
+    # ------------------------------------------------------------ 队列 --
+    def _schedule_poll(self, delay: int = 120) -> None:
+        self._after_id = self.win.after(delay, self._poll)
+
+    def _cancel_poll(self) -> None:
+        if self._after_id is not None:
+            try:
+                self.win.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+            self._after_id = None
+
+    def _poll(self) -> None:
+        if not self._alive():
+            return
+        while True:
+            try:
+                kind, payload = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "plan":
+                self._show_plan(payload)
+            elif kind == "result":
+                self._show_result(payload)
+            elif kind == "rollback":
+                self._show_rollback(payload)
+            elif kind == "error":
+                self._set_running(False, "操作失败")
+                self._write_output(["操作失败：%s" % payload])
+        if self._running:
+            self._schedule_poll(150)
+
+    def _alive(self) -> bool:
+        try:
+            return bool(self.win.winfo_exists())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _set_running(self, flag: bool, status: str) -> None:
+        self._running = flag
+        for btn in (self.gen_btn, self.apply_btn, self.rollback_btn):
+            try:
+                btn.configure(state="disabled" if flag else "normal")
+            except tk.TclError:
+                pass
+        if not flag:
+            self._set_apply_state()
+        try:
+            self.status_lbl.configure(text=status)
+        except tk.TclError:
+            pass
+
+    def _set_apply_state(self) -> None:
+        ok = bool(self._plan) and bool(self._plan.sessions) and not self._running
+        try:
+            self.apply_btn.configure(state="normal" if ok else "disabled")
+        except tk.TclError:
+            pass
+
+    def _write_output(self, lines) -> None:
+        text = lines if isinstance(lines, str) else "\n".join(lines)
+        self.out.configure(state="normal")
+        self.out.delete("1.0", tk.END)
+        self.out.insert("1.0", text)
+        self.out.configure(state="disabled")
+        self.out.yview_moveto(0.0)
+        self._scroll.sync()
+
+    def _on_close(self) -> None:
+        self._cancel_poll()
+        self.win.destroy()
 
 
 class MemoryConvertDialog:

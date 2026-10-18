@@ -1002,6 +1002,27 @@ class QoderAdapter(BaseAdapter):
         """未探测到时的默认（建议）数据目录：用户主目录 ``~``。"""
         return os.path.expanduser("~")
 
+    def lingma_import_gate(self, current_uid: str = "",
+                           home: str = "") -> "object":
+        """运行期实测：本机能否把换代前的 lingma 旧会话导入新版 ``main.sqlite``。
+
+        返回 :class:`ai_env_clone.qoder_session_import.Eligibility`（``ready`` +
+        逐条 ``reasons`` + ``notices``）。四个条件缺一不可：旧库在、新库在、
+        **当前所选账号已是新版阿里云账号**、且有明文文字稿 —— 界面据此决定
+        「历史会话诊断」行里「导入 lingma 会话」这个入口给不给（条件不满足即
+        置灰，并把缺的那条写在同一行下面）。
+
+        这条通路**不属于跨软件导入**（``import_matrix`` 里 Qoder 仍然只有
+        ``BACKUP_ONLY``）：它把旧账号的会话按新版自己的形状写回 ``main.sqlite``，
+        与同那一行的「转换旧版记忆」是同一类换代遗留问题。
+
+        ``home`` 取界面当前选中的数据目录（Qoder 的数据根就是用户主目录），
+        这样指向另一台机器的克隆目录时测的是那一份数据，不会拿本机状态冒充。
+        """
+        from ai_env_clone import qoder_session_import as qsi
+
+        return qsi.check_eligibility(home or self.detect_root() or "", current_uid)
+
     def detect_data_roots(self, root: str | None = None) -> list[dict]:
         """返回 Qoder 在 ``root`` 下的各数据根目录信息。
 
